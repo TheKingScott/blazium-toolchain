@@ -1,6 +1,8 @@
 package iso
 
 import (
+	"encoding/binary"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -21,4 +23,65 @@ func TestWriteDataISOHasPVD(t *testing.T) {
 	if !HasISO9660PVD(out) {
 		t.Fatal("missing CD001 PVD")
 	}
+}
+
+// A PS2 export puts the resolved guest tree (~35 files) under guest/. Its
+// Joliet directory needs more than one sector; records must not straddle the
+// sector boundary and the declared extent size must cover every record.
+func TestWriteDataISOMultiSectorDirectory(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "SYSTEM.CNF"), []byte("BOOT2 = cdrom0:\\GAME.ELF;1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sub := filepath.Join(dir, "guest")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const files = 40
+	for i := 0; i < files; i++ {
+		name := filepath.Join(sub, fmt.Sprintf("src_file_%02d.cpp", i))
+		if err := os.WriteFile(name, []byte{byte(i)}, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out := filepath.Join(t.TempDir(), "game.iso")
+	if err := WriteDataISO(dir, out, "TESTPS2"); err != nil {
+		t.Fatal(err)
+	}
+	img, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, vd := range []int{isoPVDSector, isoSVDSector} {
+		root := img[vd*SectorSize+156:]
+		seen := walkDirForTest(t, img, binary.LittleEndian.Uint32(root[2:]), binary.LittleEndian.Uint32(root[10:]))
+		if seen != files+2 { // SYSTEM.CNF, guest/, and the files under guest/
+			t.Fatalf("descriptor %d: walked %d entries, want %d", vd, seen, files+2)
+		}
+	}
+}
+
+func walkDirForTest(t *testing.T, img []byte, extent, size uint32) int {
+	t.Helper()
+	data := img[int(extent)*SectorSize : int(extent)*SectorSize+int(size)]
+	seen := 0
+	for off := 0; off < len(data); {
+		l := int(data[off])
+		if l == 0 {
+			off = (off/SectorSize + 1) * SectorSize
+			continue
+		}
+		if off/SectorSize != (off+l-1)/SectorSize {
+			t.Fatalf("record at %d (len %d) crosses a sector boundary", off, l)
+		}
+		ident := data[off+33 : off+33+int(data[off+32])]
+		if !(len(ident) == 1 && ident[0] <= 1) {
+			seen++
+			if data[off+25]&2 != 0 {
+				seen += walkDirForTest(t, img, binary.LittleEndian.Uint32(data[off+2:]), binary.LittleEndian.Uint32(data[off+10:]))
+			}
+		}
+		off += l
+	}
+	return seen
 }
