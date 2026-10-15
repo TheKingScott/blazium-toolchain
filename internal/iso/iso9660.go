@@ -139,27 +139,55 @@ func flattenDirs(root *node) []isoDir {
 }
 
 func dirRecordBytes(d isoDir, dirs []isoDir, joliet bool) uint32 {
-	// . and ..
+	// . and .. (34 bytes each) always fit in the first sector.
 	n := uint32(34 + 34)
 	for _, c := range d.node.children {
-		name := c.name
-		if joliet {
-			n += recLen(2*len([]rune(name)) + 1)
-			continue
+		l := recLen(len(childIdent(c, dirs, joliet)))
+		// Records never cross a logical sector (ECMA-119 6.8.1.1); the
+		// writer pads to the next sector, so the size must count that pad.
+		if room := SectorSize - n%SectorSize; l > room {
+			n += room
 		}
-		name = c.isoName
-		if name == "" {
-			name = mangle83(c.name, c.isDir, nil)
-		}
-		if !c.isDir {
-			name += ";1"
-		}
-		n += recLen(len(name))
+		n += l
 	}
 	if n < SectorSize {
 		return SectorSize
 	}
 	return uint32(blocks32(uint64(n))) * SectorSize
+}
+
+// childIdent is the identifier buildDirExtent writes for c. dirRecordBytes
+// sizes the extent from the same bytes so the declared size cannot drift
+// (Joliet file names are UTF-16BE "name;1", 2*(len+2) bytes).
+func childIdent(c *node, dirs []isoDir, joliet bool) []byte {
+	if c.isDir {
+		for _, dd := range dirs {
+			if dd.node == c {
+				if joliet {
+					return dd.joliet
+				}
+				return []byte(dd.ident)
+			}
+		}
+		return nil
+	}
+	if joliet {
+		return utf16BE(c.name + ";1")
+	}
+	id := c.isoName
+	if id == "" {
+		id = mangle83(c.name, false, nil)
+	}
+	return []byte(id + ";1")
+}
+
+// appendDirRecord appends rec, zero-padding to the next sector first when
+// rec would otherwise cross a logical sector boundary (ECMA-119 6.8.1.1).
+func appendDirRecord(b, rec []byte) []byte {
+	if room := SectorSize - len(b)%SectorSize; len(rec) > room {
+		b = append(b, make([]byte, room)...)
+	}
+	return append(b, rec...)
 }
 
 func recLen(identLen int) uint32 {
@@ -260,11 +288,9 @@ func buildDirExtent(d isoDir, dirs []isoDir, joliet bool, jsec []uint32, now tim
 	b = append(b, dirRecord(selfSec, selfSize, now, true, []byte{0})...)
 	b = append(b, dirRecord(parentSec, parentSize, now, true, []byte{1})...)
 	for _, c := range d.node.children {
-		var ident []byte
 		sec := uint32(c.absSector)
 		sz := uint32(c.size)
-		isDir := c.isDir
-		if isDir {
+		if c.isDir {
 			for i, dd := range dirs {
 				if dd.node == c {
 					sec = dd.sector
@@ -273,23 +299,11 @@ func buildDirExtent(d isoDir, dirs []isoDir, joliet bool, jsec []uint32, now tim
 						sec = jsec[i]
 						sz = dirRecordBytes(dd, dirs, true)
 					}
-					ident = []byte(dd.ident)
-					if joliet {
-						ident = dd.joliet
-					}
 					break
 				}
 			}
-		} else if joliet {
-			ident = utf16BE(c.name + ";1")
-		} else {
-			id := c.isoName
-			if id == "" {
-				id = mangle83(c.name, false, nil)
-			}
-			ident = []byte(id + ";1")
 		}
-		b = append(b, dirRecord(sec, sz, c.modTime, isDir, ident)...)
+		b = appendDirRecord(b, dirRecord(sec, sz, c.modTime, c.isDir, childIdent(c, dirs, joliet)))
 	}
 	return b
 }
