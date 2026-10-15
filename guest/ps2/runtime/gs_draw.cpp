@@ -836,6 +836,20 @@ static void apply_gs_z(xyz_t *xyz, const vertex_f_t *clip, int n, int bias)
 	}
 }
 
+/* draw_convert_xyz(xyz, 2048, 2048, ...) maps NDC -1..1 onto GS pixels
+ * 0..4096, but only the framebuffer-sized window centred on 2048 is visible.
+ * Without this, a 640x448 frame shows the middle 1/6.4 x 1/9.1 of the view.
+ * Scale NDC to half the framebuffer so -1..1 spans exactly the screen. */
+static void fit_ndc_to_frame(vertex_f_t *c, int n, const framebuffer_t *f)
+{
+	const float sx = (float)((f && f->width > 0) ? f->width : 640) * 0.5f / 2048.0f;
+	const float sy = (float)((f && f->height > 0) ? f->height : 448) * 0.5f / 2048.0f;
+	for (int i = 0; i < n; i++) {
+		c[i].x *= sx;
+		c[i].y *= sy;
+	}
+}
+
 static void send_packet(packet_t *packet, qword_t *q);
 
 void gs_draw_fb_origin(int width, int height, float *ox, float *oy)
@@ -1714,6 +1728,7 @@ void gs_draw_scene(framebuffer_t *frame, zbuffer_t *z)
 			q = draw_prim_start(q, 0, &prim, &color);
 			in_prim = 1;
 		}
+		fit_ndc_to_frame(clip, 3, frame);
 		draw_convert_xyz(xyz, 2048.0f, 2048.0f, 32, 3, clip);
 		apply_gs_z(xyz, clip, 3, slot);
 		draw_convert_rgbq(rgba, 3, clip, cols, 0x80);
@@ -1791,6 +1806,7 @@ void gs_draw_scene(framebuffer_t *frame, zbuffer_t *z)
 				q = draw_prim_start(q, 0, &prim, &color);
 				in_prim = 1;
 			}
+			fit_ndc_to_frame(clip, 3, frame);
 			draw_convert_xyz(xyz, 2048.0f, 2048.0f, 32, 3, clip);
 			apply_gs_z(xyz, clip, 3, slot);
 			draw_convert_rgbq(rgba, 3, clip, cols, 0x80);
