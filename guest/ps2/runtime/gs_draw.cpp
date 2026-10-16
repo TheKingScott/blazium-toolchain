@@ -592,6 +592,41 @@ static unsigned short clut555(const unsigned char *clut, unsigned clut_n, unsign
 }
 
 /* Expand T8/T4 + linear CLUT to PSMCT16 so the GS never has to load a palette. */
+/* GS memory for a texture. graph_vram_allocate sizes it as if the texture
+ * were stored row by row, but the GS stores it in 8 KiB pages of swizzled
+ * blocks (PSMCT32 64x32, PSMCT16 64x64, PSMT8 128x64, PSMT4 128x128 a page).
+ * A texture that is not whole pages touches more of them than that size
+ * covers: 256x32 in PSMT8 spans two pages but got one, so the next texture
+ * overwrote its right half. Round up to whole pages unless it fits in one
+ * block. */
+static int tex_vram_allocate(int w, int h, int psm)
+{
+	int pw = 0, ph = 0, bw = 0, bh = 0;
+	switch (psm) {
+		case GS_PSM_32:
+		case GS_PSM_24:
+			pw = 64; ph = 32; bw = 8; bh = 8;
+			break;
+		case GS_PSM_16:
+		case GS_PSM_16S:
+			pw = 64; ph = 64; bw = 16; bh = 8;
+			break;
+		case GS_PSM_8:
+			pw = 128; ph = 64; bw = 16; bh = 16;
+			break;
+		case GS_PSM_4:
+			pw = 128; ph = 128; bw = 32; bh = 16;
+			break;
+		default:
+			return graph_vram_allocate(w, h, psm, GRAPH_ALIGN_BLOCK);
+	}
+	if (w > bw || h > bh) {
+		w = (w + pw - 1) / pw * pw;
+		h = (h + ph - 1) / ph * ph;
+	}
+	return graph_vram_allocate(w, h, psm, GRAPH_ALIGN_BLOCK);
+}
+
 static int expand_ct16(UploadedTex *t, const unsigned char *data, unsigned data_n, const unsigned char *clut, unsigned clut_n)
 {
 	const unsigned n = (unsigned)t->width * (unsigned)t->height;
@@ -617,7 +652,7 @@ static int expand_ct16(UploadedTex *t, const unsigned char *data, unsigned data_
 			dst[i] = clut555(clut, clut_n, idx);
 		}
 	}
-	t->vram = graph_vram_allocate(t->width, t->height, GS_PSM_16, GRAPH_ALIGN_BLOCK);
+	t->vram = tex_vram_allocate(t->width, t->height, GS_PSM_16);
 	if (t->vram < 0) {
 		free(t->aligned);
 		t->aligned = 0;
@@ -690,7 +725,7 @@ static int upload_one(UploadedTex *t, const unsigned char *data, unsigned data_n
 		if (!t->aligned) {
 			return 0;
 		}
-		t->vram = graph_vram_allocate(t->width, t->height, t->hw_psm, GRAPH_ALIGN_BLOCK);
+		t->vram = tex_vram_allocate(t->width, t->height, t->hw_psm);
 		if (t->vram < 0) {
 			return 0;
 		}
@@ -703,7 +738,7 @@ static int upload_one(UploadedTex *t, const unsigned char *data, unsigned data_n
 	if (!t->aligned) {
 		return 0;
 	}
-	t->vram = graph_vram_allocate(t->width, t->height, t->hw_psm, GRAPH_ALIGN_BLOCK);
+	t->vram = tex_vram_allocate(t->width, t->height, t->hw_psm);
 	if (t->vram < 0) {
 		return 0;
 	}
