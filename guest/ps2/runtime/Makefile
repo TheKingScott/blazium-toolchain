@@ -16,7 +16,7 @@ EE_DVP ?= dvp-as
 HAS_DVP := $(wildcard $(PS2DEV)/dvp/bin/dvp-as)$(wildcard $(PS2DEV)/dvp/bin/dvp-as.exe)
 ifneq ($(wildcard $(PS2SDK)/ee/lib/libpacket2.a),)
 ifneq ($(HAS_DVP),)
-EE_OBJS += draw_3D.o
+EE_OBJS += draw_3D.o vu1_scene.o
 EE_LIBS += -lpacket2 -lmath3d
 EE_CXXFLAGS += -DBLAZIUM_PS2_HAS_VU1=1
 endif

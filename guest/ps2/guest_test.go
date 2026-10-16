@@ -289,8 +289,17 @@ func TestGuestCameraLookAndVu1Fallback(t *testing.T) {
 	if !strings.Contains(string(gs), "nz = -z / w") {
 		t.Fatal("gs_draw.cpp must invert NDC z so GS GEQUAL keeps nearer surfaces")
 	}
-	if !strings.Contains(string(gs), "apply_gs_z") || !strings.Contains(string(gs), "4294967295.0f") {
-		t.Fatal("gs_draw.cpp must write reverse-Z into the full 32-bit ZBUF")
+	if !strings.Contains(string(gs), "apply_gs_z") || !strings.Contains(string(gs), "16777215.0f") || !strings.Contains(string(gs), "GIF_REG_XYZF2") {
+		t.Fatal("gs_draw.cpp must write reverse-Z as XYZF2 (24-bit Z, then the fog factor)")
+	}
+	if !strings.Contains(string(gs), "'I' && h[1] == 'N' && h[2] == 'S' && h[3] == 'T'") || !strings.Contains(string(gs), "draw_instances") {
+		t.Fatal("gs_draw.cpp must read MESH 'INST' and draw each instance with its delta")
+	}
+	if !strings.Contains(string(gs), "gs_draw_set_fog") || !strings.Contains(string(gs), "GS_REG_FOGCOL") {
+		t.Fatal("gs_draw.cpp must set GS fog (FOGCOL, PRIM FGE) for PS2.set_fog")
+	}
+	if !strings.Contains(string(gs), "VU1Scene_CodeStart") || !strings.Contains(string(gs), "vu_take") {
+		t.Fatal("gs_draw.cpp must send unclipped chunks to VU1 (vu1_scene.vsm)")
 	}
 	if !strings.Contains(string(gs), "draw_zbuffer") {
 		t.Fatal("gs_draw.cpp must bind the Z buffer every frame and after packet splits")

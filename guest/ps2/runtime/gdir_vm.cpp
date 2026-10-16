@@ -1502,6 +1502,13 @@ static Val native(unsigned inst, int id, Val *a, int n)
 		case GN_PS2_SET_RUMBLE:
 			pad_io_set_rumble(n > 0 ? inum(a[0]) : 1, n > 1 ? inum(a[1]) : 0);
 			return vnil();
+		case GN_PS2_SET_FOG:
+			if (n >= 3) {
+				gs_draw_set_fog(1, (int)(a[0].v[0] * 255.0f), (int)(a[0].v[1] * 255.0f), (int)(a[0].v[2] * 255.0f), num(a[1]), num(a[2]));
+			} else {
+				gs_draw_set_fog(0, 0, 0, 0, 0.0f, 0.0f);
+			}
+			return vnil();
 		case GN_PS2_STOP_RUMBLE:
 			pad_io_set_rumble(0, 0);
 			return vnil();

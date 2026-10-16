@@ -196,6 +196,7 @@ enum GdirNative {
 	GN_PS2_SAY = 113,
 	GN_PS2_POKE = 114, // off, byte: 24 KiB that survives change_scene
 	GN_PS2_PEEK = 115, // off
+	GN_PS2_SET_FOG = 116, // Color, near, far (no args, or far <= near: off)
 	GN_COUNT = 128,
 };
 
