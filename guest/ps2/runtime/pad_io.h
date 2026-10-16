@@ -16,6 +16,7 @@ int pad_io_get_pressure(int button);
 // 6 square, 7 triangle, 8 L1, 9 R1, 10 L2, 11 R2, 12 start, 13 select.
 int pad_io_pressed(int action);
 int pad_io_just_pressed(int action);
+int pad_io_just_released(int action);
 void pad_io_stick(int stick, float *x, float *y);
 void pad_io_set_deadzone(float zone);
 float pad_io_get_deadzone(void);

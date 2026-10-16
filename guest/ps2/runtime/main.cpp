@@ -1,6 +1,8 @@
 // Blazium PS2 guest — MIT. Links AFL 2.0 ps2sdk graph/draw/dma/packet only.
 // P4: double 16-bit frame + 32-bit Z, CPU GIF textured MESH/GTEX. Optional VU1 when linked.
 
+#include "gdir_vm.h"
+#include "iso_path.h"
 #include "gs_draw.h"
 #include "guest_hooks.h"
 #include "pack_io.h"
@@ -74,7 +76,7 @@ static int load_disp(void)
 		NULL
 	};
 	for (int i = 0; paths[i]; i++) {
-		FILE *f = fopen(paths[i], "rb");
+		FILE *f = iso_fopen(paths[i], "rb");
 		if (!f) {
 			continue;
 		}
@@ -207,7 +209,8 @@ int main(int argc, char **argv)
 	if (user_init) {
 		user_init();
 	}
-	const int use_vu1 = vu1_draw_init(mesh, mesh_sz) && vu1_draw_ready();
+	/* Scripted scenes move nodes per frame: the CPU path applies those. */
+	const int use_vu1 = !gdir_vm_active() && vu1_draw_init(mesh, mesh_sz) && vu1_draw_ready();
 
 	int context = 0;
 	for (;;) {
@@ -218,16 +221,21 @@ int main(int argc, char **argv)
 		if (user_pad) {
 			user_pad();
 		}
-		gs_draw_orbit(yaw, dolly);
-		if (cross) {
-			pad_io_set_rumble(1, 0);
-			sfx_io_play();
+		if (gdir_vm_active()) {
+			/* The scene's scripts own the pad: no orbit, no Cross jingle. */
+			gdir_vm_process(1.0f / 60.0f);
 		} else {
-			pad_io_set_rumble(0, 0);
-		}
+			gs_draw_orbit(yaw, dolly);
+			if (cross) {
+				pad_io_set_rumble(1, 0);
+				sfx_io_play();
+			} else {
+				pad_io_set_rumble(0, 0);
+			}
 #ifdef BLAZIUM_PS2_HAS_SCRIPT
-		script_vm_process(1.0f / 60.0f);
+			script_vm_process(1.0f / 60.0f);
 #endif
+		}
 		if (user_tick) {
 			user_tick(1.0f / 60.0f);
 		}

@@ -6,7 +6,7 @@ cmake_minimum_required(VERSION 3.10)
 
 project(blazium_ps2_runtime LANGUAGES CXX)
 
-add_executable(runtime main.cpp gs_draw.cpp pad_io.cpp sfx_io.cpp pack_io.cpp script_vm.cpp sys_io.cpp vu1_draw.cpp)
+add_executable(runtime main.cpp gs_draw.cpp pad_io.cpp sfx_io.cpp pack_io.cpp script_vm.cpp sys_io.cpp vu1_draw.cpp gdir_vm.cpp)
 file(GLOB _ps2_extra RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}"
 	"extra/*.cpp" "extra/*.c")
 if(_ps2_extra)

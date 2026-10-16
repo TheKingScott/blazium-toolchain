@@ -3,6 +3,7 @@
 // libsd.h/libsdr.h or call sceSdInit/sceSdRemote (this -lsdr lacks those).
 
 #include "sfx_io.h"
+#include "iso_path.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -108,7 +109,7 @@ static unsigned ru32(const unsigned char *p)
 static int load_blob(const char **paths, unsigned char **out, unsigned *sz)
 {
 	for (int i = 0; paths[i]; i++) {
-		FILE *f = fopen(paths[i], "rb");
+		FILE *f = iso_fopen(paths[i], "rb");
 		if (!f) {
 			continue;
 		}

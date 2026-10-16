@@ -1,6 +1,7 @@
 // MIT. Consume cooked CAM/HIT/HUD/TILE/NAV/ANIM/FMV. FMV/IPU is a named skip.
 
 #include "sys_io.h"
+#include "iso_path.h"
 
 #include "gs_draw.h"
 #include "pack_io.h"
@@ -196,11 +197,11 @@ static FILE *open_sys(const char *host, const char *iso_bs, const char *iso)
 	if (f) {
 		return f;
 	}
-	f = fopen(iso_bs, "rb");
+	f = iso_fopen(iso_bs, "rb");
 	if (f) {
 		return f;
 	}
-	return fopen(iso, "rb");
+	return iso_fopen(iso, "rb");
 }
 
 static unsigned char *read_sys(const char *host, const char *iso_bs, const char *iso, unsigned *sz)
@@ -321,6 +322,18 @@ static void apply_hit(const unsigned char *b, unsigned sz)
 	s_hit_loaded = 1;
 }
 
+/* HUD kind byte: bits 0-1 kind (1 label, 2 rect, 3 button), bits 2-3 align,
+ * bits 4-6 glyph scale - 1, bit 7 hidden. Scripts change hidden/text/pos. */
+static int hud_base(int i)
+{
+	return s_hud_kind[i] & 3;
+}
+
+static int hud_hidden(int i)
+{
+	return (s_hud_kind[i] >> 7) & 1;
+}
+
 static void redraw_hud(void)
 {
 	s_btn_n = 0;
@@ -328,7 +341,8 @@ static void redraw_hud(void)
 		int r = s_hud_r[i];
 		int g = s_hud_g[i];
 		int b = s_hud_b[i];
-		if (s_hud_kind[i] == 3) {
+		const int base = hud_base(i);
+		if (base == 3 && !hud_hidden(i)) {
 			s_btn_slot[s_btn_n++] = i;
 			if (s_hud_focus == i) {
 				r = 255;
@@ -337,14 +351,18 @@ static void redraw_hud(void)
 			}
 		}
 		gs_draw_hud_quad(i, s_hud_x[i], s_hud_y[i], s_hud_w[i], s_hud_h[i], r, g, b);
-		if (s_hud_kind[i] == 1 || s_hud_text[i][0]) {
-			const char *label = s_hud_text[i];
-			const char *bar = strchr(s_hud_text[i], '|');
-			if (bar) {
-				label = bar + 1;
-			}
-			gs_draw_hud_text(i, s_hud_x[i], s_hud_y[i], r, g, b, label);
+		const char *label = s_hud_text[i];
+		const char *bar = strchr(s_hud_text[i], '|');
+		if (bar) {
+			label = bar + 1;
 		}
+		gs_draw_hud_text(i, s_hud_x[i], s_hud_y[i], r, g, b, label);
+		const int tr = base == 1 ? r : 255;
+		const int tg = base == 1 ? g : 255;
+		const int tb = base == 1 ? b : 255;
+		const int focused_text = (base == 3 && s_hud_focus == i);
+		gs_draw_hud_style(i, base, ((s_hud_kind[i] >> 4) & 7) + 1, (s_hud_kind[i] >> 2) & 3, hud_hidden(i),
+				focused_text ? 20 : tr, focused_text ? 20 : tg, focused_text ? 40 : tb);
 	}
 }
 
@@ -376,7 +394,7 @@ static void apply_hud(const unsigned char *b, unsigned sz)
 		s_hud_b[i] = r[11];
 		memcpy(s_hud_text[i], r + 12, 64);
 		s_hud_text[i][64] = 0;
-		if (s_hud_kind[i] == 3 && s_hud_focus < 0) {
+		if ((s_hud_kind[i] & 3) == 3 && !(s_hud_kind[i] & 0x80) && s_hud_focus < 0) {
 			s_hud_focus = i;
 		}
 	}
@@ -785,6 +803,89 @@ void sys_io_say(const char *line)
 int sys_io_say_done(void)
 {
 	return s_say_done;
+}
+
+void sys_io_hud_set_hidden(int slot, int hidden)
+{
+	if (slot < 0 || slot >= s_hud_n) {
+		return;
+	}
+	const unsigned char k = hidden ? (unsigned char)(s_hud_kind[slot] | 0x80) : (unsigned char)(s_hud_kind[slot] & 0x7f);
+	if (k == s_hud_kind[slot]) {
+		return;
+	}
+	s_hud_kind[slot] = k;
+	if (hidden && s_hud_focus == slot) {
+		s_hud_focus = -1;
+		for (int i = 0; i < s_hud_n; i++) {
+			if ((s_hud_kind[i] & 3) == 3 && !(s_hud_kind[i] & 0x80)) {
+				s_hud_focus = i;
+				break;
+			}
+		}
+	}
+	redraw_hud();
+}
+
+int sys_io_hud_hidden(int slot)
+{
+	if (slot < 0 || slot >= s_hud_n) {
+		return 1;
+	}
+	return (s_hud_kind[slot] >> 7) & 1;
+}
+
+void sys_io_hud_set_pos(int slot, int x, int y)
+{
+	if (slot < 0 || slot >= s_hud_n) {
+		return;
+	}
+	s_hud_x[slot] = x;
+	s_hud_y[slot] = y;
+	redraw_hud();
+}
+
+void sys_io_hud_get_pos(int slot, int *x, int *y)
+{
+	if (slot < 0 || slot >= s_hud_n) {
+		*x = *y = 0;
+		return;
+	}
+	*x = s_hud_x[slot];
+	*y = s_hud_y[slot];
+}
+
+void sys_io_hud_set_color(int slot, int r, int g, int b)
+{
+	if (slot < 0 || slot >= s_hud_n) {
+		return;
+	}
+	s_hud_r[slot] = r;
+	s_hud_g[slot] = g;
+	s_hud_b[slot] = b;
+	redraw_hud();
+}
+
+const char *sys_io_hud_text(int slot)
+{
+	if (slot < 0 || slot >= s_hud_n) {
+		return "";
+	}
+	return s_hud_text[slot];
+}
+
+int sys_io_hud_focus(void)
+{
+	return s_hud_focus;
+}
+
+void sys_io_hud_set_focus(int slot)
+{
+	if (slot < 0 || slot >= s_hud_n || (s_hud_kind[slot] & 3) != 3) {
+		return;
+	}
+	s_hud_focus = slot;
+	redraw_hud();
 }
 
 void sys_io_set_hud_text(int slot, const char *text)

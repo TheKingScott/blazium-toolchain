@@ -55,6 +55,24 @@ static int g_ready;
 static const unsigned char *g_mesh;
 static unsigned g_mesh_sz;
 static unsigned g_vert_count;
+
+/* Chunks: runs of up to GS_CHUNK_TRIS consecutive triangles of one node with
+ * a bounding sphere (cooked space). A frame tests each chunk against the
+ * view frustum and the far plane before touching its vertices, so track
+ * behind the camera and hidden karts cost one test instead of a transform
+ * per vertex. Built when a MESH is parsed. */
+#define GS_CHUNK_TRIS 48
+#define GS_MAX_CHUNKS 4096
+struct MeshChunk {
+	unsigned first;
+	unsigned short n;
+	unsigned short node;
+	float c[3];
+	float r;
+};
+static MeshChunk g_chunks[GS_MAX_CHUNKS];
+static unsigned g_chunk_n;
+static unsigned g_stat_tris, g_stat_chunks, g_stat_frames;
 static unsigned g_index_count;
 static const unsigned char *g_verts;
 static const unsigned char *g_indices;
@@ -91,7 +109,12 @@ struct HudQuad {
 	int used;
 	int x, y, w, h;
 	int r, g, b;
-	char text[33];
+	/* Style (gs_draw_hud_style): kind 1 label (text only), 2 rect, 3 button;
+	 * scale is the glyph size multiplier; align 0 left, 1 centre, 2 right. */
+	int kind, scale, align, hidden;
+	int tr, tg, tb;
+	int styled;
+	char text[65];
 };
 struct SprtQuad {
 	int used;
@@ -111,6 +134,18 @@ static int g_sprt_n;
 static int g_tile_n;
 static float g_nofs[32][3];
 static float g_nrot[32][3];
+/* Per-node world correction (scripted Node3D transforms): verts are cooked in
+ * world space, so a moved node supplies M = W_now * W_cooked^-1 (3x4, row
+ * major). Visibility hides a node's triangles (the VM propagates to children). */
+#define GS_MAX_NODES 512
+static float g_nm[GS_MAX_NODES][12];
+static unsigned char g_nm_on[GS_MAX_NODES];
+static unsigned char g_nhide[GS_MAX_NODES];
+static int g_nodes_live;
+static int g_cam_locked;
+static int g_clear_r = 32;
+static int g_clear_g = 64;
+static int g_clear_b = 160;
 static int g_fade_a;
 static int g_fade_r;
 static int g_fade_g;
@@ -212,19 +247,77 @@ static int cam_cannot_see_aabb(float x, float y, float z)
 	return dist2 > far * far;
 }
 
+/* The cooked vertex is CookVert byte for byte on the little-endian EE, so a
+ * vertex is one 28-byte copy instead of seven assembled fields. */
+typedef char cook_vert_is_28_bytes[sizeof(CookVert) == 28 ? 1 : -1];
+
 static void read_vert(const unsigned char *p, CookVert *v)
 {
-	v->x = rf32(p);
-	v->y = rf32(p + 4);
-	v->z = rf32(p + 8);
-	v->r = p[12];
-	v->g = p[13];
-	v->b = p[14];
-	v->a = p[15];
-	v->u = rf32(p + 16);
-	v->v = rf32(p + 20);
-	v->node = (unsigned short)ru16(p + 24);
-	v->tex = (unsigned short)ru16(p + 26);
+	memcpy(v, p, sizeof(CookVert));
+}
+
+static void build_chunks(void)
+{
+	g_chunk_n = 0;
+	const unsigned ntri = g_index_count / 3;
+	unsigned t = 0;
+	while (t < ntri && g_chunk_n < GS_MAX_CHUNKS) {
+		MeshChunk *ch = &g_chunks[g_chunk_n];
+		ch->first = t;
+		ch->n = 0;
+		ch->node = 0xffff;
+		float lo[3] = { 1.0e9f, 1.0e9f, 1.0e9f };
+		float hi[3] = { -1.0e9f, -1.0e9f, -1.0e9f };
+		while (t < ntri && ch->n < GS_CHUNK_TRIS) {
+			const unsigned i0 = ru32(g_indices + t * 12);
+			if (i0 >= g_vert_count) {
+				break;
+			}
+			const unsigned node = ru16(g_verts + i0 * 28 + 24);
+			if (ch->n == 0) {
+				ch->node = (unsigned short)node;
+			} else if (node != ch->node) {
+				break;
+			}
+			for (int k = 0; k < 3; k++) {
+				const unsigned vi = ru32(g_indices + t * 12 + k * 4);
+				if (vi >= g_vert_count) {
+					continue;
+				}
+				const unsigned char *vp = g_verts + vi * 28;
+				for (int a = 0; a < 3; a++) {
+					const float f = rf32(vp + a * 4);
+					if (f < lo[a]) {
+						lo[a] = f;
+					}
+					if (f > hi[a]) {
+						hi[a] = f;
+					}
+				}
+			}
+			ch->n++;
+			t++;
+		}
+		if (ch->n == 0) {
+			/* bad index: let the per-triangle path reject it */
+			ch->n = 1;
+			ch->node = 0xffff;
+			ch->r = -1.0f;
+			t++;
+		} else {
+			float r2 = 0.0f;
+			for (int a = 0; a < 3; a++) {
+				ch->c[a] = 0.5f * (lo[a] + hi[a]);
+				const float h = 0.5f * (hi[a] - lo[a]);
+				r2 += h * h;
+			}
+			ch->r = sqrtf(r2);
+		}
+		g_chunk_n++;
+	}
+	if (t < ntri) {
+		g_chunk_n = 0; /* table full: draw triangle by triangle, uncull'd */
+	}
 }
 
 static int parse_mesh(const unsigned char *blob, unsigned sz)
@@ -277,6 +370,7 @@ static int parse_mesh(const unsigned char *blob, unsigned sz)
 		g_have_aabb = 1;
 		frame_aabb();
 	}
+	build_chunks();
 	return 1;
 }
 
@@ -577,7 +671,7 @@ static qword_t *bind_tex(qword_t *q, int slot)
 	texbuf.info.width = draw_log2((unsigned)t->width);
 	texbuf.info.height = draw_log2((unsigned)t->height);
 	texbuf.info.components = TEXTURE_COMPONENTS_RGB;
-	texbuf.info.function = TEXTURE_FUNCTION_DECAL;
+	texbuf.info.function = TEXTURE_FUNCTION_MODULATE;
 	lod.calculation = LOD_USE_K;
 	lod.mag_filter = LOD_MAG_NEAREST;
 	lod.min_filter = LOD_MIN_NEAREST;
@@ -592,7 +686,16 @@ static qword_t *bind_tex(qword_t *q, int slot)
 		clut.address = 0;
 		clut.psm = 0;
 	}
+	/* Godot UVs tile (flag UV 0..8): REPEAT, not the environment's CLAMP. */
+	texwrap_t wrap;
+	wrap.horizontal = WRAP_REPEAT;
+	wrap.vertical = WRAP_REPEAT;
+	wrap.minu = 0;
+	wrap.maxu = (int)t->width - 1;
+	wrap.minv = 0;
+	wrap.maxv = (int)t->height - 1;
 	q = draw_texture_sampling(q, 0, &lod);
+	q = draw_texture_wrapping(q, 0, &wrap);
 	q = draw_texturebuffer(q, 0, &texbuf, &clut);
 	PACK_GIFTAG(q, GIF_SET_TAG(1, 0, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
 	q++;
@@ -704,52 +807,6 @@ static void xform(const Mat4 *m, float x, float y, float z, float *ox, float *oy
 	*ow = m->m[3] * x + m->m[7] * y + m->m[11] * z + m->m[15];
 }
 
-static int project_vert(const Mat4 *mvp, const CookVert *v, vertex_f_t *clip, color_f_t *col, texel_f_t *st)
-{
-	float x, y, z, w;
-	{
-		const int ni = (v->node < 32) ? (int)v->node : 0;
-		float px = v->x + g_nofs[ni][0];
-		const float py = v->y + g_nofs[ni][1];
-		float pz = v->z + g_nofs[ni][2];
-		const float ry = g_nrot[ni][1];
-		if (ry != 0.0f) {
-			const float c = cosf(ry);
-			const float s = sinf(ry);
-			const float rx = px * c - pz * s;
-			pz = px * s + pz * c;
-			px = rx;
-		}
-		xform(mvp, px, py, pz, &x, &y, &z, &w);
-	}
-	if (w <= 0.08f) {
-		return 0;
-	}
-	clip->x = x / w;
-	clip->y = y / w;
-	/* GS ZTST is only GEQUAL/GREATER. OpenGL NDC near is -1; invert so near writes high Z. */
-	{
-		float nz = -z / w;
-		if (nz > 0.999f) {
-			nz = 0.999f;
-		}
-		if (nz < -1.0f) {
-			nz = -1.0f;
-		}
-		clip->z = nz;
-	}
-	clip->w = w;
-	col->r = (float)v->r / 255.0f;
-	col->g = (float)v->g / 255.0f;
-	col->b = (float)v->b / 255.0f;
-	col->a = (float)v->a / 255.0f;
-	st->s = v->u;
-	st->t = v->v;
-	st->r = 0.0f;
-	st->q = 1.0f;
-	return 1;
-}
-
 /* Tiny AABB + 16x16 GTEX turns a 0.8 box into a full-screen checker smear.
  * Face tints keep a readable cube without ST. */
 static void face_tint(const CookVert *a, const CookVert *b, const CookVert *c, color_f_t *cols)
@@ -783,11 +840,6 @@ static void face_tint(const CookVert *a, const CookVert *b, const CookVert *c, c
 		cols[k].b = bcol;
 		cols[k].a = 1.0f;
 	}
-}
-
-static int clip_on_screen(const vertex_f_t *c)
-{
-	return c->x > -1.2f && c->x < 1.2f && c->y > -1.2f && c->y < 1.2f;
 }
 
 static int aabb_is_tiny(void)
@@ -864,8 +916,8 @@ void gs_draw_fb_origin(int width, int height, float *ox, float *oy)
 	}
 }
 
-/* 5x7 rows packed in 7 bytes for ASCII 32..90. Bit 0 is the left column. */
-static const unsigned char kFont5x7[59][7] = {
+/* 5x7 rows packed in 7 bytes for ASCII 32..126. Bit 4 is the left column. */
+static const unsigned char kFont5x7[95][7] = {
 	{0, 0, 0, 0, 0, 0, 0}, /* space */
 	{4, 4, 4, 4, 4, 0, 4},
 	{10, 10, 0, 0, 0, 0, 0},
@@ -925,6 +977,42 @@ static const unsigned char kFont5x7[59][7] = {
 	{17, 17, 10, 4, 10, 17, 17},
 	{17, 17, 10, 4, 4, 4, 4},
 	{31, 1, 2, 4, 8, 16, 31},
+	{14, 8, 8, 8, 8, 8, 14}, /* [ */
+	{16, 8, 4, 2, 1, 0, 0},
+	{14, 2, 2, 2, 2, 2, 14},
+	{4, 10, 17, 0, 0, 0, 0},
+	{0, 0, 0, 0, 0, 0, 31},
+	{8, 4, 0, 0, 0, 0, 0},
+	{0, 0, 14, 1, 15, 17, 15}, /* a */
+	{16, 16, 22, 25, 17, 17, 30},
+	{0, 0, 14, 16, 16, 17, 14},
+	{1, 1, 13, 19, 17, 17, 15},
+	{0, 0, 14, 17, 31, 16, 14},
+	{6, 9, 8, 28, 8, 8, 8},
+	{0, 15, 17, 17, 15, 1, 14},
+	{16, 16, 22, 25, 17, 17, 17},
+	{4, 0, 12, 4, 4, 4, 14},
+	{2, 0, 6, 2, 2, 18, 12},
+	{16, 16, 18, 20, 24, 20, 18},
+	{12, 4, 4, 4, 4, 4, 14},
+	{0, 0, 26, 21, 21, 17, 17},
+	{0, 0, 22, 25, 17, 17, 17},
+	{0, 0, 14, 17, 17, 17, 14},
+	{0, 0, 30, 17, 30, 16, 16},
+	{0, 0, 13, 19, 15, 1, 1},
+	{0, 0, 22, 25, 16, 16, 16},
+	{0, 0, 14, 16, 14, 1, 30},
+	{8, 8, 28, 8, 8, 9, 6},
+	{0, 0, 17, 17, 17, 19, 13},
+	{0, 0, 17, 17, 17, 10, 4},
+	{0, 0, 17, 17, 21, 21, 10},
+	{0, 0, 17, 10, 4, 10, 17},
+	{0, 0, 17, 17, 15, 1, 14},
+	{0, 0, 31, 2, 4, 8, 31},
+	{2, 4, 4, 8, 4, 4, 2}, /* { */
+	{4, 4, 4, 4, 4, 4, 4},
+	{8, 4, 4, 2, 4, 4, 8},
+	{0, 0, 8, 21, 2, 0, 0},
 };
 
 static qword_t *emit_filled(qword_t *q, float x0, float y0, float x1, float y1, int r, int g, int b)
@@ -944,14 +1032,26 @@ static qword_t *emit_filled(qword_t *q, float x0, float y0, float x1, float y1, 
 	return draw_rect_filled(q, 0, &bar);
 }
 
-static qword_t *emit_glyph(qword_t *q, float ox, float oy, int ch, int r, int g, int b)
+static packet_t *g_hud_packet;
+static qword_t *g_hud_limit;
+
+/* HUD text can outgrow one packet: send what is there and keep going (the
+ * GS keeps the drawing environment between packets). */
+static qword_t *hud_room(qword_t *q)
 {
-	if (ch >= 'a' && ch <= 'z') {
-		ch -= 32;
+	if (g_hud_packet && g_hud_limit && q >= g_hud_limit) {
+		send_packet(g_hud_packet, q);
+		q = g_hud_packet->data;
 	}
-	if (ch < 32 || ch > 90) {
+	return q;
+}
+
+static qword_t *emit_glyph(qword_t *q, float ox, float oy, int ch, int r, int g, int b, int scale)
+{
+	if (ch < 32 || ch > 126) {
 		ch = '?';
 	}
+	const float sc = (float)(scale > 0 ? scale : 1);
 	const unsigned char *rows = kFont5x7[ch - 32];
 	for (int row = 0; row < 7; row++) {
 		unsigned char bits = rows[row];
@@ -965,14 +1065,61 @@ static qword_t *emit_glyph(qword_t *q, float ox, float oy, int ch, int r, int g,
 				}
 				run++;
 			} else if (start >= 0) {
-				q = emit_filled(q, ox + (float)start, oy + (float)row, ox + (float)(start + run), oy + (float)row + 1.0f, r, g, b);
+				q = hud_room(q);
+				q = emit_filled(q, ox + (float)start * sc, oy + (float)row * sc, ox + (float)(start + run) * sc, oy + (float)(row + 1) * sc, r, g, b);
 				start = -1;
 				run = 0;
 			}
 		}
 		if (start >= 0) {
-			q = emit_filled(q, ox + (float)start, oy + (float)row, ox + (float)(start + run), oy + (float)row + 1.0f, r, g, b);
+			q = hud_room(q);
+			q = emit_filled(q, ox + (float)start * sc, oy + (float)row * sc, ox + (float)(start + run) * sc, oy + (float)(row + 1) * sc, r, g, b);
 		}
+	}
+	return q;
+}
+
+/* One HUD slot's text: '\n' starts a new line, each line aligned in the box. */
+static qword_t *emit_text_block(qword_t *q, float ox, float oy, const HudQuad *h, int r, int g, int b)
+{
+	const int sc = h->scale > 0 ? h->scale : 1;
+	const int adv = 6 * sc;
+	const int line_h = 9 * sc;
+	const char *t = h->text;
+	int lines = 1;
+	for (const char *p = t; *p; p++) {
+		if (*p == '\n') {
+			lines++;
+		}
+	}
+	int y = h->y + 2;
+	if (h->styled && h->kind != 1) {
+		/* Buttons and panels centre their text vertically. */
+		const int total = lines * line_h - 2 * sc;
+		y = h->y + (h->h - total) / 2;
+	}
+	while (*t) {
+		int n = 0;
+		while (t[n] && t[n] != '\n') {
+			n++;
+		}
+		int x = h->x + 2;
+		const int width = n * adv - sc;
+		if (h->align == 1) {
+			x = h->x + (h->w - width) / 2;
+		} else if (h->align == 2) {
+			x = h->x + h->w - width - 2;
+		}
+		for (int c = 0; c < n; c++) {
+			if (t[c] != ' ') {
+				q = emit_glyph(q, ox + (float)(x + c * adv), oy + (float)y, (int)(unsigned char)t[c], r, g, b, sc);
+			}
+		}
+		t += n;
+		if (*t == '\n') {
+			t++;
+		}
+		y += line_h;
 	}
 	return q;
 }
@@ -984,18 +1131,24 @@ static qword_t *emit_hud(qword_t *q, int width, int height)
 	const float ox = -0.5f * (float)(width > 0 ? width : 640);
 	const float oy = -0.5f * (float)(height > 0 ? height : 448);
 	for (int i = 0; i < 16; i++) {
-		if (!g_hudq[i].used) {
+		const HudQuad *h = &g_hudq[i];
+		if (!h->used || h->hidden) {
 			continue;
 		}
-		q = emit_filled(q, ox + (float)g_hudq[i].x, oy + (float)g_hudq[i].y,
-				ox + (float)(g_hudq[i].x + g_hudq[i].w), oy + (float)(g_hudq[i].y + g_hudq[i].h),
-				g_hudq[i].r, g_hudq[i].g, g_hudq[i].b);
-		if (g_hudq[i].text[0]) {
-			int n = 0;
-			for (int c = 0; g_hudq[i].text[c] && n < 16; c++, n++) {
-				q = emit_glyph(q, ox + (float)(g_hudq[i].x + 2 + n * 6), oy + (float)(g_hudq[i].y + 2),
-						(int)(unsigned char)g_hudq[i].text[c], 255, 255, 255);
+		q = hud_room(q);
+		if (!h->styled) {
+			/* Unstyled (legacy) rows: filled box, white text. */
+			q = emit_filled(q, ox + (float)h->x, oy + (float)h->y, ox + (float)(h->x + h->w), oy + (float)(h->y + h->h), h->r, h->g, h->b);
+			if (h->text[0]) {
+				q = emit_text_block(q, ox, oy, h, 255, 255, 255);
 			}
+			continue;
+		}
+		if (h->kind != 1) {
+			q = emit_filled(q, ox + (float)h->x, oy + (float)h->y, ox + (float)(h->x + h->w), oy + (float)(h->y + h->h), h->r, h->g, h->b);
+		}
+		if (h->text[0]) {
+			q = emit_text_block(q, ox, oy, h, h->tr, h->tg, h->tb);
 		}
 	}
 	for (int i = 0; i < g_sprt_n && i < 32; i++) {
@@ -1224,7 +1377,7 @@ static void apply_look_from_euler(void)
 
 void gs_draw_set_camera(float x, float y, float z, float pitch, float yaw, float roll, float fov_deg)
 {
-	if (g_have_aabb) {
+	if (g_have_aabb && !g_cam_locked) {
 		frame_aabb();
 		if (fov_deg > 1.0f && fov_deg < 170.0f) {
 			g_fov = fov_deg;
@@ -1344,12 +1497,27 @@ void gs_draw_hud_text(int slot, int x, int y, int r, int g, int b, const char *s
 	g_hudq[slot].b = b;
 	unsigned i = 0;
 	if (str) {
-		while (str[i] && i < 32) {
+		while (str[i] && i < 64) {
 			g_hudq[slot].text[i] = str[i];
 			i++;
 		}
 	}
 	g_hudq[slot].text[i] = 0;
+}
+
+void gs_draw_hud_style(int slot, int kind, int scale, int align, int hidden, int tr, int tg, int tb)
+{
+	if (slot < 0 || slot >= 16) {
+		return;
+	}
+	g_hudq[slot].styled = 1;
+	g_hudq[slot].kind = kind;
+	g_hudq[slot].scale = scale > 0 ? scale : 1;
+	g_hudq[slot].align = align;
+	g_hudq[slot].hidden = hidden ? 1 : 0;
+	g_hudq[slot].tr = tr;
+	g_hudq[slot].tg = tg;
+	g_hudq[slot].tb = tb;
 }
 
 void gs_draw_sprt(int slot, int x, int y, int w, int h, int tex, int flip)
@@ -1458,13 +1626,16 @@ void gs_draw_overlay(framebuffer_t *frame, zbuffer_t *z)
 		return;
 	}
 	(void)z;
-	packet_t *packet = packet_init(256, PACKET_NORMAL);
+	packet_t *packet = packet_init(GS_PACKET_QWORDS, PACKET_NORMAL);
 	if (!packet) {
 		return;
 	}
 	qword_t *q = packet->data;
 	q = draw_framebuffer(q, 0, frame);
+	g_hud_packet = packet;
+	g_hud_limit = packet->data + (GS_PACKET_QWORDS - 80);
 	q = emit_hud(q, frame->width, frame->height);
+	g_hud_packet = 0;
 	q = draw_finish(q);
 	send_packet(packet, q);
 	packet_free(packet);
@@ -1542,7 +1713,7 @@ void gs_draw_fill_mvp(float out[16], int width, int height)
 	yaw_y(&world, g_world_yaw);
 	float ex = 0.0f, ey = 0.0f, ez = 0.0f;
 	eye_now(&ex, &ey, &ez);
-	if (aabb_is_tiny() || cam_cannot_see_aabb(ex, ey, ez)) {
+	if (!g_cam_locked && (aabb_is_tiny() || cam_cannot_see_aabb(ex, ey, ez))) {
 		frame_aabb();
 		eye_now(&ex, &ey, &ez);
 	}
@@ -1559,6 +1730,9 @@ void gs_draw_fill_mvp(float out[16], int width, int height)
 
 void gs_draw_orbit(float yaw, float dolly)
 {
+	if (g_cam_locked) {
+		return;
+	}
 	const float tx = g_look_x;
 	const float ty = g_look_y;
 	const float tz = g_look_z;
@@ -1607,7 +1781,339 @@ static qword_t *end_prim(qword_t *q, int *in_prim)
 	return q;
 }
 
+/* ---- Scene triangles: node transforms, near/guard-band clipping. ---- */
+
+struct DrawCtx {
+	packet_t *packet;
+	qword_t *q;
+	qword_t *limit;
+	framebuffer_t *frame;
+	zbuffer_t *z;
+	const Mat4 *mvp;
+	prim_t prim;
+	color_t color;
+	int bound;
+	int in_prim;
+	unsigned emitted;
+	unsigned drawn;
+	int tiny;
+};
+
+/* Clip-space vertex with its attributes, for Sutherland-Hodgman. */
+struct PV {
+	float x, y, z, w;
+	float r, g, b, a;
+	float s, t;
+};
+
+static void node_world(const CookVert *v, float *x, float *y, float *z)
+{
+	float px = v->x;
+	float py = v->y;
+	float pz = v->z;
+	const int n = (int)v->node;
+	if (g_nodes_live && n < GS_MAX_NODES && g_nm_on[n]) {
+		const float *m = g_nm[n];
+		const float qx = m[0] * px + m[1] * py + m[2] * pz + m[3];
+		const float qy = m[4] * px + m[5] * py + m[6] * pz + m[7];
+		const float qz = m[8] * px + m[9] * py + m[10] * pz + m[11];
+		px = qx;
+		py = qy;
+		pz = qz;
+	}
+	if (n < 32) {
+		px += g_nofs[n][0];
+		py += g_nofs[n][1];
+		pz += g_nofs[n][2];
+		const float ry = g_nrot[n][1];
+		if (ry != 0.0f) {
+			const float c = cosf(ry);
+			const float s = sinf(ry);
+			const float rx = px * c - pz * s;
+			pz = px * s + pz * c;
+			px = rx;
+		}
+	}
+	*x = px;
+	*y = py;
+	*z = pz;
+}
+
+static void to_pv(const Mat4 *mvp, const CookVert *v, PV *o)
+{
+	float px, py, pz;
+	node_world(v, &px, &py, &pz);
+	xform(mvp, px, py, pz, &o->x, &o->y, &o->z, &o->w);
+	o->r = (float)v->r / 255.0f;
+	o->g = (float)v->g / 255.0f;
+	o->b = (float)v->b / 255.0f;
+	o->a = (float)v->a / 255.0f;
+	o->s = v->u;
+	o->t = v->v;
+}
+
+/* Plane distance: near (w >= kNearW) plus a guard band that keeps GS XY in
+ * 12.4 range after fit_ndc_to_frame (|x| <= 6w, |y| <= 8w). */
+#define CLIP_NEAR_W 0.25f
+static float plane_d(const PV *v, int p)
+{
+	switch (p) {
+		case 0:
+			return v->w - CLIP_NEAR_W;
+		case 1:
+			return 6.0f * v->w - v->x;
+		case 2:
+			return 6.0f * v->w + v->x;
+		case 3:
+			return 8.0f * v->w - v->y;
+		default:
+			return 8.0f * v->w + v->y;
+	}
+}
+
+static void pv_lerp(const PV *a, const PV *b, float t, PV *o)
+{
+	o->x = a->x + (b->x - a->x) * t;
+	o->y = a->y + (b->y - a->y) * t;
+	o->z = a->z + (b->z - a->z) * t;
+	o->w = a->w + (b->w - a->w) * t;
+	o->r = a->r + (b->r - a->r) * t;
+	o->g = a->g + (b->g - a->g) * t;
+	o->b = a->b + (b->b - a->b) * t;
+	o->a = a->a + (b->a - a->a) * t;
+	o->s = a->s + (b->s - a->s) * t;
+	o->t = a->t + (b->t - a->t) * t;
+}
+
+static int clip_poly(PV *poly, int n)
+{
+	PV tmp[9];
+	for (int p = 0; p < 5 && n >= 3; p++) {
+		int all_in = 1;
+		for (int i = 0; i < n; i++) {
+			if (plane_d(&poly[i], p) < 0.0f) {
+				all_in = 0;
+				break;
+			}
+		}
+		if (all_in) {
+			continue;
+		}
+		int m = 0;
+		for (int i = 0; i < n && m < 8; i++) {
+			const PV *a = &poly[i];
+			const PV *b = &poly[(i + 1) % n];
+			const float da = plane_d(a, p);
+			const float db = plane_d(b, p);
+			if (da >= 0.0f) {
+				tmp[m++] = *a;
+			}
+			if ((da >= 0.0f) != (db >= 0.0f) && m < 8) {
+				pv_lerp(a, b, da / (da - db), &tmp[m++]);
+			}
+		}
+		for (int i = 0; i < m; i++) {
+			poly[i] = tmp[i];
+		}
+		n = m;
+	}
+	return n;
+}
+
+static void ctx_flush(DrawCtx *c)
+{
+	c->q = end_prim(c->q, &c->in_prim);
+	c->q = draw_finish(c->q);
+	send_packet(c->packet, c->q);
+	c->q = c->packet->data;
+	c->q = draw_framebuffer(c->q, 0, c->frame);
+	c->q = draw_zbuffer(c->q, 0, c->z);
+	if (!c->tiny) {
+		c->q = draw_enable_tests(c->q, 0, c->z);
+	}
+	c->bound = -1;
+	c->emitted = 0;
+}
+
+static void emit_clipped(DrawCtx *c, const PV *a, const PV *b, const PV *d, int slot)
+{
+	vertex_f_t clip[3];
+	color_f_t cols[3];
+	texel_f_t sts[3];
+	xyz_t xyz[3];
+	color_t rgba[3];
+	texel_t st[3];
+	const PV *v[3] = { a, b, d };
+	for (int k = 0; k < 3; k++) {
+		const float w = v[k]->w;
+		const float z = v[k]->z;
+		clip[k].x = v[k]->x / w;
+		clip[k].y = v[k]->y / w;
+		/* GS ZTST is only GEQUAL/GREATER: invert NDC z so near writes high Z. */
+		float nz = -z / w;
+		if (nz > 0.999f) {
+			nz = 0.999f;
+		}
+		if (nz < -1.0f) {
+			nz = -1.0f;
+		}
+		clip[k].z = nz;
+		clip[k].w = w;
+		cols[k].r = v[k]->r;
+		cols[k].g = v[k]->g;
+		cols[k].b = v[k]->b;
+		cols[k].a = v[k]->a;
+		sts[k].s = v[k]->s;
+		sts[k].t = v[k]->t;
+		sts[k].r = 0.0f;
+		sts[k].q = 1.0f;
+	}
+	if (c->q >= c->limit) {
+		ctx_flush(c);
+	}
+	if (slot != c->bound || c->emitted >= GS_BATCH_TRIS) {
+		c->q = end_prim(c->q, &c->in_prim);
+		c->emitted = 0;
+		if (slot != c->bound) {
+			if (!c->tiny) {
+				c->q = bind_tex(c->q, slot);
+			}
+			c->bound = slot;
+		}
+		c->q = draw_prim_start(c->q, 0, &c->prim, &c->color);
+		c->in_prim = 1;
+	}
+	fit_ndc_to_frame(clip, 3, c->frame);
+	draw_convert_xyz(xyz, 2048.0f, 2048.0f, 32, 3, clip);
+	apply_gs_z(xyz, clip, 3, slot);
+	draw_convert_rgbq(rgba, 3, clip, cols, 0x80);
+	draw_convert_st(st, 3, clip, sts);
+	u64 *dw = (u64 *)c->q;
+	for (int k = 0; k < 3; k++) {
+		*dw++ = rgba[k].rgbaq;
+		*dw++ = st[k].uv;
+		*dw++ = xyz[k].xyz;
+	}
+	c->q = (qword_t *)dw;
+	c->emitted++;
+	c->drawn++;
+}
+
+static void draw_tri(DrawCtx *c, const CookVert *v0, const CookVert *v1, const CookVert *v2)
+{
+	if (g_nodes_live) {
+		const int n = (int)v0->node;
+		if (n < GS_MAX_NODES && g_nhide[n]) {
+			return;
+		}
+	}
+	PV poly[9];
+	to_pv(c->mvp, v0, &poly[0]);
+	to_pv(c->mvp, v1, &poly[1]);
+	to_pv(c->mvp, v2, &poly[2]);
+	/* Whole triangle outside one frustum side: drop before any work. */
+	if ((poly[0].x > poly[0].w && poly[1].x > poly[1].w && poly[2].x > poly[2].w) ||
+			(poly[0].x < -poly[0].w && poly[1].x < -poly[1].w && poly[2].x < -poly[2].w) ||
+			(poly[0].y > poly[0].w && poly[1].y > poly[1].w && poly[2].y > poly[2].w) ||
+			(poly[0].y < -poly[0].w && poly[1].y < -poly[1].w && poly[2].y < -poly[2].w) ||
+			(poly[0].w < CLIP_NEAR_W && poly[1].w < CLIP_NEAR_W && poly[2].w < CLIP_NEAR_W)) {
+		return;
+	}
+	if (c->tiny) {
+		color_f_t tint[3];
+		face_tint(v0, v1, v2, tint);
+		for (int k = 0; k < 3; k++) {
+			poly[k].r = tint[k].r;
+			poly[k].g = tint[k].g;
+			poly[k].b = tint[k].b;
+		}
+	}
+	const int n = clip_poly(poly, 3);
+	for (int i = 1; i + 1 < n; i++) {
+		emit_clipped(c, &poly[0], &poly[i], &poly[i + 1], (int)v0->tex);
+	}
+}
+
+static void draw_range(DrawCtx *c, unsigned t0, unsigned t1)
+{
+	for (unsigned t = t0; t < t1; t++) {
+		const unsigned i0 = ru32(g_indices + t * 12);
+		const unsigned i1 = ru32(g_indices + t * 12 + 4);
+		const unsigned i2 = ru32(g_indices + t * 12 + 8);
+		if (i0 >= g_vert_count || i1 >= g_vert_count || i2 >= g_vert_count) {
+			continue;
+		}
+		CookVert v0, v1, v2;
+		read_vert(g_verts + i0 * 28, &v0);
+		read_vert(g_verts + i1 * 28, &v1);
+		read_vert(g_verts + i2 * 28, &v2);
+		draw_tri(c, &v0, &v1, &v2);
+		g_stat_tris++;
+	}
+}
+
+void gs_draw_nodes_begin(void)
+{
+	g_nodes_live = 1;
+}
+
+void gs_draw_node_matrix(int node, const float *m)
+{
+	if (node < 0 || node >= GS_MAX_NODES) {
+		return;
+	}
+	if (!m) {
+		g_nm_on[node] = 0;
+		return;
+	}
+	memcpy(g_nm[node], m, sizeof(g_nm[node]));
+	g_nm_on[node] = 1;
+}
+
+void gs_draw_node_hidden(int node, int hidden)
+{
+	if (node < 0 || node >= GS_MAX_NODES) {
+		return;
+	}
+	g_nhide[node] = hidden ? 1 : 0;
+}
+
+void gs_draw_nodes_reset(void)
+{
+	memset(g_nm_on, 0, sizeof(g_nm_on));
+	memset(g_nhide, 0, sizeof(g_nhide));
+	g_nodes_live = 0;
+}
+
+void gs_draw_camera_lock(int on)
+{
+	g_cam_locked = on ? 1 : 0;
+}
+
+void gs_draw_camera_look(float ex, float ey, float ez, float tx, float ty, float tz, float fov_deg)
+{
+	g_cam_x = ex;
+	g_cam_y = ey;
+	g_cam_z = ez;
+	g_look_x = tx;
+	g_look_y = ty;
+	g_look_z = tz;
+	g_attach_x = g_attach_y = g_attach_z = 0.0f;
+	g_eye_h = 0.0f;
+	if (fov_deg > 1.0f && fov_deg < 170.0f) {
+		g_fov = fov_deg;
+	}
+}
+
+void gs_draw_set_clear(int r, int g, int b)
+{
+	g_clear_r = r;
+	g_clear_g = g;
+	g_clear_b = b;
+}
+
 void gs_draw_scene(framebuffer_t *frame, zbuffer_t *z)
+
 {
 	if (!frame) {
 		return;
@@ -1625,12 +2131,15 @@ void gs_draw_scene(framebuffer_t *frame, zbuffer_t *z)
 	q = draw_framebuffer(q, 0, frame);
 	q = draw_zbuffer(q, 0, z);
 	q = draw_disable_tests(q, 0, z);
-	q = draw_clear(q, 0, ox, oy, (float)frame->width, (float)frame->height, 32, 64, 160);
+	q = draw_clear(q, 0, ox, oy, (float)frame->width, (float)frame->height, g_clear_r, g_clear_g, g_clear_b);
 	if (!aabb_is_tiny()) {
 		q = draw_enable_tests(q, 0, z);
 	}
 	if (!g_ready) {
+		g_hud_packet = packet;
+		g_hud_limit = limit;
 		q = emit_hud(q, frame->width, frame->height);
+		g_hud_packet = 0;
 		q = draw_finish(q);
 		send_packet(packet, q);
 		packet_free(packet);
@@ -1641,7 +2150,7 @@ void gs_draw_scene(framebuffer_t *frame, zbuffer_t *z)
 	yaw_y(&world, g_world_yaw);
 	float ex = 0.0f, ey = 0.0f, ez = 0.0f;
 	eye_now(&ex, &ey, &ez);
-	if (aabb_is_tiny() || cam_cannot_see_aabb(ex, ey, ez)) {
+	if (!g_cam_locked && (aabb_is_tiny() || cam_cannot_see_aabb(ex, ey, ez))) {
 		frame_aabb();
 		eye_now(&ex, &ey, &ez);
 	}
@@ -1654,96 +2163,90 @@ void gs_draw_scene(framebuffer_t *frame, zbuffer_t *z)
 	mat_mul(&view, &world, &tmp);
 	mat_mul(&proj, &tmp, &mvp);
 
-	prim_t prim;
-	color_t color;
-	memset(&prim, 0, sizeof(prim));
-	memset(&color, 0, sizeof(color));
-	prim.type = PRIM_TRIANGLE;
-	prim.shading = PRIM_SHADE_GOURAUD;
-	prim.mapping = (g_tex_count > 0 && !aabb_is_tiny()) ? DRAW_ENABLE : DRAW_DISABLE;
-	prim.mapping_type = PRIM_MAP_ST;
-	prim.colorfix = PRIM_UNFIXED;
-	color.r = 0x80;
-	color.g = 0x80;
-	color.b = 0x80;
-	color.a = 0x80;
-	color.q = 1.0f;
-
-	vertex_f_t clip[3];
-	color_f_t cols[3];
-	texel_f_t sts[3];
-	xyz_t xyz[3];
-	color_t rgba[3];
-	texel_t st[3];
-
-	int bound = -1;
-	int in_prim = 0;
-	unsigned emitted = 0;
-	unsigned drawn = 0;
-	unsigned visible = 0;
+	DrawCtx c;
+	memset(&c, 0, sizeof(c));
+	c.packet = packet;
+	c.q = q;
+	c.limit = limit;
+	c.frame = frame;
+	c.z = z;
+	c.mvp = &mvp;
+	c.bound = -1;
+	c.prim.type = PRIM_TRIANGLE;
+	c.prim.shading = PRIM_SHADE_GOURAUD;
+	c.prim.mapping = (g_tex_count > 0 && !aabb_is_tiny()) ? DRAW_ENABLE : DRAW_DISABLE;
+	c.prim.mapping_type = PRIM_MAP_ST;
+	c.prim.colorfix = PRIM_UNFIXED;
+	c.color.r = 0x80;
+	c.color.g = 0x80;
+	c.color.b = 0x80;
+	c.color.a = 0x80;
+	c.color.q = 1.0f;
+	c.tiny = aabb_is_tiny();
 
 	const unsigned ntri = g_index_count / 3;
-	for (unsigned t = 0; t < ntri; t++) {
-		const unsigned i0 = ru32(g_indices + t * 12);
-		const unsigned i1 = ru32(g_indices + t * 12 + 4);
-		const unsigned i2 = ru32(g_indices + t * 12 + 8);
-		if (i0 >= g_vert_count || i1 >= g_vert_count || i2 >= g_vert_count) {
-			continue;
+	if (g_chunk_n == 0) {
+		draw_range(&c, 0, ntri);
+	} else {
+		/* frustum planes from the rows of mvp (column-major): left, right,
+		 * bottom, top, near (w >= CLIP_NEAR_W), far (w <= 400) */
+		const float *m = mvp.m;
+		float pl[6][4];
+		for (int k = 0; k < 4; k++) {
+			const float rx = m[k * 4 + 0], ry = m[k * 4 + 1], rw = m[k * 4 + 3];
+			pl[0][k] = rw + rx;
+			pl[1][k] = rw - rx;
+			pl[2][k] = rw + ry;
+			pl[3][k] = rw - ry;
+			pl[4][k] = rw;
+			pl[5][k] = -rw;
 		}
-		CookVert v0, v1, v2;
-		read_vert(g_verts + i0 * 28, &v0);
-		read_vert(g_verts + i1 * 28, &v1);
-		read_vert(g_verts + i2 * 28, &v2);
-		if (!project_vert(&mvp, &v0, &clip[0], &cols[0], &sts[0]) ||
-				!project_vert(&mvp, &v1, &clip[1], &cols[1], &sts[1]) ||
-				!project_vert(&mvp, &v2, &clip[2], &cols[2], &sts[2])) {
-			continue;
-		}
-		if (aabb_is_tiny()) {
-			face_tint(&v0, &v1, &v2, cols);
-		}
-		const int slot = (int)v0.tex;
-		if (q >= limit) {
-			q = end_prim(q, &in_prim);
-			q = draw_finish(q);
-			send_packet(packet, q);
-			q = packet->data;
-			q = draw_framebuffer(q, 0, frame);
-			q = draw_zbuffer(q, 0, z);
-			if (!aabb_is_tiny()) {
-				q = draw_enable_tests(q, 0, z);
-			}
-			bound = -1;
-			emitted = 0;
-		}
-		if (slot != bound || emitted >= GS_BATCH_TRIS) {
-			q = end_prim(q, &in_prim);
-			emitted = 0;
-			if (slot != bound) {
-				if (!aabb_is_tiny()) {
-					q = bind_tex(q, slot);
+		pl[4][3] -= CLIP_NEAR_W;
+		pl[5][3] += 400.0f;
+		for (int p = 0; p < 6; p++) {
+			const float l = sqrtf(pl[p][0] * pl[p][0] + pl[p][1] * pl[p][1] + pl[p][2] * pl[p][2]);
+			if (l > 1e-6f) {
+				for (int k = 0; k < 4; k++) {
+					pl[p][k] /= l;
 				}
-				bound = slot;
 			}
-			q = draw_prim_start(q, 0, &prim, &color);
-			in_prim = 1;
 		}
-		fit_ndc_to_frame(clip, 3, frame);
-		draw_convert_xyz(xyz, 2048.0f, 2048.0f, 32, 3, clip);
-		apply_gs_z(xyz, clip, 3, slot);
-		draw_convert_rgbq(rgba, 3, clip, cols, 0x80);
-		draw_convert_st(st, 3, clip, sts);
-		u64 *dw = (u64 *)q;
-		for (int k = 0; k < 3; k++) {
-			*dw++ = rgba[k].rgbaq;
-			*dw++ = st[k].uv;
-			*dw++ = xyz[k].xyz;
-		}
-		q = (qword_t *)dw;
-		emitted++;
-		drawn++;
-		if (clip_on_screen(&clip[0]) || clip_on_screen(&clip[1]) || clip_on_screen(&clip[2])) {
-			visible++;
+		for (unsigned ci = 0; ci < g_chunk_n; ci++) {
+			const MeshChunk *ch = &g_chunks[ci];
+			const unsigned n = ch->node;
+			if (ch->r >= 0.0f && n != 0xffff) {
+				if (g_nodes_live && n < GS_MAX_NODES && g_nhide[n]) {
+					continue;
+				}
+				int cull = 1;
+				float cx = ch->c[0], cy = ch->c[1], cz = ch->c[2];
+				if (g_nodes_live && n < GS_MAX_NODES && g_nm_on[n]) {
+					const float *w = g_nm[n];
+					const float qx = w[0] * cx + w[1] * cy + w[2] * cz + w[3];
+					const float qy = w[4] * cx + w[5] * cy + w[6] * cz + w[7];
+					const float qz = w[8] * cx + w[9] * cy + w[10] * cz + w[11];
+					cx = qx;
+					cy = qy;
+					cz = qz;
+				}
+				if (n < 32 && (g_nofs[n][0] != 0.0f || g_nofs[n][1] != 0.0f || g_nofs[n][2] != 0.0f ||
+									  g_nrot[n][1] != 0.0f)) {
+					cull = 0; /* legacy tape offsets: positions move outside g_nm */
+				}
+				if (cull) {
+					int out = 0;
+					for (int p = 0; p < 6 && !out; p++) {
+						if (pl[p][0] * cx + pl[p][1] * cy + pl[p][2] * cz + pl[p][3] < -ch->r) {
+							out = 1;
+						}
+					}
+					if (out) {
+						continue;
+					}
+				}
+			}
+			g_stat_chunks++;
+			draw_range(&c, ch->first, ch->first + ch->n);
 		}
 	}
 	for (int ly = 0; ly < g_ly_n; ly++) {
@@ -1772,59 +2275,20 @@ void gs_draw_scene(framebuffer_t *frame, zbuffer_t *z)
 			read_vert(lverts_p + i0 * 28, &v0);
 			read_vert(lverts_p + i1 * 28, &v1);
 			read_vert(lverts_p + i2 * 28, &v2);
-			if (!project_vert(&mvp, &v0, &clip[0], &cols[0], &sts[0]) ||
-					!project_vert(&mvp, &v1, &clip[1], &cols[1], &sts[1]) ||
-					!project_vert(&mvp, &v2, &clip[2], &cols[2], &sts[2])) {
-				continue;
-			}
-			if (aabb_is_tiny()) {
-				face_tint(&v0, &v1, &v2, cols);
-			}
-			const int slot = (int)v0.tex;
-			if (q >= limit) {
-				q = end_prim(q, &in_prim);
-				q = draw_finish(q);
-				send_packet(packet, q);
-				q = packet->data;
-				q = draw_framebuffer(q, 0, frame);
-				q = draw_zbuffer(q, 0, z);
-				if (!aabb_is_tiny()) {
-					q = draw_enable_tests(q, 0, z);
-				}
-				bound = -1;
-				emitted = 0;
-			}
-			if (slot != bound || emitted >= GS_BATCH_TRIS) {
-				q = end_prim(q, &in_prim);
-				emitted = 0;
-				if (slot != bound) {
-					if (!aabb_is_tiny()) {
-						q = bind_tex(q, slot);
-					}
-					bound = slot;
-				}
-				q = draw_prim_start(q, 0, &prim, &color);
-				in_prim = 1;
-			}
-			fit_ndc_to_frame(clip, 3, frame);
-			draw_convert_xyz(xyz, 2048.0f, 2048.0f, 32, 3, clip);
-			apply_gs_z(xyz, clip, 3, slot);
-			draw_convert_rgbq(rgba, 3, clip, cols, 0x80);
-			draw_convert_st(st, 3, clip, sts);
-			u64 *dw = (u64 *)q;
-			for (int k = 0; k < 3; k++) {
-				*dw++ = rgba[k].rgbaq;
-				*dw++ = st[k].uv;
-				*dw++ = xyz[k].xyz;
-			}
-			q = (qword_t *)dw;
-			emitted++;
-			drawn++;
-			if (clip_on_screen(&clip[0]) || clip_on_screen(&clip[1]) || clip_on_screen(&clip[2])) {
-				visible++;
-			}
+			draw_tri(&c, &v0, &v1, &v2);
 		}
 	}
+#ifdef GS_STATS
+	if (++g_stat_frames % 300 == 0) {
+		printf("GS stats: %u chunks, %u of %u tris tested, %u drawn (this frame)\n", g_stat_chunks, g_stat_tris,
+				g_index_count / 3, c.drawn);
+	}
+#endif
+	g_stat_tris = 0;
+	g_stat_chunks = 0;
+	q = c.q;
+	int in_prim = c.in_prim;
+	const unsigned drawn = c.drawn;
 	q = end_prim(q, &in_prim);
 	q = draw_disable_tests(q, 0, z);
 	if (drawn == 0) {
@@ -1835,7 +2299,10 @@ void gs_draw_scene(framebuffer_t *frame, zbuffer_t *z)
 		q = emit_filled(q, hx + 8.0f, hy + 8.0f, hx + hw * 0.5f - 8.0f, hy + hh - 8.0f, 200, 170, 48);
 		q = emit_filled(q, hx + hw * 0.5f + 8.0f, hy + 8.0f, hx + hw - 8.0f, hy + hh - 8.0f, 40, 160, 90);
 	}
+	g_hud_packet = packet;
+	g_hud_limit = limit;
 	q = emit_hud(q, frame->width, frame->height);
+	g_hud_packet = 0;
 	q = draw_finish(q);
 	send_packet(packet, q);
 	packet_free(packet);

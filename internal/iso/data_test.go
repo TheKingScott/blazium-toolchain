@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -84,4 +85,43 @@ func walkDirForTest(t *testing.T, img []byte, extent, size uint32) int {
 		off += l
 	}
 	return seen
+}
+
+func TestWriteDataISOSubdirKeepsRootShort(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "SYSTEM.CNF"), []byte("BOOT2 = cdrom0:\\GAME.ELF;1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "GAME.ELF"), []byte("elf"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 80; i++ {
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("MESH%02d.BIN", i)), []byte("data"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out := filepath.Join(t.TempDir(), "boot.iso")
+	keep := func(n string) bool { return n == "SYSTEM.CNF" || n == "GAME.ELF" }
+	if err := WriteDataISOSubdir(dir, out, "TEST", keep, "DATA", nil); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pvd := b[16*SectorSize:]
+	ext := binary.LittleEndian.Uint32(pvd[156+2:])
+	size := binary.LittleEndian.Uint32(pvd[156+10:])
+	if size != SectorSize {
+		t.Fatalf("root directory is %d bytes, want one sector", size)
+	}
+	root := string(b[int(ext)*SectorSize : int(ext)*SectorSize+int(size)])
+	for _, want := range []string{"SYSTEM.CNF;1", "GAME.ELF;1", "DATA"} {
+		if !strings.Contains(root, want) {
+			t.Fatalf("root has no %s", want)
+		}
+	}
+	if strings.Contains(root, "MESH00") {
+		t.Fatal("MESH00 should be under DATA, not the root")
+	}
 }

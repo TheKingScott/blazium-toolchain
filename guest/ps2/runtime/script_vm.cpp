@@ -1,7 +1,9 @@
 // MIT. Interpret cooked SCRP ABI 1 (rotate_y + kit name/id bind). No Godot/Luau VM.
 
 #include "script_vm.h"
+#include "iso_path.h"
 
+#include "gdir_vm.h"
 #include "gs_draw.h"
 #include "pack_io.h"
 #include "pad_io.h"
@@ -370,7 +372,7 @@ static void try_bind_node_pack(int pack)
 	paths[2] = iso;
 	paths[3] = NULL;
 	for (int i = 0; paths[i]; i++) {
-		FILE *f = fopen(paths[i], "rb");
+		FILE *f = iso_fopen(paths[i], "rb");
 		if (!f) {
 			continue;
 		}
@@ -1457,6 +1459,14 @@ int script_vm_init(const unsigned char *scrp, unsigned scrp_sz,
 	const unsigned tape_n = ru32(scrp + 8);
 	if (12 + tape_n > scrp_sz) {
 		return 0;
+	}
+	/* Flag bit 0: a GDIR program (compiled scripts) follows the tape and
+	 * drives the scene; the keyword tape is then only a summary. */
+	if ((ru16(scrp + 6) & 1) && gdir_vm_init(scrp + 12 + tape_n, scrp_sz - 12 - tape_n)) {
+		s_tape = 0;
+		s_tape_n = 0;
+		s_ready = 1;
+		return 1;
 	}
 	s_tape = scrp + 12;
 	s_tape_n = tape_n;
