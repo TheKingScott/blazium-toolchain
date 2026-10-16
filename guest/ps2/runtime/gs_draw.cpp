@@ -62,6 +62,7 @@ static unsigned g_vert_count;
  * behind the camera and hidden karts cost one test instead of a transform
  * per vertex. Built when a MESH is parsed. */
 #define GS_CHUNK_TRIS 48
+#define GS_CHUNK_SPAN 40.0f /* metres, any axis */
 #define GS_MAX_CHUNKS 4096
 struct MeshChunk {
 	unsigned first;
@@ -296,6 +297,29 @@ static void build_chunks(void)
 				ch->node = (unsigned short)node;
 			} else if (node != ch->node) {
 				break;
+			}
+			/* a run stops before it spreads past GS_CHUNK_SPAN: a long run
+			 * reaches behind the camera and the EE has to clip all of it */
+			if (ch->n > 0) {
+				int too_big = 0;
+				for (int k = 0; k < 3 && !too_big; k++) {
+					const unsigned vi = ru32(g_indices + t * 12 + k * 4);
+					if (vi >= g_vert_count) {
+						continue;
+					}
+					const unsigned char *vp = g_verts + vi * 28;
+					for (int a = 0; a < 3; a++) {
+						const float f = rf32(vp + a * 4);
+						const float l = f < lo[a] ? f : lo[a];
+						const float h = f > hi[a] ? f : hi[a];
+						if (h - l > GS_CHUNK_SPAN) {
+							too_big = 1;
+						}
+					}
+				}
+				if (too_big) {
+					break;
+				}
 			}
 			for (int k = 0; k < 3; k++) {
 				const unsigned vi = ru32(g_indices + t * 12 + k * 4);
@@ -2173,7 +2197,7 @@ extern u32 VU1Scene_CodeEnd __attribute__((section(".vudata")));
 #define VU_BLOCK_QW 7
 #define VU_MAX_BLOCKS 2048
 #define VU_MAX_DRAWS 4096
-#define VU_CHAIN_QW 4096
+#define VU_CHAIN_QW 12288 /* 3 qwords a batch, plus texture changes */
 
 struct VuBatch {
 	qword_t *blk; /* 1 + 3n qwords */
