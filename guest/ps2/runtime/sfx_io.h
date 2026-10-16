@@ -11,6 +11,8 @@ int sfx_io_init(void);
 int sfx_io_load(int pack);
 void sfx_io_unload(void);
 void sfx_io_play(void);
+void sfx_io_play_clip(int clip); /* bank index (ps2/audio/sfx_bank order) */
+int sfx_io_clip_count(void);
 void sfx_io_stop(void);
 int sfx_io_ready(void);
 int sfx_io_audible(void);
