@@ -41,7 +41,12 @@ if(EXISTS "$ENV{PS2SDK}/ee/lib/libpacket2.a" AND BLAZIUM_DVP_AS)
 		COMMAND "${BLAZIUM_DVP_AS}" "${CMAKE_CURRENT_SOURCE_DIR}/draw_3D.vsm" -o "${CMAKE_CURRENT_BINARY_DIR}/draw_3D.o"
 		DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/draw_3D.vsm"
 		VERBATIM)
-	target_sources(runtime PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/draw_3D.o")
+	add_custom_command(
+		OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/vu1_scene.o"
+		COMMAND "${BLAZIUM_DVP_AS}" "${CMAKE_CURRENT_SOURCE_DIR}/vu1_scene.vsm" -o "${CMAKE_CURRENT_BINARY_DIR}/vu1_scene.o"
+		DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/vu1_scene.vsm"
+		VERBATIM)
+	target_sources(runtime PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/draw_3D.o" "${CMAKE_CURRENT_BINARY_DIR}/vu1_scene.o")
 	target_compile_definitions(runtime PRIVATE BLAZIUM_PS2_HAS_VU1=1)
 	target_link_libraries(runtime PRIVATE packet2 math3d)
 	message(STATUS "VU1 on (dvp-as + libpacket2)")

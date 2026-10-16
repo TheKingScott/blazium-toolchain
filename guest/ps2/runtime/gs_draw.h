@@ -65,6 +65,11 @@ void gs_draw_nodes_reset(void);
 void gs_draw_camera_lock(int on);
 void gs_draw_camera_look(float ex, float ey, float ez, float tx, float ty, float tz, float fov_deg);
 void gs_draw_set_clear(int r, int g, int b);
+// Distance fog (GS FOG): colour 0..255, linear from near to far view depth.
+// on = 0 (or far <= near) turns it off. Reset by gs_draw_nodes_reset.
+void gs_draw_set_fog(int on, int r, int g, int b, float near_d, float far_d);
+// VU1 for unclipped chunks (on by default where the guest has VU1).
+void gs_draw_use_vu1(int on);
 // HUD row style: kind 1 label (text only), 2 rect, 3 button; scale is the
 // 5x7 glyph multiplier; align 0 left, 1 centre, 2 right.
 void gs_draw_hud_style(int slot, int kind, int scale, int align, int hidden, int tr, int tg, int tb);

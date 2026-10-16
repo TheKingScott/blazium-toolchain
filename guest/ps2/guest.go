@@ -43,6 +43,7 @@ var RuntimeNames = []string{
 	"gdir_ops.h",
 	"iso_path.h",
 	"draw_3D.vsm",
+	"vu1_scene.vsm",
 	"guest_hooks.h",
 	"extra/user_hooks.cpp",
 }

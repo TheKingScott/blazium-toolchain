@@ -142,7 +142,25 @@ static float g_nm[GS_MAX_NODES][12];
 static unsigned char g_nm_on[GS_MAX_NODES];
 static unsigned char g_nhide[GS_MAX_NODES];
 static int g_nodes_live;
+/* MESH trailer 'INST': instances of a cooked mesh (MultiMeshInstance3D).
+ * A source node's own triangles are not drawn; each instance draws them
+ * with its 3x4 delta in place of the node matrix. 'NFOG': nodes kept clear
+ * of fog (material Disable Fog: skies, backdrops). */
+#define GS_MAX_INST 4096
+static const unsigned char *g_inst;
+static unsigned g_inst_n;
+static unsigned char g_isrc[GS_MAX_NODES];
+static unsigned short g_isrc_c0[GS_MAX_NODES];
+static unsigned short g_isrc_c1[GS_MAX_NODES];
+static unsigned char g_nfog[GS_MAX_NODES];
+/* Distance fog (PS2.set_fog): GS FOG with F from the vertex's view depth.
+ * Every scene triangle goes out as XYZF2 with a 24-bit Z, fog or not. */
+static int g_fog_on;
+static int g_fog_r, g_fog_g, g_fog_b;
+static float g_fog_near = 40.0f;
+static float g_fog_far = 160.0f;
 static int g_cam_locked;
+static int g_mesh_dirty_vu; /* VU batches rebuilt on the next frame */
 static int g_clear_r = 32;
 static int g_clear_g = 64;
 static int g_clear_b = 160;
@@ -320,6 +338,65 @@ static void build_chunks(void)
 	}
 }
 
+static void parse_mesh_extras(const unsigned char *blob, unsigned sz, unsigned off)
+{
+	g_inst = 0;
+	g_inst_n = 0;
+	memset(g_isrc, 0, sizeof(g_isrc));
+	memset(g_isrc_c0, 0, sizeof(g_isrc_c0));
+	memset(g_isrc_c1, 0, sizeof(g_isrc_c1));
+	memset(g_nfog, 0, sizeof(g_nfog));
+	while (off + 8 <= sz) {
+		const unsigned char *h = blob + off;
+		const unsigned n = ru32(h + 4);
+		off += 8;
+		if (h[0] == 'I' && h[1] == 'N' && h[2] == 'S' && h[3] == 'T') {
+			if (off + n * 52 > sz) {
+				break;
+			}
+			for (unsigned i = 0; i < n; i++) {
+				const unsigned node = ru16(blob + off + i * 52);
+				if (node < GS_MAX_NODES) {
+					g_isrc[node] = 1;
+				}
+			}
+			/* one table: the cook writes the main list first; a source with
+			 * no instances comes as a one-row list of its own after it */
+			if (!g_inst) {
+				g_inst = blob + off;
+				g_inst_n = n < GS_MAX_INST ? n : GS_MAX_INST;
+			}
+			off += n * 52;
+		} else if (h[0] == 'N' && h[1] == 'F' && h[2] == 'O' && h[3] == 'G') {
+			if (off + n * 2 > sz) {
+				break;
+			}
+			for (unsigned i = 0; i < n; i++) {
+				const unsigned node = ru16(blob + off + i * 2);
+				if (node < GS_MAX_NODES) {
+					g_nfog[node] = 1;
+				}
+			}
+			off += (n * 2 + 3) & ~3u;
+		} else {
+			break;
+		}
+	}
+	/* each source's chunks are one contiguous run (its triangles are cooked
+	 * together) */
+	for (unsigned ci = 0; ci < g_chunk_n; ci++) {
+		const unsigned nd = g_chunks[ci].node;
+		if (nd >= GS_MAX_NODES || !g_isrc[nd]) {
+			continue;
+		}
+		if (g_isrc[nd] == 1) {
+			g_isrc_c0[nd] = (unsigned short)ci;
+			g_isrc[nd] = 2;
+		}
+		g_isrc_c1[nd] = (unsigned short)(ci + 1);
+	}
+}
+
 static int parse_mesh(const unsigned char *blob, unsigned sz)
 {
 	if (!blob || sz < 16) {
@@ -371,6 +448,8 @@ static int parse_mesh(const unsigned char *blob, unsigned sz)
 		frame_aabb();
 	}
 	build_chunks();
+	parse_mesh_extras(blob, sz, 16 + vert_bytes + g_index_count * 4);
+	g_mesh_dirty_vu = 1;
 	return 1;
 }
 
@@ -877,7 +956,8 @@ static void apply_gs_z(xyz_t *xyz, const vertex_f_t *clip, int n, int bias)
 		if (t > 1.0f) {
 			t = 1.0f;
 		}
-		z32 = (unsigned int)(t * 4294967295.0f);
+		/* 24-bit: scene triangles go out as XYZF2 (Z 24 bits, then fog) */
+		z32 = (unsigned int)(t * 16777215.0f);
 		if (bias > 0 && z32 > (unsigned)bias) {
 			z32 -= (unsigned)bias;
 		}
@@ -1767,6 +1847,9 @@ static void send_packet(packet_t *packet, qword_t *q)
 	dma_wait_fast();
 }
 
+/* RGBAQ (Q = 1/w), ST, then XYZF2: 24-bit Z and the fog factor. */
+#define GS_SCENE_REGLIST (((u64)GIF_REG_RGBAQ) << 0 | ((u64)GIF_REG_ST) << 4 | ((u64)GIF_REG_XYZF2) << 8)
+
 static qword_t *end_prim(qword_t *q, int *in_prim)
 {
 	if (!*in_prim) {
@@ -1776,7 +1859,7 @@ static qword_t *end_prim(qword_t *q, int *in_prim)
 	if (((u32)dw) & 8) {
 		*dw++ = 0;
 	}
-	q = draw_prim_end((qword_t *)dw, 3, DRAW_STQ_REGLIST);
+	q = draw_prim_end((qword_t *)dw, 3, GS_SCENE_REGLIST);
 	*in_prim = 0;
 	return q;
 }
@@ -1797,6 +1880,7 @@ struct DrawCtx {
 	unsigned emitted;
 	unsigned drawn;
 	int tiny;
+	int nofog; /* this node keeps clear of fog (F = 255) */
 };
 
 /* Clip-space vertex with its attributes, for Sutherland-Hodgman. */
@@ -1935,6 +2019,20 @@ static void ctx_flush(DrawCtx *c)
 	c->emitted = 0;
 }
 
+/* GS fog factor: 255 = no fog, 0 = all fog colour; linear in view depth. */
+static unsigned fog_byte(float w)
+{
+	const float span = g_fog_far - g_fog_near;
+	float t = span > 0.001f ? (g_fog_far - w) / span : 1.0f;
+	if (t < 0.0f) {
+		t = 0.0f;
+	}
+	if (t > 1.0f) {
+		t = 1.0f;
+	}
+	return (unsigned)(t * 255.0f);
+}
+
 static void emit_clipped(DrawCtx *c, const PV *a, const PV *b, const PV *d, int slot)
 {
 	vertex_f_t clip[3];
@@ -1990,9 +2088,13 @@ static void emit_clipped(DrawCtx *c, const PV *a, const PV *b, const PV *d, int 
 	draw_convert_st(st, 3, clip, sts);
 	u64 *dw = (u64 *)c->q;
 	for (int k = 0; k < 3; k++) {
+		u64 f = 255;
+		if (g_fog_on && !c->nofog) {
+			f = fog_byte(clip[k].w);
+		}
 		*dw++ = rgba[k].rgbaq;
 		*dw++ = st[k].uv;
-		*dw++ = xyz[k].xyz;
+		*dw++ = (u64)xyz[k].x | ((u64)xyz[k].y << 16) | ((u64)(xyz[k].z & 0xffffff) << 32) | (f << 56);
 	}
 	c->q = (qword_t *)dw;
 	c->emitted++;
@@ -2007,6 +2109,7 @@ static void draw_tri(DrawCtx *c, const CookVert *v0, const CookVert *v1, const C
 			return;
 		}
 	}
+	c->nofog = v0->node < GS_MAX_NODES ? g_nfog[v0->node] : 0;
 	PV poly[9];
 	to_pv(c->mvp, v0, &poly[0]);
 	to_pv(c->mvp, v1, &poly[1]);
@@ -2052,6 +2155,513 @@ static void draw_range(DrawCtx *c, unsigned t0, unsigned t1)
 	}
 }
 
+/* ---- VU1 scene path ----------------------------------------------------
+ * Chunks that are wholly in front of the near plane and inside the GS guard
+ * band need no clipping, so they skip the EE's per-vertex work: their
+ * triangles are prepared once per pack as VU-ready batches (24 triangles:
+ * a GIF tag, positions, texture coordinates, colours) and each frame the EE
+ * only writes a DMA chain of REF tags to them, with one small block per
+ * node (matrix, viewport, fog). vu1_scene.vsm transforms them and kicks
+ * them to the GS. Everything else (near the camera, off the guard band)
+ * still goes through the EE clipper. */
+#if defined(BLAZIUM_PS2_HAS_VU1) || defined(BLAZIUM_PS2_VU1_EMU)
+#define GS_VU1 1
+extern u32 VU1Scene_CodeStart __attribute__((section(".vudata")));
+extern u32 VU1Scene_CodeEnd __attribute__((section(".vudata")));
+
+#define VU_BATCH_TRIS 24
+#define VU_BLOCK_QW 7
+#define VU_MAX_BLOCKS 2048
+#define VU_MAX_DRAWS 4096
+#define VU_CHAIN_QW 4096
+
+struct VuBatch {
+	qword_t *blk; /* 1 + 3n qwords */
+	unsigned short n; /* vertices */
+	unsigned short tex;
+};
+
+#ifdef GS_VU1_DEFAULT_OFF
+static int g_vu_on = 0;
+#else
+static int g_vu_on = 1; /* gs_draw_use_vu1() */
+#endif
+static int g_vu_ready;
+static VuBatch *g_vb;
+static unsigned g_vb_n;
+static qword_t *g_vb_mem;
+static unsigned g_chunk_vb0[GS_MAX_CHUNKS];
+static unsigned short g_chunk_vbn[GS_MAX_CHUNKS];
+static qword_t *g_vu_fb; /* per-frame blocks */
+static unsigned g_vu_fb_n;
+static unsigned g_vu_draw_chunk[VU_MAX_DRAWS];
+static unsigned short g_vu_draw_blk[VU_MAX_DRAWS];
+static unsigned g_vu_draw_n;
+static int g_vu_nodeblk[GS_MAX_NODES];
+static int g_vu_nodeblk_static;
+static qword_t *g_vu_chain;
+static Mat4 g_vu_mvp;
+static float g_vu_gb[5][4]; /* guard band + near, normalised */
+static int g_vu_w = 640, g_vu_h = 448;
+static unsigned g_vu_stat_batches;
+
+static void vu_free_batches(void)
+{
+	if (g_vb_mem) {
+		free(g_vb_mem);
+		g_vb_mem = 0;
+	}
+	if (g_vb) {
+		free(g_vb);
+		g_vb = 0;
+	}
+	g_vb_n = 0;
+}
+
+/* VIF codes */
+#define VIF_NOP 0x00000000u
+#define VIF_STCYCL(cl, wl) (0x01000000u | ((wl) << 8) | (cl))
+#define VIF_OFFSET(o) (0x02000000u | (o))
+#define VIF_BASE(b) (0x03000000u | (b))
+#define VIF_FLUSH 0x11000000u
+#define VIF_MSCAL(a) (0x14000000u | (a))
+#define VIF_MPG(n, a) (0x4A000000u | (((n) & 0xFF) << 16) | (a))
+#define VIF_DIRECT(n) (0x50000000u | (n))
+#define VIF_UNPACK_V4_32(n, a) (0x6C000000u | (((n) & 0xFF) << 16) | 0x8000u | (a)) /* TOPS-relative */
+/* DMA tags (with the two VIF codes in the upper half) */
+#define DMA_ID_CNT 1u
+#define DMA_ID_REF 3u
+#define DMA_ID_END 7u
+
+static qword_t *vu_tag(qword_t *q, unsigned id, unsigned qwc, const void *addr, u32 vif0, u32 vif1)
+{
+	u64 *dw = (u64 *)q;
+	dw[0] = (u64)(qwc & 0xFFFF) | ((u64)id << 28) | ((u64)(u32)(unsigned long)addr << 32);
+	dw[1] = (u64)vif0 | ((u64)vif1 << 32);
+	return q + 1;
+}
+
+static void vu_send(qword_t *chain)
+{
+	FlushCache(0);
+	dma_channel_send_chain(DMA_CHANNEL_VIF1, chain, 0, DMA_FLAG_TRANSFERTAG, 0);
+	dma_channel_wait(DMA_CHANNEL_VIF1, 0);
+}
+
+static int vu_init(void)
+{
+	if (g_vu_ready) {
+		return 1;
+	}
+	if (!g_vu_chain) {
+		g_vu_chain = (qword_t *)memalign(64, VU_CHAIN_QW * 16);
+		g_vu_fb = (qword_t *)memalign(64, VU_MAX_BLOCKS * VU_BLOCK_QW * 16);
+		if (!g_vu_chain || !g_vu_fb) {
+			return 0;
+		}
+	}
+	const unsigned bytes = (unsigned)((unsigned long)&VU1Scene_CodeEnd - (unsigned long)&VU1Scene_CodeStart);
+	const unsigned ninstr = bytes / 8;
+	qword_t *q = g_vu_chain;
+	dma_channel_initialize(DMA_CHANNEL_VIF1, NULL, 0);
+	/* the program (one MPG: under 256 instructions), then the double buffer */
+	q = vu_tag(q, DMA_ID_REF, bytes / 16, &VU1Scene_CodeStart, VIF_NOP, VIF_MPG(ninstr, 0));
+	q = vu_tag(q, DMA_ID_CNT, 0, 0, VIF_STCYCL(1, 1), VIF_BASE(8));
+	q = vu_tag(q, DMA_ID_END, 0, 0, VIF_OFFSET(496), VIF_NOP);
+	vu_send(g_vu_chain);
+	g_vu_ready = 1;
+	return 1;
+}
+
+static u32 vu_col(unsigned char c)
+{
+	return (u32)((float)c / 255.0f * 128.0f);
+}
+
+/* Every chunk's triangles as VU batches: a new batch at 24 triangles or a
+ * texture change. Built when a MESH is parsed. */
+static void vu_build_batches(void)
+{
+	vu_free_batches();
+	if (g_chunk_n == 0) {
+		return;
+	}
+	/* count first: batches, then qwords */
+	unsigned nb = 0;
+	unsigned nqw = 0;
+	for (unsigned ci = 0; ci < g_chunk_n; ci++) {
+		const MeshChunk *ch = &g_chunks[ci];
+		if (ch->r < 0.0f) {
+			continue;
+		}
+		unsigned cur_tex = 0xFFFF, cur_n = 0;
+		for (unsigned t = ch->first; t < ch->first + ch->n; t++) {
+			const unsigned i0 = ru32(g_indices + t * 12);
+			const unsigned tex = i0 < g_vert_count ? ru16(g_verts + i0 * 28 + 26) : 0;
+			if (tex != cur_tex || cur_n == VU_BATCH_TRIS) {
+				nb++;
+				nqw += 1;
+				cur_tex = tex;
+				cur_n = 0;
+			}
+			cur_n++;
+			nqw += 9;
+		}
+	}
+	g_vb = (VuBatch *)malloc(nb * sizeof(VuBatch));
+	g_vb_mem = (qword_t *)memalign(64, nqw * 16);
+	if (!g_vb || !g_vb_mem) {
+		vu_free_batches();
+		return;
+	}
+	qword_t *at = g_vb_mem;
+	for (unsigned ci = 0; ci < g_chunk_n; ci++) {
+		MeshChunk *ch = &g_chunks[ci];
+		g_chunk_vb0[ci] = g_vb_n;
+		g_chunk_vbn[ci] = 0;
+		if (ch->r < 0.0f) {
+			continue;
+		}
+		unsigned t = ch->first;
+		const unsigned end = ch->first + ch->n;
+		while (t < end) {
+			const unsigned i0 = ru32(g_indices + t * 12);
+			const unsigned tex = i0 < g_vert_count ? ru16(g_verts + i0 * 28 + 26) : 0;
+			unsigned nt = 0;
+			while (t + nt < end && nt < VU_BATCH_TRIS) {
+				const unsigned j0 = ru32(g_indices + (t + nt) * 12);
+				const unsigned tj = j0 < g_vert_count ? ru16(g_verts + j0 * 28 + 26) : 0;
+				if (tj != tex) {
+					break;
+				}
+				nt++;
+			}
+			const unsigned n = nt * 3;
+			VuBatch *b = &g_vb[g_vb_n++];
+			b->blk = at;
+			b->n = (unsigned short)n;
+			b->tex = (unsigned short)tex;
+			g_chunk_vbn[ci]++;
+			/* GIF tag: PACKED ST, RGBAQ, XYZF2; triangles, Gouraud, textured,
+			 * fogged (F = 255 is no fog); n in the unused w word */
+			const u64 prim = 3u | (1u << 3) | (1u << 4) | (1u << 5);
+			u64 *dw = (u64 *)at;
+			dw[0] = (u64)n | (1ull << 15) | (1ull << 46) | (prim << 47) | (3ull << 60);
+			dw[1] = (u64)GIF_REG_ST | ((u64)GIF_REG_RGBAQ << 4) | ((u64)GIF_REG_XYZF2 << 8) | ((u64)n << 32);
+			float *pos = (float *)(at + 1);
+			float *st = (float *)(at + 1 + n);
+			u32 *col = (u32 *)(at + 1 + 2 * n);
+			for (unsigned k = 0; k < n; k++) {
+				const unsigned vi = ru32(g_indices + (t + k / 3) * 12 + (k % 3) * 4);
+				CookVert v;
+				memset(&v, 0, sizeof(v));
+				if (vi < g_vert_count) {
+					read_vert(g_verts + vi * 28, &v);
+				}
+				pos[k * 4 + 0] = v.x;
+				pos[k * 4 + 1] = v.y;
+				pos[k * 4 + 2] = v.z;
+				pos[k * 4 + 3] = 1.0f;
+				st[k * 4 + 0] = v.u;
+				st[k * 4 + 1] = v.v;
+				st[k * 4 + 2] = 1.0f;
+				st[k * 4 + 3] = 0.0f;
+				col[k * 4 + 0] = vu_col(v.r);
+				col[k * 4 + 1] = vu_col(v.g);
+				col[k * 4 + 2] = vu_col(v.b);
+				col[k * 4 + 3] = 0x80;
+			}
+			at += 1 + 3 * n;
+			t += nt;
+		}
+	}
+	FlushCache(0);
+}
+
+static void vu_frame_begin(const Mat4 *mvp, int w, int h)
+{
+	if (g_vu_on && !g_vu_ready) {
+		vu_init();
+	}
+	g_vu_fb_n = 0;
+	g_vu_draw_n = 0;
+	g_vu_stat_batches = 0;
+	g_vu_nodeblk_static = -1;
+	memset(g_vu_nodeblk, 0xFF, sizeof(g_vu_nodeblk));
+	g_vu_mvp = *mvp;
+	g_vu_w = w > 0 ? w : 640;
+	g_vu_h = h > 0 ? h : 448;
+	const float *m = mvp->m;
+	for (int k = 0; k < 4; k++) {
+		const float rx = m[k * 4 + 0], ry = m[k * 4 + 1], rw = m[k * 4 + 3];
+		g_vu_gb[0][k] = 6.0f * rw - rx;
+		g_vu_gb[1][k] = 6.0f * rw + rx;
+		g_vu_gb[2][k] = 8.0f * rw - ry;
+		g_vu_gb[3][k] = 8.0f * rw + ry;
+		g_vu_gb[4][k] = rw;
+	}
+	g_vu_gb[4][3] -= CLIP_NEAR_W;
+	for (int p = 0; p < 5; p++) {
+		const float l = sqrtf(g_vu_gb[p][0] * g_vu_gb[p][0] + g_vu_gb[p][1] * g_vu_gb[p][1] + g_vu_gb[p][2] * g_vu_gb[p][2]);
+		if (l > 1e-6f) {
+			for (int k = 0; k < 4; k++) {
+				g_vu_gb[p][k] /= l;
+			}
+		}
+	}
+}
+
+/* One per-frame block: MVP x node (z row (0,0,0,1)), viewport, fog. */
+static int vu_block(const float *nm, int nofog)
+{
+	if (g_vu_fb_n >= VU_MAX_BLOCKS) {
+		return -1;
+	}
+	Mat4 m = g_vu_mvp;
+	if (nm) {
+		Mat4 n;
+		mat_ident(&n);
+		for (int r = 0; r < 3; r++) {
+			for (int c = 0; c < 4; c++) {
+				n.m[c * 4 + r] = nm[r * 4 + c];
+			}
+		}
+		mat_mul(&g_vu_mvp, &n, &m);
+	}
+	for (int c = 0; c < 4; c++) {
+		m.m[c * 4 + 2] = c == 3 ? 1.0f : 0.0f;
+	}
+	float *f = (float *)(g_vu_fb + g_vu_fb_n * VU_BLOCK_QW);
+	memcpy(f, m.m, 64);
+	f[16] = (float)g_vu_w * 0.5f;
+	f[17] = -(float)g_vu_h * 0.5f;
+	f[18] = 0.25f * 16777215.0f;
+	f[19] = 0.0f;
+	f[20] = 2048.0f;
+	f[21] = 2048.0f;
+	f[22] = 0.0f;
+	f[23] = 0.0f;
+	if (g_fog_on && !nofog && g_fog_far > g_fog_near) {
+		const float span = g_fog_far - g_fog_near;
+		f[24] = -255.0f / span;
+		f[25] = 255.0f * g_fog_far / span;
+	} else {
+		f[24] = 0.0f;
+		f[25] = 255.0f;
+	}
+	f[26] = 255.0f;
+	f[27] = 0.0f;
+	return (int)g_vu_fb_n++;
+}
+
+/* Queue a chunk for VU1 if it needs no clipping: returns 1 if taken. The
+ * centre is already in cooked space after any node matrix. */
+static int vu_take(const DrawCtx *c, unsigned ci, float cx, float cy, float cz, float r, int node, int fresh)
+{
+	if (!g_vu_on || !g_vu_ready || !g_vb || c->tiny || g_tex_count == 0 || g_chunk_vbn[ci] == 0 || g_vu_draw_n >= VU_MAX_DRAWS) {
+		return 0;
+	}
+	for (int p = 0; p < 5; p++) {
+		if (g_vu_gb[p][0] * cx + g_vu_gb[p][1] * cy + g_vu_gb[p][2] * cz + g_vu_gb[p][3] < r) {
+			return 0;
+		}
+	}
+	const int moved = node >= 0 && node < GS_MAX_NODES && g_nodes_live && g_nm_on[node];
+	const int nofog = node >= 0 && node < GS_MAX_NODES ? g_nfog[node] : 0;
+	int blk;
+	if (fresh) {
+		blk = vu_block(moved ? g_nm[node] : 0, nofog);
+	} else if (moved || nofog) {
+		blk = g_vu_nodeblk[node];
+		if (blk < 0) {
+			blk = g_vu_nodeblk[node] = vu_block(moved ? g_nm[node] : 0, nofog);
+		}
+	} else {
+		if (g_vu_nodeblk_static < 0) {
+			g_vu_nodeblk_static = vu_block(0, 0);
+		}
+		blk = g_vu_nodeblk_static;
+	}
+	if (blk < 0) {
+		return 0;
+	}
+	g_vu_draw_chunk[g_vu_draw_n] = ci;
+	g_vu_draw_blk[g_vu_draw_n] = (unsigned short)blk;
+	g_vu_draw_n++;
+	return 1;
+}
+
+/* The frame's VU chain, run to the end before the HUD goes out. */
+static void vu_flush(void)
+{
+	if (g_vu_draw_n == 0 || !vu_init()) {
+		return;
+	}
+	qword_t *q = g_vu_chain;
+	qword_t *lim = g_vu_chain + VU_CHAIN_QW - 40;
+	int cur_tex = -1;
+	for (unsigned d = 0; d < g_vu_draw_n; d++) {
+		const unsigned ci = g_vu_draw_chunk[d];
+		const qword_t *fb = g_vu_fb + g_vu_draw_blk[d] * VU_BLOCK_QW;
+		for (unsigned b = g_chunk_vb0[ci]; b < g_chunk_vb0[ci] + g_chunk_vbn[ci]; b++) {
+			const VuBatch *vb = &g_vb[b];
+			if (q >= lim) {
+				q = vu_tag(q, DMA_ID_END, 0, 0, VIF_FLUSH, VIF_NOP);
+				vu_send(g_vu_chain);
+				q = g_vu_chain;
+			}
+			if ((int)vb->tex != cur_tex) {
+				/* texture: after everything kicked so far, straight to the GIF */
+				qword_t *tag = q++;
+				qword_t *data = q;
+				q = bind_tex(q, vb->tex);
+				PACK_GIFTAG(q, GIF_SET_TAG(0, 1, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
+				q++;
+				const unsigned k = (unsigned)(q - data);
+				vu_tag(tag, DMA_ID_CNT, k, 0, VIF_FLUSH, VIF_DIRECT(k));
+				cur_tex = vb->tex;
+			}
+			q = vu_tag(q, DMA_ID_REF, VU_BLOCK_QW, fb, VIF_NOP, VIF_UNPACK_V4_32(VU_BLOCK_QW, 0));
+			q = vu_tag(q, DMA_ID_REF, 1 + 3u * vb->n, vb->blk, VIF_NOP, VIF_UNPACK_V4_32(1 + 3u * vb->n, VU_BLOCK_QW));
+			q = vu_tag(q, DMA_ID_CNT, 0, 0, VIF_NOP, VIF_MSCAL(0));
+			g_vu_stat_batches++;
+		}
+	}
+	q = vu_tag(q, DMA_ID_END, 0, 0, VIF_FLUSH, VIF_NOP);
+	vu_send(g_vu_chain);
+#ifndef BLAZIUM_PS2_VU1_EMU
+	/* The DMA is done once the VIF has the last tag; the VIF can still be
+	 * in that FLUSH, and the last XGKICK still on its way to the GS. The
+	 * HUD must not get in ahead of it: wait for the VIF (status, stalls and
+	 * FIFO) and then for PATH1 (active path, queued request) to go idle. */
+	volatile u32 *vif1_stat = (volatile u32 *)0x10003C00;
+	volatile u32 *gif_stat = (volatile u32 *)0x10003020;
+	for (int i = 0; i < 4000000 && (*vif1_stat & 0x1F00000Fu); i++) {
+	}
+	for (int i = 0; i < 4000000 && (*gif_stat & ((3u << 10) | (1u << 6))); i++) {
+	}
+#endif
+}
+#else
+static void vu_build_batches(void) {}
+static void vu_frame_begin(const Mat4 *, int, int) {}
+static int vu_take(const DrawCtx *, unsigned, float, float, float, float, int, int) { return 0; }
+static void vu_flush(void) {}
+#endif
+
+static unsigned g_vu_stat_frame(void)
+{
+#ifdef GS_VU1
+	return g_vu_stat_batches;
+#else
+	return 0;
+#endif
+}
+
+static unsigned g_vu_draw_n_frame(void)
+{
+#ifdef GS_VU1
+	return g_vu_draw_n;
+#else
+	return 0;
+#endif
+}
+
+void gs_draw_use_vu1(int on)
+{
+#ifdef GS_VU1
+	g_vu_on = on ? 1 : 0;
+#else
+	(void)on;
+#endif
+}
+
+/* 3x4 row-major a * b */
+static void m34_mul(const float *a, const float *b, float *o)
+{
+	for (int r = 0; r < 3; r++) {
+		for (int k = 0; k < 4; k++) {
+			o[r * 4 + k] = a[r * 4 + 0] * b[0 + k] + a[r * 4 + 1] * b[4 + k] + a[r * 4 + 2] * b[8 + k] +
+					(k == 3 ? a[r * 4 + 3] : 0.0f);
+		}
+	}
+}
+
+/* Every instance: its source node's chunks, culled by the moved sphere (and
+ * dropped past the fog), drawn with the instance delta as the node matrix. */
+static void draw_instances(DrawCtx *c, float pl[6][4])
+{
+	if (!g_inst || g_inst_n == 0) {
+		return;
+	}
+	const int live = g_nodes_live;
+	g_nodes_live = 1;
+	for (unsigned i = 0; i < g_inst_n; i++) {
+		const unsigned char *row = g_inst + i * 52;
+		const unsigned nd = ru16(row);
+		if (nd >= GS_MAX_NODES || g_isrc[nd] != 2 || g_nhide[nd]) {
+			continue;
+		}
+		float d[12];
+		for (int k = 0; k < 12; k++) {
+			d[k] = rf32(row + 4 + k * 4);
+		}
+		float m[12];
+		if (g_nm_on[nd]) {
+			m34_mul(g_nm[nd], d, m);
+		} else {
+			memcpy(m, d, sizeof(m));
+		}
+		/* largest axis scale, for the sphere radius */
+		float sc2 = 0.0f;
+		for (int k = 0; k < 3; k++) {
+			const float l = m[k] * m[k] + m[4 + k] * m[4 + k] + m[8 + k] * m[8 + k];
+			if (l > sc2) {
+				sc2 = l;
+			}
+		}
+		if (sc2 < 1e-12f) {
+			continue;
+		}
+		const float sc = sqrtf(sc2);
+		float keep[12];
+		const unsigned char keep_on = g_nm_on[nd];
+		memcpy(keep, g_nm[nd], sizeof(keep));
+		memcpy(g_nm[nd], m, sizeof(m));
+		g_nm_on[nd] = 1;
+		c->nofog = g_nfog[nd];
+		for (unsigned ci = g_isrc_c0[nd]; ci < g_isrc_c1[nd]; ci++) {
+			const MeshChunk *ch = &g_chunks[ci];
+			const float cx = m[0] * ch->c[0] + m[1] * ch->c[1] + m[2] * ch->c[2] + m[3];
+			const float cy = m[4] * ch->c[0] + m[5] * ch->c[1] + m[6] * ch->c[2] + m[7];
+			const float cz = m[8] * ch->c[0] + m[9] * ch->c[1] + m[10] * ch->c[2] + m[11];
+			const float r = ch->r * sc;
+			int out = 0;
+			for (int p = 0; p < 6 && !out; p++) {
+				if (pl[p][0] * cx + pl[p][1] * cy + pl[p][2] * cz + pl[p][3] < -r) {
+					out = 1;
+				}
+			}
+			/* wholly in the fog: the near plane's distance is the view depth */
+			if (!out && g_fog_on && !c->nofog &&
+					pl[4][0] * cx + pl[4][1] * cy + pl[4][2] * cz + pl[4][3] + CLIP_NEAR_W - r > g_fog_far) {
+				out = 1;
+			}
+			if (out) {
+				continue;
+			}
+			g_stat_chunks++;
+			if (vu_take(c, ci, cx, cy, cz, r, (int)nd, 1)) {
+				continue;
+			}
+			draw_range(c, ch->first, ch->first + ch->n);
+		}
+		memcpy(g_nm[nd], keep, sizeof(keep));
+		g_nm_on[nd] = keep_on;
+	}
+	g_nodes_live = live;
+}
+
 void gs_draw_nodes_begin(void)
 {
 	g_nodes_live = 1;
@@ -2078,8 +2688,19 @@ void gs_draw_node_hidden(int node, int hidden)
 	g_nhide[node] = hidden ? 1 : 0;
 }
 
+void gs_draw_set_fog(int on, int r, int g, int b, float near_d, float far_d)
+{
+	g_fog_on = on && far_d > near_d;
+	g_fog_r = r;
+	g_fog_g = g;
+	g_fog_b = b;
+	g_fog_near = near_d;
+	g_fog_far = far_d;
+}
+
 void gs_draw_nodes_reset(void)
 {
+	g_fog_on = 0;
 	memset(g_nm_on, 0, sizeof(g_nm_on));
 	memset(g_nhide, 0, sizeof(g_nhide));
 	g_nodes_live = 0;
@@ -2162,6 +2783,11 @@ void gs_draw_scene(framebuffer_t *frame, zbuffer_t *z)
 	}
 	mat_mul(&view, &world, &tmp);
 	mat_mul(&proj, &tmp, &mvp);
+	if (g_mesh_dirty_vu) {
+		g_mesh_dirty_vu = 0;
+		vu_build_batches();
+	}
+	vu_frame_begin(&mvp, frame->width, frame->height);
 
 	DrawCtx c;
 	memset(&c, 0, sizeof(c));
@@ -2177,6 +2803,14 @@ void gs_draw_scene(framebuffer_t *frame, zbuffer_t *z)
 	c.prim.mapping = (g_tex_count > 0 && !aabb_is_tiny()) ? DRAW_ENABLE : DRAW_DISABLE;
 	c.prim.mapping_type = PRIM_MAP_ST;
 	c.prim.colorfix = PRIM_UNFIXED;
+	c.prim.fogging = g_fog_on ? DRAW_ENABLE : DRAW_DISABLE;
+	if (g_fog_on) {
+		PACK_GIFTAG(q, GIF_SET_TAG(1, 0, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
+		q++;
+		PACK_GIFTAG(q, GS_SET_FOGCOL(g_fog_r, g_fog_g, g_fog_b), GS_REG_FOGCOL);
+		q++;
+	}
+	c.q = q;
 	c.color.r = 0x80;
 	c.color.g = 0x80;
 	c.color.b = 0x80;
@@ -2214,6 +2848,10 @@ void gs_draw_scene(framebuffer_t *frame, zbuffer_t *z)
 		for (unsigned ci = 0; ci < g_chunk_n; ci++) {
 			const MeshChunk *ch = &g_chunks[ci];
 			const unsigned n = ch->node;
+			if (n < GS_MAX_NODES && g_isrc[n]) {
+				continue; /* drawn once per instance below */
+			}
+			c.nofog = n < GS_MAX_NODES ? g_nfog[n] : 0;
 			if (ch->r >= 0.0f && n != 0xffff) {
 				if (g_nodes_live && n < GS_MAX_NODES && g_nhide[n]) {
 					continue;
@@ -2240,14 +2878,26 @@ void gs_draw_scene(framebuffer_t *frame, zbuffer_t *z)
 							out = 1;
 						}
 					}
+					/* wholly in the fog: nothing to see */
+					if (!out && g_fog_on && !c.nofog &&
+							pl[4][0] * cx + pl[4][1] * cy + pl[4][2] * cz + pl[4][3] + CLIP_NEAR_W - ch->r > g_fog_far) {
+						out = 1;
+					}
 					if (out) {
 						continue;
 					}
+					g_stat_chunks++;
+					if (vu_take(&c, ci, cx, cy, cz, ch->r, (int)n, 0)) {
+						continue;
+					}
+					draw_range(&c, ch->first, ch->first + ch->n);
+					continue;
 				}
 			}
 			g_stat_chunks++;
 			draw_range(&c, ch->first, ch->first + ch->n);
 		}
+		draw_instances(&c, pl);
 	}
 	for (int ly = 0; ly < g_ly_n; ly++) {
 		const unsigned char *blob = g_ly_mesh[ly];
@@ -2278,17 +2928,24 @@ void gs_draw_scene(framebuffer_t *frame, zbuffer_t *z)
 			draw_tri(&c, &v0, &v1, &v2);
 		}
 	}
-#ifdef GS_STATS
-	if (++g_stat_frames % 300 == 0) {
-		printf("GS stats: %u chunks, %u of %u tris tested, %u drawn (this frame)\n", g_stat_chunks, g_stat_tris,
-				g_index_count / 3, c.drawn);
-	}
-#endif
 	g_stat_tris = 0;
 	g_stat_chunks = 0;
+#ifdef GS_VU1
+	if (g_vu_draw_n > 0) {
+		/* the EE's triangles first, then VU1's, then the HUD on top */
+		ctx_flush(&c);
+		vu_flush();
+	}
+#endif
+#ifdef GS_STATS
+	if (++g_stat_frames % 300 == 0) {
+		printf("GS stats: %u chunks, %u of %u tris tested, %u drawn by the EE, %u VU1 batches (this frame)\n", g_stat_chunks,
+				g_stat_tris, g_index_count / 3, c.drawn, g_vu_stat_frame());
+	}
+#endif
 	q = c.q;
 	int in_prim = c.in_prim;
-	const unsigned drawn = c.drawn;
+	const unsigned drawn = c.drawn + g_vu_draw_n_frame();
 	q = end_prim(q, &in_prim);
 	q = draw_disable_tests(q, 0, z);
 	if (drawn == 0) {
