@@ -55,6 +55,20 @@ void gs_draw_apply_node(int node, float *x, float *y, float *z);
 int gs_draw_primary_mesh_node(void);
 void gs_draw_overlay(framebuffer_t *frame, zbuffer_t *z);
 
+// Scripted scenes (GDIR): per-node world correction m = W_now * W_cooked^-1
+// as 3x4 row-major (NULL = identity), hidden nodes skip their triangles.
+void gs_draw_nodes_begin(void);
+void gs_draw_node_matrix(int node, const float *m);
+void gs_draw_node_hidden(int node, int hidden);
+void gs_draw_nodes_reset(void);
+// Camera from the scene: no auto-framing, no pad orbit while locked.
+void gs_draw_camera_lock(int on);
+void gs_draw_camera_look(float ex, float ey, float ez, float tx, float ty, float tz, float fov_deg);
+void gs_draw_set_clear(int r, int g, int b);
+// HUD row style: kind 1 label (text only), 2 rect, 3 button; scale is the
+// 5x7 glyph multiplier; align 0 left, 1 centre, 2 right.
+void gs_draw_hud_style(int slot, int kind, int scale, int align, int hidden, int tr, int tg, int tb);
+
 // Clear + textured tris + slot-0 HUD stamp. Sends GIF packets itself.
 void gs_draw_scene(framebuffer_t *frame, zbuffer_t *z);
 

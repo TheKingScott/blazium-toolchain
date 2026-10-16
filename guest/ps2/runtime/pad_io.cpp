@@ -281,6 +281,12 @@ int pad_io_just_pressed(int action)
 	return (s_ready && m && (s_btns & m) && !(s_prev_btns & m)) ? 1 : 0;
 }
 
+int pad_io_just_released(int action)
+{
+	const unsigned short m = action_mask(action);
+	return (s_ready && m && !(s_btns & m) && (s_prev_btns & m)) ? 1 : 0;
+}
+
 void pad_io_stick(int stick, float *x, float *y)
 {
 	float sx = 0.0f;
@@ -374,6 +380,12 @@ int pad_io_pressed(int action)
 }
 
 int pad_io_just_pressed(int action)
+{
+	(void)action;
+	return 0;
+}
+
+int pad_io_just_released(int action)
 {
 	(void)action;
 	return 0;

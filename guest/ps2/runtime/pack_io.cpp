@@ -1,6 +1,7 @@
 // MIT. Stream extra packs from host: (ELF dir HostFs) then cdrom0:. SAVE.BIN is user:// stub.
 
 #include "pack_io.h"
+#include "iso_path.h"
 
 #include "gs_draw.h"
 #include "sys_io.h"
@@ -142,7 +143,7 @@ static FILE *open_named(const char *host, const char *iso_bs, const char *iso)
 	paths[2] = iso;
 	paths[3] = 0;
 	for (int i = 0; paths[i]; i++) {
-		FILE *f = fopen(paths[i], "rb");
+		FILE *f = iso_fopen(paths[i], "rb");
 		if (f) {
 			return f;
 		}

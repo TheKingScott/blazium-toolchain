@@ -3,7 +3,7 @@
 # VU1 is enabled here when dvp-as + libpacket2 exist. CMake is CPU-GIF fallback.
 
 EE_BIN = runtime.elf
-EE_OBJS = main.o gs_draw.o pad_io.o sfx_io.o pack_io.o script_vm.o sys_io.o vu1_draw.o
+EE_OBJS = main.o gs_draw.o pad_io.o sfx_io.o pack_io.o script_vm.o sys_io.o vu1_draw.o gdir_vm.o
 EE_OBJS += $(patsubst %.cpp,%.o,$(wildcard extra/*.cpp))
 EE_OBJS += $(patsubst %.c,%.o,$(wildcard extra/*.c))
 EE_INCS += -I.

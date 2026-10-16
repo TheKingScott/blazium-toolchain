@@ -123,6 +123,16 @@ void sys_io_set_path_offset(float t);
 int sys_io_navmesh_next(int from, int to);
 int sys_io_prefetch(int pack);
 
+// HUD rows by slot (GDIR scripts: Label.text / visible / position, Button focus).
+void sys_io_hud_set_hidden(int slot, int hidden);
+int sys_io_hud_hidden(int slot);
+void sys_io_hud_set_pos(int slot, int x, int y);
+void sys_io_hud_get_pos(int slot, int *x, int *y);
+void sys_io_hud_set_color(int slot, int r, int g, int b);
+const char *sys_io_hud_text(int slot);
+int sys_io_hud_focus(void);
+void sys_io_hud_set_focus(int slot);
+
 #ifdef __cplusplus
 }
 #endif

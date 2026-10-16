@@ -246,8 +246,17 @@ func (t *Tool) ISO(ctx context.Context, opts platforms.ISOOptions) error {
 		return err
 	}
 	vol := iso.VolumeOr(opts.VolumeID, settings.Current().PS2.ISOVolume)
-	if err := iso.WriteDataISO(opts.Dir, opts.Out, vol); err != nil {
+	boot := bootELFName(opts.Dir)
+	keep := func(name string) bool {
+		return strings.EqualFold(name, "SYSTEM.CNF") || (boot != "" && strings.EqualFold(name, boot))
+	}
+	// Everything but SYSTEM.CNF and the boot ELF goes under DATA/: the guest
+	// runtime tries cdrom0:\DATA\ first, then the root.
+	if err := iso.WriteDataISOSubdir(opts.Dir, opts.Out, vol, keep, ISODataDir, skipOnDisc); err != nil {
 		return err
+	}
+	if n := iso.LargestDirRecords(opts.Out); n > 1 && opts.Stdout != nil {
+		report.Line(opts.Stdout, report.Note, fmt.Sprintf("a directory on %s spans %d sectors; the PS2 boot ROM reads only the first", opts.Out, n))
 	}
 	if opts.Stdout != nil {
 		report.Line(opts.Stdout, report.Wrote, opts.Out)
@@ -519,6 +528,58 @@ func hostFsDir(exe, iso, override string) string {
 		return ""
 	}
 	return filepath.Dir(exe)
+}
+
+// ISODataDir is the ISO folder that holds cooked data (MESH/NODE/... and
+// sidecars). Keep in sync with guest/ps2/runtime/iso_path.h.
+const ISODataDir = "DATA"
+
+// skipOnDisc leaves off the ISO what the guest never reads from cdrom0:
+// build notes, the guest source tree, host-only saves, and sidecars the
+// cooker wrote empty (header only: the guest treats a missing one the same).
+func skipOnDisc(name string, size int64, isDir bool) bool {
+	up := strings.ToUpper(name)
+	if isDir {
+		return up == "GUEST" || up == "EXTRA"
+	}
+	switch filepath.Ext(up) {
+	case ".TXT", ".MAP", ".LOG":
+		return true
+	}
+	if strings.HasPrefix(up, "SAVE") {
+		return true
+	}
+	if size <= 10 {
+		for _, stem := range []string{"ANIM", "PART", "PATH", "SPRT", "VEHL", "NAVM", "NAV", "TILE", "FMV"} {
+			if strings.HasPrefix(up, stem) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// bootELFName returns the file SYSTEM.CNF's BOOT2 line points at ("" if none).
+func bootELFName(dir string) string {
+	b, err := os.ReadFile(filepath.Join(dir, "SYSTEM.CNF"))
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(strings.ToUpper(line), "BOOT2") {
+			continue
+		}
+		v := line[strings.Index(line, "=")+1:]
+		v = strings.TrimSpace(v)
+		v = strings.TrimPrefix(v, "cdrom0:")
+		v = strings.TrimLeft(v, "\\/")
+		if i := strings.Index(v, ";"); i >= 0 {
+			v = v[:i]
+		}
+		return v
+	}
+	return ""
 }
 
 func ensureSystemCNF(dir string) error {
