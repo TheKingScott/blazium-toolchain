@@ -1497,7 +1497,7 @@ static Val native(unsigned inst, int id, Val *a, int n)
 			return vnil();
 		}
 		case GN_PS2_PLAY_SFX:
-			sfx_io_play();
+			sfx_io_play_clip(n > 0 && is_num(a[0]) ? inum(a[0]) : 0);
 			return vnil();
 		case GN_PS2_SET_RUMBLE:
 			pad_io_set_rumble(n > 0 ? inum(a[0]) : 1, n > 1 ? inum(a[1]) : 0);

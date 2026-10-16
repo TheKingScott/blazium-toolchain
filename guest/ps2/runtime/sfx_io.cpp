@@ -70,8 +70,21 @@ static const int s_ima_index[16] = {
 static short *s_pcm;
 static int s_pcm_n;
 static int s_rate;
-static unsigned char *s_vag;
+static unsigned char *s_vag; /* every clip's VAG, back to back */
 static unsigned s_vag_sz;
+/* The bank ("SFXB", or one "SFX " clip as a bank of one). It is uploaded to
+ * SPU2 RAM once when the pack loads; play only starts a voice. */
+#define SFX_MAX_CLIPS 64
+#define SFX_SPU_BASE 0x5000
+#define SFX_SPU_END 0x10000 /* music starts here */
+#define SFX_VOICE_FIRST 2 /* voice 0: unused, 1: music */
+#define SFX_VOICE_COUNT 8
+static unsigned s_clip_off[SFX_MAX_CLIPS];
+static unsigned s_clip_len[SFX_MAX_CLIPS];
+static int s_clip_rate[SFX_MAX_CLIPS];
+static int s_clip_n;
+static int s_bank_on_spu;
+static int s_next_voice;
 static int s_ready;
 static int s_sfx_pack = -1;
 static int s_played;
@@ -335,10 +348,16 @@ static int init_sdr(void)
 		return 0;
 	}
 	sdr_cmd(rSdInit, 0, 0, 0, 0, 0);
-	sdr_cmd(rSdSetParam, SD_PARAM_MVOLL, 0x3fff, 0, 0, 0);
-	sdr_cmd(rSdSetParam, SD_PARAM_MVOLR, 0x3fff, 0, 0, 0);
-	sdr_cmd(rSdSetSwitch, SD_SWITCH_VMIXL, 3, 0, 0, 0);
-	sdr_cmd(rSdSetSwitch, SD_SWITCH_VMIXR, 3, 0, 0, 0);
+	/* Both cores: core 0's voices feed core 1's input, and core 1 is what
+	 * reaches the outputs, so both need their master volume up and their
+	 * mixers open (voices dry, sound-in, memory-in; no reverb). */
+	for (int core = 0; core < 2; core++) {
+		sdr_cmd(rSdSetParam, SD_PARAM_MVOLL | core, 0x3fff, 0, 0, 0);
+		sdr_cmd(rSdSetParam, SD_PARAM_MVOLR | core, 0x3fff, 0, 0, 0);
+		sdr_cmd(rSdSetParam, SD_PARAM_MMIX | core, 0xffc, 0, 0, 0);
+	}
+	sdr_cmd(rSdSetSwitch, SD_SWITCH_VMIXL, 0xffffff, 0, 0, 0);
+	sdr_cmd(rSdSetSwitch, SD_SWITCH_VMIXR, 0xffffff, 0, 0, 0);
 	return 1;
 #else
 	return 0;
@@ -386,27 +405,132 @@ static void free_sfx(void)
 	s_vag_sz = 0;
 	s_ready = 0;
 	s_sfx_pack = -1;
+	s_clip_n = 0;
+	s_bank_on_spu = 0;
+}
+
+/* One clip's IMA nibbles -> VAG appended to s_vag. */
+static int add_clip(const unsigned char *nibbles, unsigned nbytes, int rate)
+{
+	if (s_clip_n >= SFX_MAX_CLIPS) {
+		return 0;
+	}
+	short *pcm = 0;
+	int n = 0;
+	if (!decode_ima(nibbles, nbytes, &pcm, &n)) {
+		return 0;
+	}
+	unsigned char *vag = 0;
+	unsigned vsz = 0;
+	const int ok = encode_vag(pcm, n, &vag, &vsz, 0);
+	if (s_clip_n == 0) {
+		/* clip 0 keeps its PCM for sfx_io_ready()/the legacy path */
+		s_pcm = pcm;
+		s_pcm_n = n;
+		s_rate = rate;
+	} else {
+		free(pcm);
+	}
+	if (!ok) {
+		return 0;
+	}
+	unsigned char *grown = (unsigned char *)realloc(s_vag, s_vag_sz + vsz + 64);
+	if (!grown) {
+		free(vag);
+		return 0;
+	}
+	s_vag = grown;
+	memcpy(s_vag + s_vag_sz, vag, vsz);
+	free(vag);
+	s_clip_off[s_clip_n] = s_vag_sz;
+	s_clip_len[s_clip_n] = vsz;
+	s_clip_rate[s_clip_n] = rate;
+	s_clip_n++;
+	s_vag_sz += vsz;
+	return 1;
 }
 
 static int decode_sfx_blob(unsigned char *blob, unsigned sz)
 {
-	if (!blob || sz < 12 || blob[0] != 'S' || blob[1] != 'F' || blob[2] != 'X' || blob[3] != ' ') {
+	if (!blob || sz < 8 || blob[0] != 'S' || blob[1] != 'F' || blob[2] != 'X' || ru16(blob + 4) != 1) {
 		return 0;
 	}
-	if (ru16(blob + 4) != 1) {
+	s_clip_n = 0;
+	if (blob[3] == ' ') {
+		if (sz < 12) {
+			return 0;
+		}
+		const unsigned nbytes = ru32(blob + 8);
+		if (12 + nbytes > sz || !add_clip(blob + 12, nbytes, (int)ru16(blob + 6))) {
+			return 0;
+		}
+	} else if (blob[3] == 'B') {
+		const unsigned count = ru16(blob + 6);
+		unsigned off = 8;
+		for (unsigned i = 0; i < count; i++) {
+			if (off + 6 > sz) {
+				break;
+			}
+			const int rate = (int)ru16(blob + off);
+			const unsigned nbytes = ru32(blob + off + 2);
+			off += 6;
+			if (off + nbytes > sz) {
+				break;
+			}
+			if (!add_clip(blob + off, nbytes, rate)) {
+				/* keep the index of every later clip right: an empty slot */
+				if (s_clip_n < SFX_MAX_CLIPS) {
+					s_clip_off[s_clip_n] = 0;
+					s_clip_len[s_clip_n] = 0;
+					s_clip_rate[s_clip_n] = 0;
+					s_clip_n++;
+				}
+			}
+			off += nbytes;
+		}
+	} else {
 		return 0;
 	}
-	s_rate = (int)ru16(blob + 6);
-	const unsigned nbytes = ru32(blob + 8);
-	if (12 + nbytes > sz) {
-		return 0;
+	s_ready = s_clip_n > 0;
+	return s_ready;
+}
+
+/* The whole bank to SPU2 RAM in one transfer; clips past SFX_SPU_END are
+ * dropped (they would run into the music). */
+static void upload_bank(void)
+{
+	s_bank_on_spu = 0;
+#ifdef BLAZIUM_PS2_HAS_LIBSDR
+#ifdef BLAZIUM_PS2_HAS_IOPHEAP
+	if (!s_sd_ok || !s_vag || s_vag_sz < 16) {
+		return;
 	}
-	if (!decode_ima(blob + 12, nbytes, &s_pcm, &s_pcm_n)) {
-		return 0;
+	unsigned sz = s_vag_sz;
+	if (SFX_SPU_BASE + sz > SFX_SPU_END) {
+		sz = SFX_SPU_END - SFX_SPU_BASE;
+		for (int i = 0; i < s_clip_n; i++) {
+			if (s_clip_off[i] + s_clip_len[i] > sz) {
+				printf("SFX: clip %d does not fit in SPU2 RAM (%u bytes of %u), silent\n", i, s_vag_sz, sz);
+				s_clip_len[i] = 0;
+			}
+		}
 	}
-	(void)encode_vag(s_pcm, s_pcm_n, &s_vag, &s_vag_sz, 0);
-	s_ready = 1;
-	return 1;
+	sz = (sz + 63) & ~63u;
+	void *iop = SifAllocIopHeap((int)sz);
+	if (!iop) {
+		return;
+	}
+	FlushCache(0);
+	if (sdr_trans_to_iop(s_vag, iop, sz) < 0) {
+		SifFreeIopHeap(iop);
+		return;
+	}
+	sdr_cmd(rSdVoiceTrans, 0, SD_TRANS_WRITE | SD_TRANS_MODE_DMA, (int)(unsigned long)iop, SFX_SPU_BASE, (int)sz);
+	sdr_cmd(rSdVoiceTransStatus, 0, 1, 0, 0, 0);
+	SifFreeIopHeap(iop);
+	s_bank_on_spu = 1;
+#endif
+#endif
 }
 
 int sfx_io_load(int pack)
@@ -440,6 +564,10 @@ int sfx_io_load(int pack)
 	free(blob);
 	if (ok) {
 		s_sfx_pack = pack;
+		upload_bank();
+		/* One line in the EE log per bank, so a silent run says why. */
+		printf("SFX: pack %d, %d clips, %u bytes, driver %s, on SPU2 %s\n", pack, s_clip_n, s_vag_sz,
+				s_sd_ok ? "ok" : "missing", s_bank_on_spu ? "yes" : "no");
 	}
 	return ok;
 }
@@ -455,45 +583,45 @@ void sfx_io_unload(void)
 
 void sfx_io_play(void)
 {
-	if (!s_ready || !s_pcm) {
+	sfx_io_play_clip(0);
+}
+
+void sfx_io_play_clip(int clip)
+{
+	if (!s_ready || clip < 0 || clip >= s_clip_n || !s_clip_len[clip]) {
 		return;
 	}
 	s_played = 1;
 	s_audible = 0;
-#ifdef BLAZIUM_PS2_HAS_LIBSDR
-#ifdef BLAZIUM_PS2_HAS_IOPHEAP
-	if (!s_sd_ok || !s_vag || s_vag_sz < 16) {
-		return;
-	}
-	void *iop = SifAllocIopHeap((int)s_vag_sz);
-	if (!iop) {
-		return;
-	}
-#ifdef BLAZIUM_PS2_HAS_LOADFILE
-	FlushCache(0);
+#ifdef BLAZIUM_PS2_HOST_HARNESS
+	printf("SFX play clip %d\n", clip);
 #endif
-	if (sdr_trans_to_iop(s_vag, iop, s_vag_sz) < 0) {
-		SifFreeIopHeap(iop);
+#ifdef BLAZIUM_PS2_HAS_LIBSDR
+	if (!s_sd_ok || !s_bank_on_spu) {
 		return;
 	}
-	const int pitch = s_rate > 0 ? (s_rate * 4096) / 44100 : 2048;
-	const int voice = SD_VOICE(0, 0);
-	sdr_cmd(rSdVoiceTrans, 0, SD_TRANS_WRITE | SD_TRANS_MODE_DMA, (int)(unsigned long)iop, 0x5000, (int)s_vag_sz);
-	sdr_cmd(rSdVoiceTransStatus, 0, 1, 0, 0, 0);
+	/* round-robin over a few voices so sounds overlap instead of cutting.
+	 * ADSR: instant attack (rate 0; 0x7f is "never", which is why the old
+	 * one-sound path was silent), hold at full, short release. */
+	const int v = SFX_VOICE_FIRST + s_next_voice;
+	s_next_voice = (s_next_voice + 1) % SFX_VOICE_COUNT;
+	const int voice = SD_VOICE(0, v);
+	const int pitch = s_clip_rate[clip] > 0 ? (s_clip_rate[clip] * 4096) / 48000 : 2048;
+	sdr_cmd(rSdSetSwitch, SD_SWITCH_KOFF, 1 << v, 0, 0, 0);
 	sdr_cmd(rSdSetParam, SD_VPARAM_VOLL | voice, 0x3fff, 0, 0, 0);
 	sdr_cmd(rSdSetParam, SD_VPARAM_VOLR | voice, 0x3fff, 0, 0, 0);
 	sdr_cmd(rSdSetParam, SD_VPARAM_PITCH | voice, pitch, 0, 0, 0);
-	sdr_cmd(rSdSetParam, SD_VPARAM_ADSR1 | voice, SD_SET_ADSR1(0, 0x7f, 0xf, 0xf), 0, 0, 0);
-	sdr_cmd(rSdSetParam, SD_VPARAM_ADSR2 | voice, SD_SET_ADSR2(0, 0, 0, 0x10), 0, 0, 0);
-	sdr_cmd(rSdSetAddr, SD_VADDR_SSA | voice, 0x5000, 0, 0, 0);
-	sdr_cmd(rSdSetSwitch, SD_SWITCH_KON, 1, 0, 0, 0);
-	SifFreeIopHeap(iop);
+	sdr_cmd(rSdSetParam, SD_VPARAM_ADSR1 | voice, SD_SET_ADSR1(0, 0x00, 0xf, 0xf), 0, 0, 0);
+	sdr_cmd(rSdSetParam, SD_VPARAM_ADSR2 | voice, SD_SET_ADSR2(0, 0x7f, 0, 0x0a), 0, 0, 0);
+	sdr_cmd(rSdSetAddr, SD_VADDR_SSA | voice, (int)(SFX_SPU_BASE + s_clip_off[clip]), 0, 0, 0);
+	sdr_cmd(rSdSetSwitch, SD_SWITCH_KON, 1 << v, 0, 0, 0);
 	s_audible = 1;
-	return;
 #endif
-#endif
-	(void)s_rate;
-	(void)s_pcm_n;
+}
+
+int sfx_io_clip_count(void)
+{
+	return s_clip_n;
 }
 
 void sfx_io_stop(void)
@@ -501,7 +629,7 @@ void sfx_io_stop(void)
 	s_played = 0;
 #ifdef BLAZIUM_PS2_HAS_LIBSDR
 	if (s_sd_ok) {
-		sdr_cmd(rSdSetSwitch, SD_SWITCH_KOFF, 1, 0, 0, 0);
+		sdr_cmd(rSdSetSwitch, SD_SWITCH_KOFF, ((1 << SFX_VOICE_COUNT) - 1) << SFX_VOICE_FIRST, 0, 0, 0);
 	}
 #endif
 }
@@ -651,8 +779,8 @@ void sfx_io_music_play(void)
 	sdr_cmd(rSdSetParam, SD_VPARAM_VOLL | voice, s_mus_vol, 0, 0, 0);
 	sdr_cmd(rSdSetParam, SD_VPARAM_VOLR | voice, s_mus_vol, 0, 0, 0);
 	sdr_cmd(rSdSetParam, SD_VPARAM_PITCH | voice, pitch, 0, 0, 0);
-	sdr_cmd(rSdSetParam, SD_VPARAM_ADSR1 | voice, SD_SET_ADSR1(0, 0x7f, 0xf, 0xf), 0, 0, 0);
-	sdr_cmd(rSdSetParam, SD_VPARAM_ADSR2 | voice, SD_SET_ADSR2(0, 0, 0, 0x10), 0, 0, 0);
+	sdr_cmd(rSdSetParam, SD_VPARAM_ADSR1 | voice, SD_SET_ADSR1(0, 0x00, 0xf, 0xf), 0, 0, 0);
+	sdr_cmd(rSdSetParam, SD_VPARAM_ADSR2 | voice, SD_SET_ADSR2(0, 0x7f, 0, 0x0a), 0, 0, 0);
 	sdr_cmd(rSdSetAddr, SD_VADDR_SSA | voice, 0x10000, 0, 0, 0);
 	sdr_cmd(rSdSetSwitch, SD_SWITCH_KON, 2, 0, 0, 0);
 	SifFreeIopHeap(iop);
