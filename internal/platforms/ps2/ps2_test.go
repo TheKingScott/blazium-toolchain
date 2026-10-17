@@ -434,3 +434,19 @@ func TestISOBootLogo(t *testing.T) {
 		t.Fatal("the volume descriptor moved")
 	}
 }
+
+func TestPackGroup(t *testing.T) {
+	for name, want := range map[string]string{
+		"MESH04.BIN":  "P04",
+		"music00.bin": "P00",
+		"HUD10.BIN":   "P10",
+		"STREAM.BIN":  "",
+		"DISP.BIN":    "",
+		"MCSAVE.BIN":  "",
+		"PACK01.BIN":  "P01",
+	} {
+		if got := packGroup(name); got != want {
+			t.Errorf("packGroup(%q) = %q, want %q", name, got, want)
+		}
+	}
+}

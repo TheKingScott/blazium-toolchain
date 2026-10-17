@@ -28,6 +28,16 @@ func WriteDataISO(srcDir, outPath, volumeID string) error {
 // sources, empty sidecars).
 func WriteDataISOSubdir(srcDir, outPath, volumeID string, keepRoot func(name string) bool, subdir string,
 	skip func(name string, size int64, isDir bool) bool) error {
+	return WriteDataISOGrouped(srcDir, outPath, volumeID, keepRoot, subdir, skip, nil)
+}
+
+// WriteDataISOGrouped is WriteDataISOSubdir with the moved files split
+// further: group returns, for each file name, a folder under subdir to put
+// it in ("" keeps it in subdir). The IOP's CD file search (CDVDMAN) only
+// reads a directory's first sector too, so a folder of more than ~44 files
+// hides the rest; grouping keeps every folder to one sector.
+func WriteDataISOGrouped(srcDir, outPath, volumeID string, keepRoot func(name string) bool, subdir string,
+	skip func(name string, size int64, isDir bool) bool, group func(name string) string) error {
 	if srcDir == "" || outPath == "" {
 		return report.Usage("iso requires --dir and --out")
 	}
@@ -67,7 +77,21 @@ func WriteDataISOSubdir(srcDir, outPath, volumeID string, keepRoot func(name str
 		if len(moved) > 0 {
 			root.children = kept
 			d := root.mkdir(subdir, st.ModTime())
-			d.children = append(d.children, moved...)
+			for _, c := range moved {
+				g := ""
+				if group != nil && !c.isDir {
+					g = group(c.name)
+				}
+				if g == "" {
+					d.children = append(d.children, c)
+					continue
+				}
+				gd := d.mkdir(g, st.ModTime())
+				gd.children = append(gd.children, c)
+			}
+			sort.SliceStable(d.children, func(i, j int) bool {
+				return strings.ToUpper(d.children[i].name) < strings.ToUpper(d.children[j].name)
+			})
 			// ISO9660 wants directory records in name order
 			sort.SliceStable(root.children, func(i, j int) bool {
 				return strings.ToUpper(root.children[i].name) < strings.ToUpper(root.children[j].name)

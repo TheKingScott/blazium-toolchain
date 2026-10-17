@@ -125,3 +125,42 @@ func TestWriteDataISOSubdirKeepsRootShort(t *testing.T) {
 		t.Fatal("MESH00 should be under DATA, not the root")
 	}
 }
+
+func TestWriteDataISOGroupedKeepsEveryDirOneSector(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "SYSTEM.CNF"), []byte("BOOT2 = cdrom0:\\GAME.ELF;1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// 11 packs of 7 files: 77 records in one DATA folder would take two sectors
+	for i := 0; i < 11; i++ {
+		for _, stem := range []string{"CAM", "GTEX", "HIT", "HUD", "MESH", "NODE", "SCRP"} {
+			if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("%s%02d.BIN", stem, i)), []byte("data"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "STREAM.BIN"), []byte("data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(t.TempDir(), "boot.iso")
+	keep := func(n string) bool { return n == "SYSTEM.CNF" }
+	group := func(n string) string {
+		if strings.HasPrefix(n, "STREAM") {
+			return ""
+		}
+		return "P" + n[len(n)-6:len(n)-4]
+	}
+	if err := WriteDataISOGrouped(dir, out, "TEST", keep, "DATA", nil, group); err != nil {
+		t.Fatal(err)
+	}
+	if n := LargestDirRecords(out); n != 1 {
+		t.Fatalf("largest directory spans %d sectors, want 1", n)
+	}
+	b, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "P10") || !strings.Contains(string(b), "MESH10.BIN;1") {
+		t.Fatal("no P10 folder with MESH10.BIN")
+	}
+}
