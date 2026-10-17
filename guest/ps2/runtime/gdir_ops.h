@@ -200,6 +200,11 @@ enum GdirNative {
 	GN_PS2_SAVE_SLOT = 117, // slot: the poke bytes (up to the last non-zero one) to the memory card
 	GN_PS2_LOAD_SLOT = 118, // slot: the memory card save back into the poke bytes; bytes, -1 none, -2 no card
 	GN_PS2_MEMCARD_PRESENT = 119, // a formatted PS2 memory card is in slot 1
+	GN_PS2_SET_VIEWS = 120, // count, camera nodes: split screen (2: halves, 3-4: quarters); 0 or 1: one view
+	GN_PS2_PAD_COUNT = 121, // pads plugged in (a multitap's slots count)
+	GN_PS2_PAD_PRESSED = 122, // pad, button name ("cross", "left", "start", ...)
+	GN_PS2_PAD_JUST_PRESSED = 123, // pad, button name
+	GN_PS2_PAD_AXIS = 124, // pad: steering -1..1 (d-pad, else the left stick)
 	GN_COUNT = 128,
 };
 

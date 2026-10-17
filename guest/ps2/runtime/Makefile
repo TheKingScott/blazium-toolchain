@@ -7,7 +7,7 @@ EE_OBJS = main.o gs_draw.o pad_io.o sfx_io.o pack_io.o script_vm.o sys_io.o vu1_
 EE_OBJS += $(patsubst %.cpp,%.o,$(wildcard extra/*.cpp))
 EE_OBJS += $(patsubst %.c,%.o,$(wildcard extra/*.c))
 EE_INCS += -I.
-EE_LIBS = -ldraw -lgraph -lpacket -ldma -lpad -lmc -lfileXio -lpatches -lm
+EE_LIBS = -ldraw -lgraph -lpacket -ldma -lpadx -lmtap -lmc -lfileXio -lpatches -lm
 ifneq ($(wildcard $(PS2SDK)/ee/lib/libsdr.a),)
 EE_LIBS += -lsdr
 EE_CXXFLAGS += -DBLAZIUM_PS2_HAS_LIBSD=1

@@ -169,6 +169,18 @@ static int g_fade_a;
 static int g_fade_r;
 static int g_fade_g;
 static int g_fade_b;
+/* Split screen (gs_draw_set_views): up to four views of the one scene, each
+ * with its own camera, drawn one after another into its own part of the
+ * frame (2: top and bottom halves; 3-4: quarters). The HUD goes on top once. */
+#define GS_MAX_VIEWS 4
+struct ViewCam {
+	float ex, ey, ez, tx, ty, tz, fov;
+};
+static ViewCam g_views[GS_MAX_VIEWS];
+static int g_view_n;
+/* the size of the view being drawn: NDC -1..1 spans this many pixels */
+static int g_vp_w = 640;
+static int g_vp_h = 448;
 
 static unsigned ru16(const unsigned char *p)
 {
@@ -1042,8 +1054,9 @@ static void apply_gs_z(xyz_t *xyz, const vertex_f_t *clip, int n, int bias)
  * Scale NDC to half the framebuffer so -1..1 spans exactly the screen. */
 static void fit_ndc_to_frame(vertex_f_t *c, int n, const framebuffer_t *f)
 {
-	const float sx = (float)((f && f->width > 0) ? f->width : 640) * 0.5f / 2048.0f;
-	const float sy = (float)((f && f->height > 0) ? f->height : 448) * 0.5f / 2048.0f;
+	(void)f; /* the view's size: the whole frame, or one split-screen view */
+	const float sx = (float)(g_vp_w > 0 ? g_vp_w : 640) * 0.5f / 2048.0f;
+	const float sy = (float)(g_vp_h > 0 ? g_vp_h : 448) * 0.5f / 2048.0f;
 	for (int i = 0; i < n; i++) {
 		c[i].x *= sx;
 		c[i].y *= sy;
@@ -2878,53 +2891,79 @@ void gs_draw_set_clear(int r, int g, int b)
 	g_clear_b = b;
 }
 
-void gs_draw_scene(framebuffer_t *frame, zbuffer_t *z)
-
+static qword_t *view_regs(qword_t *q, int ctx, float ox, float oy, int x0, int y0, int x1, int y1)
 {
-	if (!frame) {
-		return;
-	}
-	packet_t *packet = packet_init(GS_PACKET_QWORDS, PACKET_NORMAL);
-	if (!packet) {
-		return;
-	}
-	qword_t *q = packet->data;
-	qword_t *limit = packet->data + (GS_PACKET_QWORDS - 80);
+	PACK_GIFTAG(q, GIF_SET_TAG(2, 0, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
+	q++;
+	PACK_GIFTAG(q, GS_SET_XYOFFSET((int)(ox * 16.0f), (int)(oy * 16.0f)), GS_REG_XYOFFSET + ctx);
+	q++;
+	PACK_GIFTAG(q, GS_SET_SCISSOR(x0, x1, y0, y1), GS_REG_SCISSOR + ctx);
+	q++;
+	return q;
+}
 
-	float ox = 0.0f;
-	float oy = 0.0f;
-	gs_draw_fb_origin(frame->width, frame->height, &ox, &oy);
-	q = draw_framebuffer(q, 0, frame);
-	q = draw_zbuffer(q, 0, z);
-	q = draw_disable_tests(q, 0, z);
-	q = draw_clear(q, 0, ox, oy, (float)frame->width, (float)frame->height, g_clear_r, g_clear_g, g_clear_b);
-	if (!aabb_is_tiny()) {
-		q = draw_enable_tests(q, 0, z);
-	}
-	if (!g_ready) {
-		g_hud_packet = packet;
-		g_hud_limit = limit;
-		q = emit_hud(q, frame->width, frame->height);
-		g_hud_packet = 0;
-		q = draw_finish(q);
-		send_packet(packet, q);
-		packet_free(packet);
+void gs_draw_set_views(int n)
+{
+	g_view_n = n >= 2 && n <= GS_MAX_VIEWS ? n : 0;
+}
+
+void gs_draw_view_look(int i, float ex, float ey, float ez, float tx, float ty, float tz, float fov_deg)
+{
+	if (i < 0 || i >= GS_MAX_VIEWS) {
 		return;
 	}
+	ViewCam *v = &g_views[i];
+	v->ex = ex;
+	v->ey = ey;
+	v->ez = ez;
+	v->tx = tx;
+	v->ty = ty;
+	v->tz = tz;
+	v->fov = fov_deg > 1.0f && fov_deg < 170.0f ? fov_deg : 55.0f;
+}
 
+int gs_draw_view_count(void)
+{
+	return g_view_n;
+}
+
+/* split-screen view i of n in a w x h frame */
+static void view_rect(int i, int n, int w, int h, int *x, int *y, int *vw, int *vh)
+{
+	if (n == 2) {
+		*x = 0;
+		*y = i * (h / 2);
+		*vw = w;
+		*vh = h / 2;
+		return;
+	}
+	*x = (i & 1) * (w / 2);
+	*y = (i >> 1) * (h / 2);
+	*vw = w / 2;
+	*vh = h / 2;
+}
+
+/* One view of the scene: the camera as it stands, NDC -1..1 onto the
+ * vw x vh rectangle at (vx, vy). split: one of several views, so the view
+ * sets its own XYOFFSET and SCISSOR and keeps the camera it was given. */
+static qword_t *draw_view(packet_t *packet, qword_t *q, qword_t *limit, framebuffer_t *frame, zbuffer_t *z, float ox,
+		float oy, int vx, int vy, int vw, int vh, int split, unsigned *drawn, int *in_prim)
+{
+	const float vox = split ? 2048.0f - (float)vx - (float)(vw / 2) : ox;
+	const float voy = split ? 2048.0f - (float)vy - (float)(vh / 2) : oy;
 	Mat4 world, view, proj, tmp, mvp;
 	yaw_y(&world, g_world_yaw);
 	float ex = 0.0f, ey = 0.0f, ez = 0.0f;
 	eye_now(&ex, &ey, &ez);
-	if (!g_cam_locked && (aabb_is_tiny() || cam_cannot_see_aabb(ex, ey, ez))) {
+	if (!split && !g_cam_locked && (aabb_is_tiny() || cam_cannot_see_aabb(ex, ey, ez))) {
 		frame_aabb();
 		eye_now(&ex, &ey, &ez);
 	}
 	look_at(&view, ex, ey, ez, g_look_x, g_look_y, g_look_z);
 	if (g_ortho && !g_have_aabb) {
-		ortho_proj(&proj, (float)frame->width / (float)(frame->height ? frame->height : 1), 0.25f, 400.0f);
+		ortho_proj(&proj, (float)vw / (float)(vh ? vh : 1), 0.25f, 400.0f);
 	} else {
-		perspective(&proj, g_fov, (float)frame->width / (float)frame->height, 0.25f, 400.0f);
+		perspective(&proj, g_fov, (float)vw / (float)(vh ? vh : 1), 0.25f, 400.0f);
 	}
 	mat_mul(&view, &world, &tmp);
 	mat_mul(&proj, &tmp, &mvp);
@@ -2932,7 +2971,14 @@ void gs_draw_scene(framebuffer_t *frame, zbuffer_t *z)
 		g_mesh_dirty_vu = 0;
 		vu_build_batches();
 	}
-	vu_frame_begin(&mvp, frame->width, frame->height);
+	g_vp_w = vw;
+	g_vp_h = vh;
+	vu_frame_begin(&mvp, vw, vh);
+	if (split) {
+		/* this view's part of the frame: NDC centre on its middle, nothing
+		 * drawn past its edges (VU1 leaves the guard band to the scissor) */
+		q = view_regs(q, 0, vox, voy, vx, vy, vx + vw - 1, vy + vh - 1);
+	}
 
 	DrawCtx c;
 	memset(&c, 0, sizeof(c));
@@ -2969,8 +3015,11 @@ void gs_draw_scene(framebuffer_t *frame, zbuffer_t *z)
 	if (g_vu_on && g_vu_ready && g_vb && !c.tiny) {
 		/* context 2 mirrors context 1 for VU1's triangles */
 		q = draw_setup_environment(q, 1, frame, z);
-		q = draw_primitive_xyoffset(q, 1, ox, oy);
+		q = draw_primitive_xyoffset(q, 1, vox, voy);
 		q = draw_enable_tests(q, 1, z);
+		if (split) {
+			q = view_regs(q, 1, vox, voy, vx, vy, vx + vw - 1, vy + vh - 1);
+		}
 		if (g_fog_on) {
 			PACK_GIFTAG(q, GIF_SET_TAG(1, 0, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
 			q++;
@@ -3100,7 +3149,8 @@ void gs_draw_scene(framebuffer_t *frame, zbuffer_t *z)
 	}
 #ifdef GS_VU1
 	if (g_vu_draw_n > 0) {
-		/* the EE's triangles and VU1's both in, then the HUD on top */
+		/* the EE's triangles and VU1's both in, then the HUD (or the next
+		 * view, which reuses VU1's blocks) */
 		run_deferred(&c);
 		ctx_flush(&c);
 		if (!g_vu_kicked) {
@@ -3109,6 +3159,89 @@ void gs_draw_scene(framebuffer_t *frame, zbuffer_t *z)
 		vu_wait();
 	}
 #endif
+	*drawn += c.drawn + g_vu_draw_n_frame();
+	*in_prim = c.in_prim;
+	return c.q;
+}
+void gs_draw_scene(framebuffer_t *frame, zbuffer_t *z)
+
+{
+	if (!frame) {
+		return;
+	}
+	packet_t *packet = packet_init(GS_PACKET_QWORDS, PACKET_NORMAL);
+	if (!packet) {
+		return;
+	}
+	qword_t *q = packet->data;
+	qword_t *limit = packet->data + (GS_PACKET_QWORDS - 80);
+
+	float ox = 0.0f;
+	float oy = 0.0f;
+	gs_draw_fb_origin(frame->width, frame->height, &ox, &oy);
+	q = draw_framebuffer(q, 0, frame);
+	q = draw_zbuffer(q, 0, z);
+	q = draw_disable_tests(q, 0, z);
+	q = draw_clear(q, 0, ox, oy, (float)frame->width, (float)frame->height, g_clear_r, g_clear_g, g_clear_b);
+	if (!aabb_is_tiny()) {
+		q = draw_enable_tests(q, 0, z);
+	}
+	if (!g_ready) {
+		g_hud_packet = packet;
+		g_hud_limit = limit;
+		q = emit_hud(q, frame->width, frame->height);
+		g_hud_packet = 0;
+		q = draw_finish(q);
+		send_packet(packet, q);
+		packet_free(packet);
+		return;
+	}
+
+	const int nv = g_view_n >= 2 ? g_view_n : 1;
+	unsigned drawn = 0;
+	int in_prim = 0;
+	if (nv == 1) {
+		q = draw_view(packet, q, limit, frame, z, ox, oy, 0, 0, frame->width, frame->height, 0, &drawn, &in_prim);
+	} else {
+		/* each view with its own camera; the scripted one comes back after */
+		const float kx = g_cam_x, ky = g_cam_y, kz = g_cam_z;
+		const float lx = g_look_x, lyy = g_look_y, lz = g_look_z, kf = g_fov;
+		const float ax = g_attach_x, ay = g_attach_y, az = g_attach_z, eh = g_eye_h;
+		g_attach_x = g_attach_y = g_attach_z = 0.0f;
+		g_eye_h = 0.0f;
+		for (int v = 0; v < nv; v++) {
+			int vx = 0, vy = 0, vw = 0, vh = 0;
+			view_rect(v, nv, frame->width, frame->height, &vx, &vy, &vw, &vh);
+			const ViewCam *vc = &g_views[v];
+			g_cam_x = vc->ex;
+			g_cam_y = vc->ey;
+			g_cam_z = vc->ez;
+			g_look_x = vc->tx;
+			g_look_y = vc->ty;
+			g_look_z = vc->tz;
+			g_fov = vc->fov;
+			if (v > 0) {
+				q = end_prim(q, &in_prim);
+			}
+			q = draw_view(packet, q, limit, frame, z, ox, oy, vx, vy, vw, vh, 1, &drawn, &in_prim);
+		}
+		g_cam_x = kx;
+		g_cam_y = ky;
+		g_cam_z = kz;
+		g_look_x = lx;
+		g_look_y = lyy;
+		g_look_z = lz;
+		g_fov = kf;
+		g_attach_x = ax;
+		g_attach_y = ay;
+		g_attach_z = az;
+		g_eye_h = eh;
+		g_vp_w = frame->width;
+		g_vp_h = frame->height;
+		q = end_prim(q, &in_prim);
+		/* the HUD in whole-frame coordinates again */
+		q = view_regs(q, 0, ox, oy, 0, 0, frame->width - 1, frame->height - 1);
+	}
 #ifdef GS_FRAMELOG
 	{
 		/* one line a frame: where the camera is and what the frame cost */
@@ -3124,21 +3257,18 @@ void gs_draw_scene(framebuffer_t *frame, zbuffer_t *z)
 #endif
 		extern unsigned gdir_vm_last_ops(void);
 		printf("FRAME %u cam %.1f %.1f %.1f chunks %u ee_tested %u ee_drawn %u vu_batches %u vu_tris %u ops %u\n", fl_frame++,
-				g_cam_x, g_cam_y, g_cam_z, g_stat_chunks, g_stat_tris, c.drawn, g_vu_stat_frame(), vu_verts / 3,
+				g_cam_x, g_cam_y, g_cam_z, g_stat_chunks, g_stat_tris, drawn, g_vu_stat_frame(), vu_verts / 3,
 				gdir_vm_last_ops());
 	}
 #endif
 #ifdef GS_STATS
 	if (++g_stat_frames % 300 == 0) {
 		printf("GS stats: %u chunks, %u of %u tris tested, %u drawn by the EE, %u VU1 batches (this frame)\n", g_stat_chunks,
-				g_stat_tris, g_index_count / 3, c.drawn, g_vu_stat_frame());
+				g_stat_tris, g_index_count / 3, drawn, g_vu_stat_frame());
 	}
 #endif
 	g_stat_tris = 0;
 	g_stat_chunks = 0;
-	q = c.q;
-	int in_prim = c.in_prim;
-	const unsigned drawn = c.drawn + g_vu_draw_n_frame();
 	q = end_prim(q, &in_prim);
 	q = draw_disable_tests(q, 0, z);
 	if (drawn == 0) {

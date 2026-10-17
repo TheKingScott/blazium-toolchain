@@ -29,7 +29,7 @@ target_include_directories(runtime PRIVATE
 	"$ENV{PS2SDK}/common/include")
 target_compile_options(runtime PRIVATE -D_EE -G0 -fno-exceptions -fno-rtti)
 target_compile_definitions(runtime PRIVATE BLAZIUM_PS2_COOK_ABI=1 BUILD_FOR_PCSX2=1)
-target_link_libraries(runtime PRIVATE draw graph packet dma pad mc fileXio patches m)
+target_link_libraries(runtime PRIVATE draw graph packet dma padx mtap mc fileXio patches m)
 if(EXISTS "$ENV{PS2SDK}/ee/lib/libsdr.a")
 	target_link_libraries(runtime PRIVATE sdr)
 	target_compile_definitions(runtime PRIVATE BLAZIUM_PS2_HAS_LIBSD=1)

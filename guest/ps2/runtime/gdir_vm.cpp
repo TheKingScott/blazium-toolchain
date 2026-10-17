@@ -136,6 +136,9 @@ static float s_world[GDIR_MAX_NODES][12];
 static float s_w0inv[GDIR_MAX_NODES][12];
 static unsigned char s_vis[GDIR_MAX_NODES];
 static unsigned char s_dirty;
+/* PS2.set_views: split-screen cameras (nodes of this pack), s_view_n >= 2 */
+static short s_view_cam[4];
+static int s_view_n;
 static unsigned s_inst_n;
 static PackInst s_inst[GDIR_MAX_INST];
 static unsigned s_inst_mem[GDIR_MAX_INST];
@@ -642,6 +645,21 @@ static void recompute_nodes(void)
 		gs_draw_node_matrix((int)n, ident ? 0 : d);
 	}
 	const Pack *pk = &s_pack[s_cur];
+	for (int v = 0; v < s_view_n; v++) {
+		const int cn = s_view_cam[v];
+		if (!node_ok(cn)) {
+			continue;
+		}
+		const float *w = s_world[cn];
+		float fx = -w[2], fy = -w[6], fz = -w[10];
+		const float l = sqrtf(fx * fx + fy * fy + fz * fz);
+		if (l > 1e-6f) {
+			fx /= l;
+			fy /= l;
+			fz /= l;
+		}
+		gs_draw_view_look(v, w[3], w[7], w[11], w[3] + fx * 10.0f, w[7] + fy * 10.0f, w[11] + fz * 10.0f, pk->fov);
+	}
 	if (node_ok(pk->camera)) {
 		const float *w = s_world[pk->camera];
 		float fx = -w[2], fy = -w[6], fz = -w[10];
@@ -1580,6 +1598,28 @@ static Val native(unsigned inst, int id, Val *a, int n)
 			return vint(mc_io_load(inum(a[0]), s_poke, GDIR_POKE_BYTES));
 		case GN_PS2_MEMCARD_PRESENT:
 			return vbool(mc_io_present());
+		case GN_PS2_SET_VIEWS: {
+			/* count, then a camera node for each view; 0 or 1: one view */
+			int nv = n > 0 ? inum(a[0]) : 0;
+			if (nv < 2 || nv > 4 || n < 1 + nv) {
+				nv = 0;
+			}
+			for (int v = 0; v < nv; v++) {
+				s_view_cam[v] = a[1 + v].t == T_NODE ? (short)a[1 + v].i : (short)-1;
+			}
+			s_view_n = nv;
+			gs_draw_set_views(nv);
+			s_dirty = 1;
+			return vbool(nv >= 2);
+		}
+		case GN_PS2_PAD_COUNT:
+			return vint(pad_io_count());
+		case GN_PS2_PAD_PRESSED:
+			return vbool(a[1].t == T_STR && pad_io_pad_pressed(inum(a[0]), a[1].s));
+		case GN_PS2_PAD_JUST_PRESSED:
+			return vbool(a[1].t == T_STR && pad_io_pad_just_pressed(inum(a[0]), a[1].s));
+		case GN_PS2_PAD_AXIS:
+			return vfloat(pad_io_pad_axis(inum(a[0])));
 	}
 	fail("unknown native");
 	return vnil();
@@ -1881,6 +1921,8 @@ static void enter_pack(int pack)
 	s_conn_n = 0;
 	memset(s_arr_used, 0, sizeof(s_arr_used));
 	gs_draw_nodes_reset();
+	s_view_n = 0;
+	gs_draw_set_views(0);
 	if (pack < 0 || pack >= GDIR_MAX_PACKS || !s_pack[pack].present) {
 		gs_draw_camera_lock(0);
 		return;
