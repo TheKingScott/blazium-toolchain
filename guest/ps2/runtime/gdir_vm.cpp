@@ -61,6 +61,7 @@ struct Func {
 	unsigned char argc;
 	unsigned char locals;
 	unsigned code;
+	unsigned short name; /* const index */
 };
 
 struct Class {
@@ -976,6 +977,9 @@ static int compare(int op, const Val &a, const Val &b)
 
 /* ------------------------------------------------------------ natives */
 static Val call(unsigned inst, unsigned func, const Val *args, int argc);
+#ifdef GDIR_STATS
+static unsigned s_fn_ops[GDIR_MAX_FUNCS]; /* inclusive, since the last report */
+#endif
 
 static float frand(void)
 {
@@ -1600,6 +1604,9 @@ static Val call(unsigned inst, unsigned func, const Val *args, int argc)
 	}
 	s_sp = base + f->locals;
 	s_depth++;
+#ifdef GDIR_STATS
+	const unsigned ops0 = s_ops;
+#endif
 	const unsigned mem = s_inst_mem[inst];
 	const unsigned cls = s_inst[inst].cls;
 	unsigned pc = f->code;
@@ -1853,6 +1860,9 @@ static Val call(unsigned inst, unsigned func, const Val *args, int argc)
 		}
 	}
 done:
+#ifdef GDIR_STATS
+	s_fn_ops[func] += s_ops - ops0;
+#endif
 	s_sp = base;
 	s_depth--;
 	return ret;
@@ -2047,6 +2057,7 @@ int gdir_vm_init(const unsigned char *b, unsigned sz)
 			s_fn[s_fn_n].argc = p[0];
 			s_fn[s_fn_n].locals = p[1];
 			s_fn[s_fn_n].code = ru32(p + 2);
+			s_fn[s_fn_n].name = (unsigned short)ru16(p + 6);
 			s_fn_n++;
 			p += 8; // argc, locals, code, name const u16
 		}
@@ -2165,6 +2176,23 @@ void gdir_vm_process(float delta)
 		if (++frames % 300 == 0) {
 			printf("GDIR stats: pack %d peak %u ops/frame (last %u)\n", s_cur, peak, s_ops);
 			peak = 0;
+			/* the six heaviest functions over the last 300 frames, per frame */
+			for (int top = 0; top < 6; top++) {
+				unsigned best = 0, bi = 0;
+				for (unsigned f = 0; f < s_fn_n; f++) {
+					if (s_fn_ops[f] > best) {
+						best = s_fn_ops[f];
+						bi = f;
+					}
+				}
+				if (!best) {
+					break;
+				}
+				const Val nm = s_fn[bi].name < s_k_n ? s_k[s_fn[bi].name] : vnil();
+				printf("  %-20s %u ops/frame\n", nm.t == T_STR ? nm.s : "?", best / 300);
+				s_fn_ops[bi] = 0;
+			}
+			memset(s_fn_ops, 0, sizeof(s_fn_ops));
 		}
 	}
 #endif
