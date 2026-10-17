@@ -980,6 +980,8 @@ static Val call(unsigned inst, unsigned func, const Val *args, int argc);
 #ifdef GDIR_STATS
 static unsigned s_fn_ops[GDIR_MAX_FUNCS]; /* inclusive, since the last report */
 #endif
+static unsigned s_ops_last; /* interpreter ops of the last frame (GS_FRAMELOG) */
+unsigned gdir_vm_last_ops(void);
 
 static float frand(void)
 {
@@ -2167,6 +2169,7 @@ void gdir_vm_process(float delta)
 	if (s_dirty) {
 		recompute_nodes();
 	}
+	s_ops_last = s_ops;
 #ifdef GDIR_STATS
 	{
 		static unsigned peak, frames;
@@ -2208,4 +2211,9 @@ void gdir_vm_process(float delta)
 		}
 	}
 	sfx_io_tick(delta);
+}
+
+unsigned gdir_vm_last_ops(void)
+{
+	return s_ops_last;
 }

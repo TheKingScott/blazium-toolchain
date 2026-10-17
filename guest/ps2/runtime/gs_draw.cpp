@@ -788,7 +788,16 @@ static void parse_upload_gtex(const unsigned char *blob, unsigned sz)
 	}
 }
 
+static qword_t *bind_tex_ctx(qword_t *q, int slot, int ctx);
+
 static qword_t *bind_tex(qword_t *q, int slot)
+{
+	return bind_tex_ctx(q, slot, 0);
+}
+
+/* A texture for drawing context ctx (0: the EE's triangles, 1: VU1's, so
+ * the two can be in flight at once without trading TEX0/TEX1/CLAMP). */
+static qword_t *bind_tex_ctx(qword_t *q, int slot, int ctx)
 {
 	if (slot < 0 || slot >= g_tex_count || !g_tex[slot].ready) {
 		slot = 0;
@@ -832,9 +841,9 @@ static qword_t *bind_tex(qword_t *q, int slot)
 	wrap.maxu = (int)t->width - 1;
 	wrap.minv = 0;
 	wrap.maxv = (int)t->height - 1;
-	q = draw_texture_sampling(q, 0, &lod);
-	q = draw_texture_wrapping(q, 0, &wrap);
-	q = draw_texturebuffer(q, 0, &texbuf, &clut);
+	q = draw_texture_sampling(q, ctx, &lod);
+	q = draw_texture_wrapping(q, ctx, &wrap);
+	q = draw_texturebuffer(q, ctx, &texbuf, &clut);
 	PACK_GIFTAG(q, GIF_SET_TAG(1, 0, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
 	q++;
 	PACK_GIFTAG(q, 1, GS_REG_TEXFLUSH);
@@ -2245,6 +2254,7 @@ static int g_vu_on = 0;
 #else
 static int g_vu_on = 1; /* gs_draw_use_vu1() */
 #endif
+static int g_vu_kicked;
 static int g_vu_ready;
 static VuBatch *g_vb;
 static unsigned g_vb_n;
@@ -2403,7 +2413,7 @@ static void vu_build_batches(void)
 			g_chunk_vbn[ci]++;
 			/* GIF tag: PACKED ST, RGBAQ, XYZF2; triangles, Gouraud, textured,
 			 * fogged (F = 255 is no fog); n in the unused w word */
-			const u64 prim = 3u | (1u << 3) | (1u << 4) | (1u << 5);
+			const u64 prim = 3u | (1u << 3) | (1u << 4) | (1u << 5) | (1u << 9); /* CTXT 2 */
 			u64 *dw = (u64 *)at;
 			dw[0] = (u64)n | (1ull << 15) | (1ull << 46) | (prim << 47) | (3ull << 60);
 			dw[1] = (u64)GIF_REG_ST | ((u64)GIF_REG_RGBAQ << 4) | ((u64)GIF_REG_XYZF2 << 8) | ((u64)n << 32);
@@ -2550,8 +2560,9 @@ static int vu_take(const DrawCtx *c, unsigned ci, float cx, float cy, float cz, 
 	return 1;
 }
 
-/* The frame's VU chain, run to the end before the HUD goes out. */
-static void vu_flush(void)
+/* The frame's VU chain. It runs while the EE clips the rest; vu_wait()
+ * before the HUD. */
+static void vu_kick(void)
 {
 	if (g_vu_draw_n == 0 || !vu_init()) {
 		return;
@@ -2573,7 +2584,7 @@ static void vu_flush(void)
 				/* texture: after everything kicked so far, straight to the GIF */
 				qword_t *tag = q++;
 				qword_t *data = q;
-				q = bind_tex(q, vb->tex);
+				q = bind_tex_ctx(q, vb->tex, 1);
 				PACK_GIFTAG(q, GIF_SET_TAG(0, 1, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
 				q++;
 				const unsigned k = (unsigned)(q - data);
@@ -2587,7 +2598,18 @@ static void vu_flush(void)
 		}
 	}
 	q = vu_tag(q, DMA_ID_END, 0, 0, VIF_FLUSH, VIF_NOP);
-	vu_send(g_vu_chain);
+	FlushCache(0);
+	dma_channel_send_chain(DMA_CHANNEL_VIF1, g_vu_chain, 0, DMA_FLAG_TRANSFERTAG, 0);
+	g_vu_kicked = 1;
+}
+
+static void vu_wait(void)
+{
+	if (!g_vu_kicked) {
+		return;
+	}
+	g_vu_kicked = 0;
+	dma_channel_wait(DMA_CHANNEL_VIF1, 0);
 #ifndef BLAZIUM_PS2_VU1_EMU
 	/* The DMA is done once the VIF has the last tag; the VIF can still be
 	 * in that FLUSH, and the last XGKICK still on its way to the GS. The
@@ -2605,7 +2627,8 @@ static void vu_flush(void)
 static void vu_build_batches(void) {}
 static void vu_frame_begin(const Mat4 *, int, int) {}
 static int vu_take(const DrawCtx *, unsigned, float, float, float, float, int, int) { return 0; }
-static void vu_flush(void) {}
+static void vu_kick(void) {}
+static void vu_wait(void) {}
 #endif
 
 static unsigned g_vu_stat_frame(void)
@@ -2633,6 +2656,34 @@ void gs_draw_use_vu1(int on)
 #else
 	(void)on;
 #endif
+}
+
+/* With VU1 on, the EE first only sorts the frame's chunks: VU1's go in the
+ * chain, its own wait here until the chain is kicked, then it clips them
+ * while VU1 draws. */
+struct CpuJob {
+	unsigned ci;
+	int inst; /* -1: an ordinary chunk; else a node whose matrix is m */
+	float m[12];
+};
+#define GS_MAX_JOBS 2048
+static CpuJob g_jobs[GS_MAX_JOBS];
+static unsigned g_job_n;
+static int g_defer;
+
+static void defer_or_draw(DrawCtx *c, unsigned ci, int inst_node, const float *m)
+{
+	const MeshChunk *ch = &g_chunks[ci];
+	if (g_defer && g_job_n < GS_MAX_JOBS) {
+		CpuJob *j = &g_jobs[g_job_n++];
+		j->ci = ci;
+		j->inst = inst_node;
+		if (m) {
+			memcpy(j->m, m, sizeof(j->m));
+		}
+		return;
+	}
+	draw_range(c, ch->first, ch->first + ch->n);
 }
 
 /* 3x4 row-major a * b */
@@ -2713,12 +2764,47 @@ static void draw_instances(DrawCtx *c, float pl[6][4])
 			if (vu_take(c, ci, cx, cy, cz, r, (int)nd, 1)) {
 				continue;
 			}
-			draw_range(c, ch->first, ch->first + ch->n);
+			defer_or_draw(c, ci, (int)nd, m);
 		}
 		memcpy(g_nm[nd], keep, sizeof(keep));
 		g_nm_on[nd] = keep_on;
 	}
 	g_nodes_live = live;
+}
+
+/* Send what the EE has so far (the clear, fog, and context 2 for VU1), kick
+ * VU1's chain, then clip the EE's own chunks while it runs. */
+static void run_deferred(DrawCtx *c)
+{
+	if (!g_defer) {
+		return;
+	}
+	g_defer = 0;
+	ctx_flush(c);
+	vu_kick();
+	const int live = g_nodes_live;
+	for (unsigned k = 0; k < g_job_n; k++) {
+		const CpuJob *j = &g_jobs[k];
+		const MeshChunk *ch = &g_chunks[j->ci];
+		if (j->inst >= 0) {
+			const int nd = j->inst;
+			float keep[12];
+			const unsigned char keep_on = g_nm_on[nd];
+			memcpy(keep, g_nm[nd], sizeof(keep));
+			memcpy(g_nm[nd], j->m, sizeof(j->m));
+			g_nm_on[nd] = 1;
+			g_nodes_live = 1;
+			c->nofog = g_nfog[nd];
+			draw_range(c, ch->first, ch->first + ch->n);
+			memcpy(g_nm[nd], keep, sizeof(keep));
+			g_nm_on[nd] = keep_on;
+			g_nodes_live = live;
+		} else {
+			c->nofog = ch->node < GS_MAX_NODES ? g_nfog[ch->node] : 0;
+			draw_range(c, ch->first, ch->first + ch->n);
+		}
+	}
+	g_job_n = 0;
 }
 
 void gs_draw_nodes_begin(void)
@@ -2869,6 +2955,30 @@ void gs_draw_scene(framebuffer_t *frame, zbuffer_t *z)
 		PACK_GIFTAG(q, GS_SET_FOGCOL(g_fog_r, g_fog_g, g_fog_b), GS_REG_FOGCOL);
 		q++;
 	}
+#ifdef GS_VU1
+	g_job_n = 0;
+	/* the GS has one CLUT buffer for both contexts: palettised textures
+	 * keep VU1 and the EE in turn */
+	int any_clut = 0;
+	for (int t = 0; t < g_tex_count; t++) {
+		if (g_tex[t].ready && g_tex[t].clut_count > 0) {
+			any_clut = 1;
+		}
+	}
+	g_defer = g_vu_on && g_vu_ready && g_vb && !c.tiny && !any_clut;
+	if (g_vu_on && g_vu_ready && g_vb && !c.tiny) {
+		/* context 2 mirrors context 1 for VU1's triangles */
+		q = draw_setup_environment(q, 1, frame, z);
+		q = draw_primitive_xyoffset(q, 1, ox, oy);
+		q = draw_enable_tests(q, 1, z);
+		if (g_fog_on) {
+			PACK_GIFTAG(q, GIF_SET_TAG(1, 0, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
+			q++;
+			PACK_GIFTAG(q, GS_SET_FOGCOL(g_fog_r, g_fog_g, g_fog_b), GS_REG_FOGCOL);
+			q++;
+		}
+	}
+#endif
 	c.q = q;
 	c.color.r = 0x80;
 	c.color.g = 0x80;
@@ -2949,7 +3059,7 @@ void gs_draw_scene(framebuffer_t *frame, zbuffer_t *z)
 					if (vu_take(&c, ci, cx, cy, cz, ch->r, (int)n, 0)) {
 						continue;
 					}
-					draw_range(&c, ch->first, ch->first + ch->n);
+					defer_or_draw(&c, ci, -1, 0);
 					continue;
 				}
 			}
@@ -2957,6 +3067,7 @@ void gs_draw_scene(framebuffer_t *frame, zbuffer_t *z)
 			draw_range(&c, ch->first, ch->first + ch->n);
 		}
 		draw_instances(&c, pl);
+		run_deferred(&c);
 	}
 	for (int ly = 0; ly < g_ly_n; ly++) {
 		const unsigned char *blob = g_ly_mesh[ly];
@@ -2987,13 +3098,34 @@ void gs_draw_scene(framebuffer_t *frame, zbuffer_t *z)
 			draw_tri(&c, &v0, &v1, &v2);
 		}
 	}
-	g_stat_tris = 0;
-	g_stat_chunks = 0;
 #ifdef GS_VU1
 	if (g_vu_draw_n > 0) {
-		/* the EE's triangles first, then VU1's, then the HUD on top */
+		/* the EE's triangles and VU1's both in, then the HUD on top */
+		run_deferred(&c);
 		ctx_flush(&c);
-		vu_flush();
+		if (!g_vu_kicked) {
+			vu_kick();
+		}
+		vu_wait();
+	}
+#endif
+#ifdef GS_FRAMELOG
+	{
+		/* one line a frame: where the camera is and what the frame cost */
+		static unsigned fl_frame;
+		unsigned vu_verts = 0;
+#ifdef GS_VU1
+		for (unsigned d = 0; d < g_vu_draw_n; d++) {
+			const unsigned ci = g_vu_draw_chunk[d];
+			for (unsigned b = g_chunk_vb0[ci]; b < g_chunk_vb0[ci] + g_chunk_vbn[ci]; b++) {
+				vu_verts += g_vb[b].n;
+			}
+		}
+#endif
+		extern unsigned gdir_vm_last_ops(void);
+		printf("FRAME %u cam %.1f %.1f %.1f chunks %u ee_tested %u ee_drawn %u vu_batches %u vu_tris %u ops %u\n", fl_frame++,
+				g_cam_x, g_cam_y, g_cam_z, g_stat_chunks, g_stat_tris, c.drawn, g_vu_stat_frame(), vu_verts / 3,
+				gdir_vm_last_ops());
 	}
 #endif
 #ifdef GS_STATS
@@ -3002,6 +3134,8 @@ void gs_draw_scene(framebuffer_t *frame, zbuffer_t *z)
 				g_stat_tris, g_index_count / 3, c.drawn, g_vu_stat_frame());
 	}
 #endif
+	g_stat_tris = 0;
+	g_stat_chunks = 0;
 	q = c.q;
 	int in_prim = c.in_prim;
 	const unsigned drawn = c.drawn + g_vu_draw_n_frame();
