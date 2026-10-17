@@ -247,13 +247,52 @@ func (t *Tool) ISO(ctx context.Context, opts platforms.ISOOptions) error {
 	}
 	vol := iso.VolumeOr(opts.VolumeID, settings.Current().PS2.ISOVolume)
 	boot := bootELFName(opts.Dir)
+	// The BIOS only boots a disc whose boot ELF has a product-code name
+	// (SLUS_000.01): it checks the name against the disc's key. Fast boot in
+	// PCSX2 skips that check, so a GAME.ELF disc boots fast but not full.
+	want := strings.ToUpper(strings.TrimSpace(opts.BootELF))
+	if want != "" && !isSerialELFName(want) {
+		return report.Usage("--boot-elf must be a product code like SLUS_000.01 (four letters, _, three digits, ., two digits)")
+	}
+	src := opts.Dir
+	if boot != "" && fileExists(filepath.Join(opts.Dir, boot)) &&
+		((want != "" && !strings.EqualFold(boot, want)) || (want == "" && !isSerialELFName(boot))) {
+		serial := want
+		if serial == "" {
+			serial = serialELFName()
+		}
+		// The disc is built from a copy of the folder with the ELF renamed and
+		// BOOT2 pointing at it; the export folder itself is left as it is, so
+		// the next export's ELF is the one that goes on the next disc.
+		stage, err := stageBootAsSerial(opts.Dir, boot, serial)
+		if err != nil {
+			return err
+		}
+		defer os.RemoveAll(stage)
+		if opts.Stdout != nil {
+			report.Line(opts.Stdout, report.Note, fmt.Sprintf("boot ELF %s goes on the disc as %s (the BIOS boots product-code names only)", boot, serial))
+		}
+		src = stage
+		boot = serial
+	}
 	keep := func(name string) bool {
 		return strings.EqualFold(name, "SYSTEM.CNF") || (boot != "" && strings.EqualFold(name, boot))
 	}
 	// Everything but SYSTEM.CNF and the boot ELF goes under DATA/: the guest
 	// runtime tries cdrom0:\DATA\ first, then the root.
-	if err := iso.WriteDataISOSubdir(opts.Dir, opts.Out, vol, keep, ISODataDir, skipOnDisc); err != nil {
+	if err := iso.WriteDataISOSubdir(src, opts.Out, vol, keep, ISODataDir, skipOnDisc); err != nil {
 		return err
+	}
+	if logo := strings.TrimSpace(opts.BootLogo); logo != "" {
+		if !isSerialELFName(boot) {
+			return report.Fail("boot logo needs a product-code boot ELF ("+boot+")", "pass --boot-elf SLUS_000.01")
+		}
+		if err := writeBootLogo(opts.Out, logo, boot); err != nil {
+			return err
+		}
+		if opts.Stdout != nil {
+			report.Line(opts.Stdout, report.Note, "boot logo written to the disc's logo sectors")
+		}
 	}
 	if n := iso.LargestDirRecords(opts.Out); n > 1 && opts.Stdout != nil {
 		report.Line(opts.Stdout, report.Note, fmt.Sprintf("a directory on %s spans %d sectors; the PS2 boot ROM reads only the first", opts.Out, n))
@@ -539,6 +578,9 @@ const ISODataDir = "DATA"
 // cooker wrote empty (header only: the guest treats a missing one the same).
 func skipOnDisc(name string, size int64, isDir bool) bool {
 	up := strings.ToUpper(name)
+	if !isDir && up == "BOOTLOGO.RAW" {
+		return true // goes in the logo sectors, not the file system
+	}
 	if isDir {
 		return up == "GUEST" || up == "EXTRA"
 	}
@@ -557,6 +599,141 @@ func skipOnDisc(name string, size int64, isDir bool) bool {
 		}
 	}
 	return false
+}
+
+// isSerialELFName reports whether name is a product code in the form the
+// BIOS boots: four letters, underscore, three digits, dot, two digits.
+func isSerialELFName(name string) bool {
+	if len(name) != 11 || name[4] != '_' || name[8] != '.' {
+		return false
+	}
+	for i, c := range name {
+		switch {
+		case i < 4:
+			if !(c >= 'A' && c <= 'Z') && !(c >= 'a' && c <= 'z') {
+				return false
+			}
+		case i == 4 || i == 8:
+		default:
+			if c < '0' || c > '9' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// serialELFName is the product-code name the boot ELF gets on the disc:
+// ps2.default_elf when that is one, else SLUS_000.01.
+func serialELFName() string {
+	if name := strings.TrimSpace(settings.Current().PS2.DefaultELF); isSerialELFName(name) {
+		return strings.ToUpper(name)
+	}
+	return "SLUS_000.01"
+}
+
+// stageBootAsSerial makes a copy of dir (hard links where it can) in which
+// the boot ELF is called serial and SYSTEM.CNF's BOOT2 points at it, and
+// returns the copy's path. The caller removes it.
+func stageBootAsSerial(dir, boot, serial string) (string, error) {
+	stage, err := os.MkdirTemp("", "ps2iso-")
+	if err != nil {
+		return "", err
+	}
+	err = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(dir, path)
+		if err != nil || rel == "." {
+			return err
+		}
+		to := filepath.Join(stage, rel)
+		if info.IsDir() {
+			return os.MkdirAll(to, 0o755)
+		}
+		if filepath.Dir(rel) == "." {
+			if strings.EqualFold(rel, boot) {
+				to = filepath.Join(stage, serial)
+			} else if strings.EqualFold(rel, "SYSTEM.CNF") || isSerialELFName(rel) {
+				// SYSTEM.CNF is rewritten below; a product-code ELF left over
+				// from an older export must not end up on the disc
+				return nil
+			}
+		}
+		return linkOrCopy(path, to)
+	})
+	if err == nil {
+		var b []byte
+		b, err = os.ReadFile(filepath.Join(dir, "SYSTEM.CNF"))
+		if err == nil {
+			lines := strings.Split(string(b), "\n")
+			for i, line := range lines {
+				if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(line)), "BOOT2") {
+					lines[i] = "BOOT2 = cdrom0:\\" + serial + ";1"
+				}
+			}
+			err = os.WriteFile(filepath.Join(stage, "SYSTEM.CNF"), []byte(strings.Join(lines, "\n")), 0o644)
+		}
+	}
+	if err != nil {
+		os.RemoveAll(stage)
+		return "", err
+	}
+	return stage, nil
+}
+
+func linkOrCopy(from, to string) error {
+	if err := os.Link(from, to); err == nil {
+		return nil
+	}
+	raw, err := os.ReadFile(from)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(to, raw, 0o644)
+}
+
+// BootLogoSectors is how much of the disc's system area holds the logo.
+const BootLogoSectors = 12
+
+// bootLogoKey is the byte the BIOS's PS2LOGO decrypts the logo with. It
+// comes from the disc's product code (the boot ELF name): byte 4 of the
+// disc key, as PCSX2's cdvdReadKey and loser's ps2boot.txt work it out.
+func bootLogoKey(serial string) byte {
+	up := strings.ToUpper(serial)
+	numbers := 0
+	for _, c := range up[5:8] + up[9:11] {
+		numbers = numbers*10 + int(c-'0')
+	}
+	letters := int(up[3]&0x7f) | int(up[2]&0x7f)<<7 | int(up[1]&0x7f)<<14 | int(up[0]&0x7f)<<21
+	return byte(((numbers & 0x1f) << 3) | ((letters & 0x0e000000) >> 25))
+}
+
+// writeBootLogo scrambles a raw 8-bit grey logo the way a pressed disc
+// holds it (each byte rotated left 5, then XORed with the key) and writes it
+// over the start of the ISO. PS2LOGO shows it during a full boot, and does
+// not start the game when the sectors are blank.
+func writeBootLogo(isoPath, logoPath, serial string) error {
+	raw, err := os.ReadFile(logoPath)
+	if err != nil {
+		return err
+	}
+	if len(raw) == 0 || len(raw) > BootLogoSectors*2048 {
+		return report.Fail(fmt.Sprintf("boot logo %s is %d bytes", logoPath, len(raw)), "use a raw 8-bit grey image of 384x64 (NTSC) or 344x71 (PAL)")
+	}
+	key := bootLogoKey(serial)
+	enc := make([]byte, len(raw))
+	for i, b := range raw {
+		enc[i] = ((b << 5) | (b >> 3)) ^ key
+	}
+	f, err := os.OpenFile(isoPath, os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = f.WriteAt(enc, 0)
+	return err
 }
 
 // bootELFName returns the file SYSTEM.CNF's BOOT2 line points at ("" if none).

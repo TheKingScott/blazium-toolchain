@@ -6,7 +6,7 @@ cmake_minimum_required(VERSION 3.10)
 
 project(blazium_ps2_runtime LANGUAGES CXX)
 
-add_executable(runtime main.cpp gs_draw.cpp pad_io.cpp sfx_io.cpp pack_io.cpp script_vm.cpp sys_io.cpp vu1_draw.cpp gdir_vm.cpp)
+add_executable(runtime main.cpp gs_draw.cpp pad_io.cpp sfx_io.cpp pack_io.cpp script_vm.cpp sys_io.cpp vu1_draw.cpp gdir_vm.cpp mc_io.cpp)
 file(GLOB _ps2_extra RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}"
 	"extra/*.cpp" "extra/*.c")
 if(_ps2_extra)
@@ -29,7 +29,7 @@ target_include_directories(runtime PRIVATE
 	"$ENV{PS2SDK}/common/include")
 target_compile_options(runtime PRIVATE -D_EE -G0 -fno-exceptions -fno-rtti)
 target_compile_definitions(runtime PRIVATE BLAZIUM_PS2_COOK_ABI=1 BUILD_FOR_PCSX2=1)
-target_link_libraries(runtime PRIVATE draw graph packet dma pad fileXio patches m)
+target_link_libraries(runtime PRIVATE draw graph packet dma pad mc fileXio patches m)
 if(EXISTS "$ENV{PS2SDK}/ee/lib/libsdr.a")
 	target_link_libraries(runtime PRIVATE sdr)
 	target_compile_definitions(runtime PRIVATE BLAZIUM_PS2_HAS_LIBSD=1)

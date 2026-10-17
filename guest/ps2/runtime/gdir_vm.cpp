@@ -3,6 +3,7 @@
 // gdir_compile.cpp for the compiler. Not the Godot VM: no Variant/ClassDB.
 
 #include "gdir_vm.h"
+#include "mc_io.h"
 
 #include "gdir_ops.h"
 #include "gs_draw.h"
@@ -1556,6 +1557,23 @@ static Val native(unsigned inst, int id, Val *a, int n)
 			const int off = inum(a[0]);
 			return vint((off >= 0 && off < GDIR_POKE_BYTES) ? s_poke[off] : 0);
 		}
+		case GN_PS2_SAVE_SLOT: {
+			// only as much of the poke bytes as is in use: up to the last
+			// non-zero byte, in 16s
+			int n = GDIR_POKE_BYTES;
+			while (n > 0 && s_poke[n - 1] == 0) {
+				n--;
+			}
+			n = (n + 15) & ~15;
+			if (n < 16) {
+				n = 16;
+			}
+			return vbool(mc_io_save(inum(a[0]), s_poke, (unsigned)n));
+		}
+		case GN_PS2_LOAD_SLOT:
+			return vint(mc_io_load(inum(a[0]), s_poke, GDIR_POKE_BYTES));
+		case GN_PS2_MEMCARD_PRESENT:
+			return vbool(mc_io_present());
 	}
 	fail("unknown native");
 	return vnil();
