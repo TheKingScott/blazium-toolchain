@@ -169,6 +169,18 @@ static int g_fade_a;
 static int g_fade_r;
 static int g_fade_g;
 static int g_fade_b;
+/* Split screen (gs_draw_set_views): up to four views of the one scene, each
+ * with its own camera, drawn one after another into its own part of the
+ * frame (2: top and bottom halves; 3-4: quarters). The HUD goes on top once. */
+#define GS_MAX_VIEWS 4
+struct ViewCam {
+	float ex, ey, ez, tx, ty, tz, fov;
+};
+static ViewCam g_views[GS_MAX_VIEWS];
+static int g_view_n;
+/* the size of the view being drawn: NDC -1..1 spans this many pixels */
+static int g_vp_w = 640;
+static int g_vp_h = 448;
 
 static unsigned ru16(const unsigned char *p)
 {
@@ -788,7 +800,16 @@ static void parse_upload_gtex(const unsigned char *blob, unsigned sz)
 	}
 }
 
+static qword_t *bind_tex_ctx(qword_t *q, int slot, int ctx);
+
 static qword_t *bind_tex(qword_t *q, int slot)
+{
+	return bind_tex_ctx(q, slot, 0);
+}
+
+/* A texture for drawing context ctx (0: the EE's triangles, 1: VU1's, so
+ * the two can be in flight at once without trading TEX0/TEX1/CLAMP). */
+static qword_t *bind_tex_ctx(qword_t *q, int slot, int ctx)
 {
 	if (slot < 0 || slot >= g_tex_count || !g_tex[slot].ready) {
 		slot = 0;
@@ -832,9 +853,9 @@ static qword_t *bind_tex(qword_t *q, int slot)
 	wrap.maxu = (int)t->width - 1;
 	wrap.minv = 0;
 	wrap.maxv = (int)t->height - 1;
-	q = draw_texture_sampling(q, 0, &lod);
-	q = draw_texture_wrapping(q, 0, &wrap);
-	q = draw_texturebuffer(q, 0, &texbuf, &clut);
+	q = draw_texture_sampling(q, ctx, &lod);
+	q = draw_texture_wrapping(q, ctx, &wrap);
+	q = draw_texturebuffer(q, ctx, &texbuf, &clut);
 	PACK_GIFTAG(q, GIF_SET_TAG(1, 0, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
 	q++;
 	PACK_GIFTAG(q, 1, GS_REG_TEXFLUSH);
@@ -1033,8 +1054,9 @@ static void apply_gs_z(xyz_t *xyz, const vertex_f_t *clip, int n, int bias)
  * Scale NDC to half the framebuffer so -1..1 spans exactly the screen. */
 static void fit_ndc_to_frame(vertex_f_t *c, int n, const framebuffer_t *f)
 {
-	const float sx = (float)((f && f->width > 0) ? f->width : 640) * 0.5f / 2048.0f;
-	const float sy = (float)((f && f->height > 0) ? f->height : 448) * 0.5f / 2048.0f;
+	(void)f; /* the view's size: the whole frame, or one split-screen view */
+	const float sx = (float)(g_vp_w > 0 ? g_vp_w : 640) * 0.5f / 2048.0f;
+	const float sy = (float)(g_vp_h > 0 ? g_vp_h : 448) * 0.5f / 2048.0f;
 	for (int i = 0; i < n; i++) {
 		c[i].x *= sx;
 		c[i].y *= sy;
@@ -2245,6 +2267,7 @@ static int g_vu_on = 0;
 #else
 static int g_vu_on = 1; /* gs_draw_use_vu1() */
 #endif
+static int g_vu_kicked;
 static int g_vu_ready;
 static VuBatch *g_vb;
 static unsigned g_vb_n;
@@ -2403,7 +2426,7 @@ static void vu_build_batches(void)
 			g_chunk_vbn[ci]++;
 			/* GIF tag: PACKED ST, RGBAQ, XYZF2; triangles, Gouraud, textured,
 			 * fogged (F = 255 is no fog); n in the unused w word */
-			const u64 prim = 3u | (1u << 3) | (1u << 4) | (1u << 5);
+			const u64 prim = 3u | (1u << 3) | (1u << 4) | (1u << 5) | (1u << 9); /* CTXT 2 */
 			u64 *dw = (u64 *)at;
 			dw[0] = (u64)n | (1ull << 15) | (1ull << 46) | (prim << 47) | (3ull << 60);
 			dw[1] = (u64)GIF_REG_ST | ((u64)GIF_REG_RGBAQ << 4) | ((u64)GIF_REG_XYZF2 << 8) | ((u64)n << 32);
@@ -2550,8 +2573,9 @@ static int vu_take(const DrawCtx *c, unsigned ci, float cx, float cy, float cz, 
 	return 1;
 }
 
-/* The frame's VU chain, run to the end before the HUD goes out. */
-static void vu_flush(void)
+/* The frame's VU chain. It runs while the EE clips the rest; vu_wait()
+ * before the HUD. */
+static void vu_kick(void)
 {
 	if (g_vu_draw_n == 0 || !vu_init()) {
 		return;
@@ -2573,7 +2597,7 @@ static void vu_flush(void)
 				/* texture: after everything kicked so far, straight to the GIF */
 				qword_t *tag = q++;
 				qword_t *data = q;
-				q = bind_tex(q, vb->tex);
+				q = bind_tex_ctx(q, vb->tex, 1);
 				PACK_GIFTAG(q, GIF_SET_TAG(0, 1, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
 				q++;
 				const unsigned k = (unsigned)(q - data);
@@ -2587,7 +2611,18 @@ static void vu_flush(void)
 		}
 	}
 	q = vu_tag(q, DMA_ID_END, 0, 0, VIF_FLUSH, VIF_NOP);
-	vu_send(g_vu_chain);
+	FlushCache(0);
+	dma_channel_send_chain(DMA_CHANNEL_VIF1, g_vu_chain, 0, DMA_FLAG_TRANSFERTAG, 0);
+	g_vu_kicked = 1;
+}
+
+static void vu_wait(void)
+{
+	if (!g_vu_kicked) {
+		return;
+	}
+	g_vu_kicked = 0;
+	dma_channel_wait(DMA_CHANNEL_VIF1, 0);
 #ifndef BLAZIUM_PS2_VU1_EMU
 	/* The DMA is done once the VIF has the last tag; the VIF can still be
 	 * in that FLUSH, and the last XGKICK still on its way to the GS. The
@@ -2605,7 +2640,8 @@ static void vu_flush(void)
 static void vu_build_batches(void) {}
 static void vu_frame_begin(const Mat4 *, int, int) {}
 static int vu_take(const DrawCtx *, unsigned, float, float, float, float, int, int) { return 0; }
-static void vu_flush(void) {}
+static void vu_kick(void) {}
+static void vu_wait(void) {}
 #endif
 
 static unsigned g_vu_stat_frame(void)
@@ -2633,6 +2669,34 @@ void gs_draw_use_vu1(int on)
 #else
 	(void)on;
 #endif
+}
+
+/* With VU1 on, the EE first only sorts the frame's chunks: VU1's go in the
+ * chain, its own wait here until the chain is kicked, then it clips them
+ * while VU1 draws. */
+struct CpuJob {
+	unsigned ci;
+	int inst; /* -1: an ordinary chunk; else a node whose matrix is m */
+	float m[12];
+};
+#define GS_MAX_JOBS 2048
+static CpuJob g_jobs[GS_MAX_JOBS];
+static unsigned g_job_n;
+static int g_defer;
+
+static void defer_or_draw(DrawCtx *c, unsigned ci, int inst_node, const float *m)
+{
+	const MeshChunk *ch = &g_chunks[ci];
+	if (g_defer && g_job_n < GS_MAX_JOBS) {
+		CpuJob *j = &g_jobs[g_job_n++];
+		j->ci = ci;
+		j->inst = inst_node;
+		if (m) {
+			memcpy(j->m, m, sizeof(j->m));
+		}
+		return;
+	}
+	draw_range(c, ch->first, ch->first + ch->n);
 }
 
 /* 3x4 row-major a * b */
@@ -2713,12 +2777,47 @@ static void draw_instances(DrawCtx *c, float pl[6][4])
 			if (vu_take(c, ci, cx, cy, cz, r, (int)nd, 1)) {
 				continue;
 			}
-			draw_range(c, ch->first, ch->first + ch->n);
+			defer_or_draw(c, ci, (int)nd, m);
 		}
 		memcpy(g_nm[nd], keep, sizeof(keep));
 		g_nm_on[nd] = keep_on;
 	}
 	g_nodes_live = live;
+}
+
+/* Send what the EE has so far (the clear, fog, and context 2 for VU1), kick
+ * VU1's chain, then clip the EE's own chunks while it runs. */
+static void run_deferred(DrawCtx *c)
+{
+	if (!g_defer) {
+		return;
+	}
+	g_defer = 0;
+	ctx_flush(c);
+	vu_kick();
+	const int live = g_nodes_live;
+	for (unsigned k = 0; k < g_job_n; k++) {
+		const CpuJob *j = &g_jobs[k];
+		const MeshChunk *ch = &g_chunks[j->ci];
+		if (j->inst >= 0) {
+			const int nd = j->inst;
+			float keep[12];
+			const unsigned char keep_on = g_nm_on[nd];
+			memcpy(keep, g_nm[nd], sizeof(keep));
+			memcpy(g_nm[nd], j->m, sizeof(j->m));
+			g_nm_on[nd] = 1;
+			g_nodes_live = 1;
+			c->nofog = g_nfog[nd];
+			draw_range(c, ch->first, ch->first + ch->n);
+			memcpy(g_nm[nd], keep, sizeof(keep));
+			g_nm_on[nd] = keep_on;
+			g_nodes_live = live;
+		} else {
+			c->nofog = ch->node < GS_MAX_NODES ? g_nfog[ch->node] : 0;
+			draw_range(c, ch->first, ch->first + ch->n);
+		}
+	}
+	g_job_n = 0;
 }
 
 void gs_draw_nodes_begin(void)
@@ -2792,53 +2891,79 @@ void gs_draw_set_clear(int r, int g, int b)
 	g_clear_b = b;
 }
 
-void gs_draw_scene(framebuffer_t *frame, zbuffer_t *z)
-
+static qword_t *view_regs(qword_t *q, int ctx, float ox, float oy, int x0, int y0, int x1, int y1)
 {
-	if (!frame) {
-		return;
-	}
-	packet_t *packet = packet_init(GS_PACKET_QWORDS, PACKET_NORMAL);
-	if (!packet) {
-		return;
-	}
-	qword_t *q = packet->data;
-	qword_t *limit = packet->data + (GS_PACKET_QWORDS - 80);
+	PACK_GIFTAG(q, GIF_SET_TAG(2, 0, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
+	q++;
+	PACK_GIFTAG(q, GS_SET_XYOFFSET((int)(ox * 16.0f), (int)(oy * 16.0f)), GS_REG_XYOFFSET + ctx);
+	q++;
+	PACK_GIFTAG(q, GS_SET_SCISSOR(x0, x1, y0, y1), GS_REG_SCISSOR + ctx);
+	q++;
+	return q;
+}
 
-	float ox = 0.0f;
-	float oy = 0.0f;
-	gs_draw_fb_origin(frame->width, frame->height, &ox, &oy);
-	q = draw_framebuffer(q, 0, frame);
-	q = draw_zbuffer(q, 0, z);
-	q = draw_disable_tests(q, 0, z);
-	q = draw_clear(q, 0, ox, oy, (float)frame->width, (float)frame->height, g_clear_r, g_clear_g, g_clear_b);
-	if (!aabb_is_tiny()) {
-		q = draw_enable_tests(q, 0, z);
-	}
-	if (!g_ready) {
-		g_hud_packet = packet;
-		g_hud_limit = limit;
-		q = emit_hud(q, frame->width, frame->height);
-		g_hud_packet = 0;
-		q = draw_finish(q);
-		send_packet(packet, q);
-		packet_free(packet);
+void gs_draw_set_views(int n)
+{
+	g_view_n = n >= 2 && n <= GS_MAX_VIEWS ? n : 0;
+}
+
+void gs_draw_view_look(int i, float ex, float ey, float ez, float tx, float ty, float tz, float fov_deg)
+{
+	if (i < 0 || i >= GS_MAX_VIEWS) {
 		return;
 	}
+	ViewCam *v = &g_views[i];
+	v->ex = ex;
+	v->ey = ey;
+	v->ez = ez;
+	v->tx = tx;
+	v->ty = ty;
+	v->tz = tz;
+	v->fov = fov_deg > 1.0f && fov_deg < 170.0f ? fov_deg : 55.0f;
+}
 
+int gs_draw_view_count(void)
+{
+	return g_view_n;
+}
+
+/* split-screen view i of n in a w x h frame */
+static void view_rect(int i, int n, int w, int h, int *x, int *y, int *vw, int *vh)
+{
+	if (n == 2) {
+		*x = 0;
+		*y = i * (h / 2);
+		*vw = w;
+		*vh = h / 2;
+		return;
+	}
+	*x = (i & 1) * (w / 2);
+	*y = (i >> 1) * (h / 2);
+	*vw = w / 2;
+	*vh = h / 2;
+}
+
+/* One view of the scene: the camera as it stands, NDC -1..1 onto the
+ * vw x vh rectangle at (vx, vy). split: one of several views, so the view
+ * sets its own XYOFFSET and SCISSOR and keeps the camera it was given. */
+static qword_t *draw_view(packet_t *packet, qword_t *q, qword_t *limit, framebuffer_t *frame, zbuffer_t *z, float ox,
+		float oy, int vx, int vy, int vw, int vh, int split, unsigned *drawn, int *in_prim)
+{
+	const float vox = split ? 2048.0f - (float)vx - (float)(vw / 2) : ox;
+	const float voy = split ? 2048.0f - (float)vy - (float)(vh / 2) : oy;
 	Mat4 world, view, proj, tmp, mvp;
 	yaw_y(&world, g_world_yaw);
 	float ex = 0.0f, ey = 0.0f, ez = 0.0f;
 	eye_now(&ex, &ey, &ez);
-	if (!g_cam_locked && (aabb_is_tiny() || cam_cannot_see_aabb(ex, ey, ez))) {
+	if (!split && !g_cam_locked && (aabb_is_tiny() || cam_cannot_see_aabb(ex, ey, ez))) {
 		frame_aabb();
 		eye_now(&ex, &ey, &ez);
 	}
 	look_at(&view, ex, ey, ez, g_look_x, g_look_y, g_look_z);
 	if (g_ortho && !g_have_aabb) {
-		ortho_proj(&proj, (float)frame->width / (float)(frame->height ? frame->height : 1), 0.25f, 400.0f);
+		ortho_proj(&proj, (float)vw / (float)(vh ? vh : 1), 0.25f, 400.0f);
 	} else {
-		perspective(&proj, g_fov, (float)frame->width / (float)frame->height, 0.25f, 400.0f);
+		perspective(&proj, g_fov, (float)vw / (float)(vh ? vh : 1), 0.25f, 400.0f);
 	}
 	mat_mul(&view, &world, &tmp);
 	mat_mul(&proj, &tmp, &mvp);
@@ -2846,7 +2971,14 @@ void gs_draw_scene(framebuffer_t *frame, zbuffer_t *z)
 		g_mesh_dirty_vu = 0;
 		vu_build_batches();
 	}
-	vu_frame_begin(&mvp, frame->width, frame->height);
+	g_vp_w = vw;
+	g_vp_h = vh;
+	vu_frame_begin(&mvp, vw, vh);
+	if (split) {
+		/* this view's part of the frame: NDC centre on its middle, nothing
+		 * drawn past its edges (VU1 leaves the guard band to the scissor) */
+		q = view_regs(q, 0, vox, voy, vx, vy, vx + vw - 1, vy + vh - 1);
+	}
 
 	DrawCtx c;
 	memset(&c, 0, sizeof(c));
@@ -2869,6 +3001,33 @@ void gs_draw_scene(framebuffer_t *frame, zbuffer_t *z)
 		PACK_GIFTAG(q, GS_SET_FOGCOL(g_fog_r, g_fog_g, g_fog_b), GS_REG_FOGCOL);
 		q++;
 	}
+#ifdef GS_VU1
+	g_job_n = 0;
+	/* the GS has one CLUT buffer for both contexts: palettised textures
+	 * keep VU1 and the EE in turn */
+	int any_clut = 0;
+	for (int t = 0; t < g_tex_count; t++) {
+		if (g_tex[t].ready && g_tex[t].clut_count > 0) {
+			any_clut = 1;
+		}
+	}
+	g_defer = g_vu_on && g_vu_ready && g_vb && !c.tiny && !any_clut;
+	if (g_vu_on && g_vu_ready && g_vb && !c.tiny) {
+		/* context 2 mirrors context 1 for VU1's triangles */
+		q = draw_setup_environment(q, 1, frame, z);
+		q = draw_primitive_xyoffset(q, 1, vox, voy);
+		q = draw_enable_tests(q, 1, z);
+		if (split) {
+			q = view_regs(q, 1, vox, voy, vx, vy, vx + vw - 1, vy + vh - 1);
+		}
+		if (g_fog_on) {
+			PACK_GIFTAG(q, GIF_SET_TAG(1, 0, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
+			q++;
+			PACK_GIFTAG(q, GS_SET_FOGCOL(g_fog_r, g_fog_g, g_fog_b), GS_REG_FOGCOL);
+			q++;
+		}
+	}
+#endif
 	c.q = q;
 	c.color.r = 0x80;
 	c.color.g = 0x80;
@@ -2949,7 +3108,7 @@ void gs_draw_scene(framebuffer_t *frame, zbuffer_t *z)
 					if (vu_take(&c, ci, cx, cy, cz, ch->r, (int)n, 0)) {
 						continue;
 					}
-					draw_range(&c, ch->first, ch->first + ch->n);
+					defer_or_draw(&c, ci, -1, 0);
 					continue;
 				}
 			}
@@ -2957,6 +3116,7 @@ void gs_draw_scene(framebuffer_t *frame, zbuffer_t *z)
 			draw_range(&c, ch->first, ch->first + ch->n);
 		}
 		draw_instances(&c, pl);
+		run_deferred(&c);
 	}
 	for (int ly = 0; ly < g_ly_n; ly++) {
 		const unsigned char *blob = g_ly_mesh[ly];
@@ -2987,24 +3147,128 @@ void gs_draw_scene(framebuffer_t *frame, zbuffer_t *z)
 			draw_tri(&c, &v0, &v1, &v2);
 		}
 	}
-	g_stat_tris = 0;
-	g_stat_chunks = 0;
 #ifdef GS_VU1
 	if (g_vu_draw_n > 0) {
-		/* the EE's triangles first, then VU1's, then the HUD on top */
+		/* the EE's triangles and VU1's both in, then the HUD (or the next
+		 * view, which reuses VU1's blocks) */
+		run_deferred(&c);
 		ctx_flush(&c);
-		vu_flush();
+		if (!g_vu_kicked) {
+			vu_kick();
+		}
+		vu_wait();
+	}
+#endif
+	*drawn += c.drawn + g_vu_draw_n_frame();
+	*in_prim = c.in_prim;
+	return c.q;
+}
+void gs_draw_scene(framebuffer_t *frame, zbuffer_t *z)
+
+{
+	if (!frame) {
+		return;
+	}
+	packet_t *packet = packet_init(GS_PACKET_QWORDS, PACKET_NORMAL);
+	if (!packet) {
+		return;
+	}
+	qword_t *q = packet->data;
+	qword_t *limit = packet->data + (GS_PACKET_QWORDS - 80);
+
+	float ox = 0.0f;
+	float oy = 0.0f;
+	gs_draw_fb_origin(frame->width, frame->height, &ox, &oy);
+	q = draw_framebuffer(q, 0, frame);
+	q = draw_zbuffer(q, 0, z);
+	q = draw_disable_tests(q, 0, z);
+	q = draw_clear(q, 0, ox, oy, (float)frame->width, (float)frame->height, g_clear_r, g_clear_g, g_clear_b);
+	if (!aabb_is_tiny()) {
+		q = draw_enable_tests(q, 0, z);
+	}
+	if (!g_ready) {
+		g_hud_packet = packet;
+		g_hud_limit = limit;
+		q = emit_hud(q, frame->width, frame->height);
+		g_hud_packet = 0;
+		q = draw_finish(q);
+		send_packet(packet, q);
+		packet_free(packet);
+		return;
+	}
+
+	const int nv = g_view_n >= 2 ? g_view_n : 1;
+	unsigned drawn = 0;
+	int in_prim = 0;
+	if (nv == 1) {
+		q = draw_view(packet, q, limit, frame, z, ox, oy, 0, 0, frame->width, frame->height, 0, &drawn, &in_prim);
+	} else {
+		/* each view with its own camera; the scripted one comes back after */
+		const float kx = g_cam_x, ky = g_cam_y, kz = g_cam_z;
+		const float lx = g_look_x, lyy = g_look_y, lz = g_look_z, kf = g_fov;
+		const float ax = g_attach_x, ay = g_attach_y, az = g_attach_z, eh = g_eye_h;
+		g_attach_x = g_attach_y = g_attach_z = 0.0f;
+		g_eye_h = 0.0f;
+		for (int v = 0; v < nv; v++) {
+			int vx = 0, vy = 0, vw = 0, vh = 0;
+			view_rect(v, nv, frame->width, frame->height, &vx, &vy, &vw, &vh);
+			const ViewCam *vc = &g_views[v];
+			g_cam_x = vc->ex;
+			g_cam_y = vc->ey;
+			g_cam_z = vc->ez;
+			g_look_x = vc->tx;
+			g_look_y = vc->ty;
+			g_look_z = vc->tz;
+			g_fov = vc->fov;
+			if (v > 0) {
+				q = end_prim(q, &in_prim);
+			}
+			q = draw_view(packet, q, limit, frame, z, ox, oy, vx, vy, vw, vh, 1, &drawn, &in_prim);
+		}
+		g_cam_x = kx;
+		g_cam_y = ky;
+		g_cam_z = kz;
+		g_look_x = lx;
+		g_look_y = lyy;
+		g_look_z = lz;
+		g_fov = kf;
+		g_attach_x = ax;
+		g_attach_y = ay;
+		g_attach_z = az;
+		g_eye_h = eh;
+		g_vp_w = frame->width;
+		g_vp_h = frame->height;
+		q = end_prim(q, &in_prim);
+		/* the HUD in whole-frame coordinates again */
+		q = view_regs(q, 0, ox, oy, 0, 0, frame->width - 1, frame->height - 1);
+	}
+#ifdef GS_FRAMELOG
+	{
+		/* one line a frame: where the camera is and what the frame cost */
+		static unsigned fl_frame;
+		unsigned vu_verts = 0;
+#ifdef GS_VU1
+		for (unsigned d = 0; d < g_vu_draw_n; d++) {
+			const unsigned ci = g_vu_draw_chunk[d];
+			for (unsigned b = g_chunk_vb0[ci]; b < g_chunk_vb0[ci] + g_chunk_vbn[ci]; b++) {
+				vu_verts += g_vb[b].n;
+			}
+		}
+#endif
+		extern unsigned gdir_vm_last_ops(void);
+		printf("FRAME %u cam %.1f %.1f %.1f chunks %u ee_tested %u ee_drawn %u vu_batches %u vu_tris %u ops %u\n", fl_frame++,
+				g_cam_x, g_cam_y, g_cam_z, g_stat_chunks, g_stat_tris, drawn, g_vu_stat_frame(), vu_verts / 3,
+				gdir_vm_last_ops());
 	}
 #endif
 #ifdef GS_STATS
 	if (++g_stat_frames % 300 == 0) {
 		printf("GS stats: %u chunks, %u of %u tris tested, %u drawn by the EE, %u VU1 batches (this frame)\n", g_stat_chunks,
-				g_stat_tris, g_index_count / 3, c.drawn, g_vu_stat_frame());
+				g_stat_tris, g_index_count / 3, drawn, g_vu_stat_frame());
 	}
 #endif
-	q = c.q;
-	int in_prim = c.in_prim;
-	const unsigned drawn = c.drawn + g_vu_draw_n_frame();
+	g_stat_tris = 0;
+	g_stat_chunks = 0;
 	q = end_prim(q, &in_prim);
 	q = draw_disable_tests(q, 0, z);
 	if (drawn == 0) {

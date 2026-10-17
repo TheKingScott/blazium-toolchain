@@ -1,8 +1,8 @@
 // MIT. Memory card saves (see mc_io.h).
 //
-// MCMAN and MCSERV come from the BIOS (rom0:), matching the rom0: SIO2MAN and
-// PADMAN pad_io loads, and are only loaded the first time a script asks for
-// the card. Files are written with libmc rather than fopen("mc0:..."): the
+// XMCMAN and XMCSERV come from the BIOS (rom0:), matching the rom0: XSIO2MAN
+// and XPADMAN pad_io loads; pad_io_init loads them at boot (mc_io_boot), and
+// a guest without pads loads them the first time a script asks for the card. Files are written with libmc rather than fopen("mc0:..."): the
 // newlib open flags are not the IOP's, and libmc reports why a call failed.
 
 #include "mc_io.h"
@@ -32,26 +32,31 @@ static char s_title[33] = "Blazium game";
 static unsigned char *s_icon; // the browser icon (.ico), or 0
 static unsigned s_icon_n;
 
-static int mc_ready(void)
+int mc_io_boot(void)
 {
 	if (s_init) {
 		return s_init > 0;
 	}
 	s_init = -1;
-	if (SifLoadModule("rom0:MCMAN", 0, NULL) < 0) {
-		printf("MC: rom0:MCMAN did not load\n");
+	if (SifLoadModule("rom0:XMCMAN", 0, NULL) < 0) {
+		printf("MC: rom0:XMCMAN did not load\n");
 		return 0;
 	}
-	if (SifLoadModule("rom0:MCSERV", 0, NULL) < 0) {
-		printf("MC: rom0:MCSERV did not load\n");
+	if (SifLoadModule("rom0:XMCSERV", 0, NULL) < 0) {
+		printf("MC: rom0:XMCSERV did not load\n");
 		return 0;
 	}
-	if (mcInit(MC_TYPE_MC) < 0) {
+	if (mcInit(MC_TYPE_XMC) < 0) {
 		printf("MC: mcInit failed\n");
 		return 0;
 	}
 	s_init = 1;
 	return 1;
+}
+
+static int mc_ready(void)
+{
+	return mc_io_boot();
 }
 
 static unsigned rd32(const unsigned char *p)

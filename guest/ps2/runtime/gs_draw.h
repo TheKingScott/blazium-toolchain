@@ -68,6 +68,11 @@ void gs_draw_set_clear(int r, int g, int b);
 // Distance fog (GS FOG): colour 0..255, linear from near to far view depth.
 // on = 0 (or far <= near) turns it off. Reset by gs_draw_nodes_reset.
 void gs_draw_set_fog(int on, int r, int g, int b, float near_d, float far_d);
+/* Split screen: n views (2: top and bottom halves; 3-4: quarters), each
+ * drawn from the camera gs_draw_view_look gave it; 0 or 1 back to one view. */
+void gs_draw_set_views(int n);
+void gs_draw_view_look(int i, float ex, float ey, float ez, float tx, float ty, float tz, float fov_deg);
+int gs_draw_view_count(void);
 // VU1 for unclipped chunks (on by default where the guest has VU1).
 void gs_draw_use_vu1(int on);
 // HUD row style: kind 1 label (text only), 2 rect, 3 button; scale is the

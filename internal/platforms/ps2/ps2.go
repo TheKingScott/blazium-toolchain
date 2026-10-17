@@ -278,9 +278,11 @@ func (t *Tool) ISO(ctx context.Context, opts platforms.ISOOptions) error {
 	keep := func(name string) bool {
 		return strings.EqualFold(name, "SYSTEM.CNF") || (boot != "" && strings.EqualFold(name, boot))
 	}
-	// Everything but SYSTEM.CNF and the boot ELF goes under DATA/: the guest
-	// runtime tries cdrom0:\DATA\ first, then the root.
-	if err := iso.WriteDataISOSubdir(src, opts.Out, vol, keep, ISODataDir, skipOnDisc); err != nil {
+	// Everything but SYSTEM.CNF and the boot ELF goes under DATA/, and each
+	// pack's files (MESH04.BIN, NODE04.BIN, ...) under DATA/P04/: CDVDMAN
+	// only searches a directory's first sector. The guest runtime tries
+	// cdrom0:\DATA\Pnn\, then cdrom0:\DATA\, then the root.
+	if err := iso.WriteDataISOGrouped(src, opts.Out, vol, keep, ISODataDir, skipOnDisc, packGroup); err != nil {
 		return err
 	}
 	if logo := strings.TrimSpace(opts.BootLogo); logo != "" {
@@ -567,6 +569,24 @@ func hostFsDir(exe, iso, override string) string {
 		return ""
 	}
 	return filepath.Dir(exe)
+}
+
+// packGroup puts a numbered file (MESH04.BIN, MUSIC00.BIN) in its pack's
+// folder, P04 / P00; anything else stays in DATA. Keep in sync with
+// guest/ps2/runtime/iso_path.h.
+func packGroup(name string) string {
+	stem := strings.ToUpper(name)
+	if i := strings.IndexByte(stem, '.'); i >= 0 {
+		stem = stem[:i]
+	}
+	if len(stem) < 3 {
+		return ""
+	}
+	d := stem[len(stem)-2:]
+	if d[0] < '0' || d[0] > '9' || d[1] < '0' || d[1] > '9' {
+		return ""
+	}
+	return "P" + d
 }
 
 // ISODataDir is the ISO folder that holds cooked data (MESH/NODE/... and

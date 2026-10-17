@@ -13,6 +13,10 @@
 extern "C" {
 #endif
 
+// Load the card modules (XMCMAN, XMCSERV) and start libmc. pad_io_init calls
+// it at boot, after the pad modules. 1 when the card can be used.
+int mc_io_boot(void);
+
 // 1 when a formatted PS2 memory card is in slot 1.
 int mc_io_present(void);
 
