@@ -13,9 +13,15 @@
 
 #define PS2_CATALOG 99
 #define PS2_LAYERS 16
+#ifndef PS2_EE_LIMIT
 #define PS2_EE_LIMIT (24u * 1024u * 1024u)
+#endif
+#ifndef PS2_GS_LIMIT
 #define PS2_GS_LIMIT (4u * 1024u * 1024u)
+#endif
+#ifndef PS2_EXTRA_EE_CAP
 #define PS2_EXTRA_EE_CAP (2u * 1024u * 1024u)
+#endif
 #define PS2_POKE_N (24u * 1024u)
 
 static unsigned char s_poke[PS2_POKE_N];
@@ -420,13 +426,17 @@ int pack_io_swap(int pack)
 			gs -= pack_cost_gs(s_current, s_px_gtex_sz);
 		}
 		if (ee + pack_io_cost_ee(pack) > PS2_EE_LIMIT || gs + pack_io_cost_gs(pack) > PS2_GS_LIMIT) {
+			printf("pack_io: pack %d does not fit (RAM %u + %u of %u, VRAM %u + %u of %u)\n", pack, ee, pack_io_cost_ee(pack),
+					(unsigned)PS2_EE_LIMIT, gs, pack_io_cost_gs(pack), (unsigned)PS2_GS_LIMIT);
 			return 0;
 		}
 	}
 	if (!load_pack_n(pack)) {
+		printf("pack_io: pack %d did not load\n", pack);
 		return 0;
 	}
 	if (!gs_draw_init(s_px_mesh, s_px_mesh_sz, s_px_gtex, s_px_gtex_sz, s_px_node, s_px_node_sz)) {
+		printf("pack_io: pack %d did not draw\n", pack);
 		return 0;
 	}
 	vu1_draw_init(s_px_mesh, s_px_mesh_sz);

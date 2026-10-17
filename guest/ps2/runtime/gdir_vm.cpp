@@ -17,22 +17,55 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* sizes: a guest with less RAM (the PS1) sets smaller ones */
+#ifndef GDIR_MAX_NODES
 #define GDIR_MAX_NODES 512
+#endif
+#ifndef GDIR_MAX_CLASSES
 #define GDIR_MAX_CLASSES 64
+#endif
+#ifndef GDIR_MAX_FUNCS
 #define GDIR_MAX_FUNCS 512
+#endif
+#ifndef GDIR_MAX_CONSTS
 #define GDIR_MAX_CONSTS 16384
+#endif
+#ifndef GDIR_MAX_KARR
 #define GDIR_MAX_KARR 1024
+#endif
+#ifndef GDIR_POKE_BYTES
 #define GDIR_POKE_BYTES (24 * 1024)
+#endif
+#ifndef GDIR_MAX_PACKS
 #define GDIR_MAX_PACKS 100
+#endif
+#ifndef GDIR_MAX_INST
 #define GDIR_MAX_INST 128
+#endif
+#ifndef GDIR_MAX_MEMBERS
 #define GDIR_MAX_MEMBERS 2048
+#endif
+#ifndef GDIR_STACK
 #define GDIR_STACK 1024
+#endif
+#ifndef GDIR_DEPTH
 #define GDIR_DEPTH 48
+#endif
+#ifndef GDIR_STR
 #define GDIR_STR 64
+#endif
+#ifndef GDIR_RING
 #define GDIR_RING 256
+#endif
+#ifndef GDIR_ARRAYS
 #define GDIR_ARRAYS 96
+#endif
+#ifndef GDIR_ARR_LEN
 #define GDIR_ARR_LEN 64
+#endif
+#ifndef GDIR_OPS_PER_FRAME
 #define GDIR_OPS_PER_FRAME 400000
+#endif
 
 enum {
 	T_NIL = 0,
@@ -136,6 +169,23 @@ static float s_world[GDIR_MAX_NODES][12];
 static float s_w0inv[GDIR_MAX_NODES][12];
 static unsigned char s_vis[GDIR_MAX_NODES];
 static unsigned char s_dirty;
+/* which nodes' own transforms changed since the last recompute_nodes (their
+ * subtrees are redone, the rest kept); s_all_dirty redoes everything */
+static unsigned char s_ndirty[GDIR_MAX_NODES];
+static unsigned char s_wchanged[GDIR_MAX_NODES];
+static unsigned char s_lstale[GDIR_MAX_NODES]; /* s_local needs mat_from_trs */
+static float s_local[GDIR_MAX_NODES][12];
+static unsigned char s_all_dirty = 1;
+
+static void mark_node(int n)
+{
+	s_dirty = 1;
+	if (n >= 0 && n < GDIR_MAX_NODES) {
+		s_ndirty[n] = 1;
+	} else {
+		s_all_dirty = 1;
+	}
+}
 /* PS2.set_views: split-screen cameras (nodes of this pack), s_view_n >= 2 */
 static short s_view_cam[4];
 static int s_view_n;
@@ -601,16 +651,88 @@ static int node_ok(int n)
 	return n >= 0 && (unsigned)n < s_node_n;
 }
 
+/* the cameras and their ancestors: their worlds are never left stale */
+static unsigned char s_keep[GDIR_MAX_NODES];
+
+static void mark_keep(int n)
+{
+	while (node_ok(n)) {
+		s_keep[n] = 1;
+		const int p = s_nodes[n].parent;
+		if (p < 0 || p >= n) {
+			break;
+		}
+		n = p;
+	}
+}
+
+/* n or an ancestor has a change still waiting (it was hidden) */
+static int chain_pending(int n)
+{
+	while (node_ok(n)) {
+		if (s_ndirty[n]) {
+			return 1;
+		}
+		const int p = s_nodes[n].parent;
+		if (p < 0 || p >= n) {
+			break;
+		}
+		n = p;
+	}
+	return 0;
+}
+
+static void recompute_nodes(void);
+
+/* n's world up to date for a script that reads it, hidden or not */
+static void world_fresh(int n)
+{
+	if (s_dirty) {
+		recompute_nodes();
+	}
+	if (node_ok(n) && !s_vis[n] && chain_pending(n)) {
+		s_all_dirty = 1;
+		recompute_nodes();
+	}
+}
+
 static void recompute_nodes(void)
 {
+	/* Parents come before children, so one pass carries a change down: a
+	 * node's world is redone when it or an ancestor moved. */
+	const int all = s_all_dirty;
+	memset(s_keep, 0, s_node_n);
+	if (s_cur >= 0 && s_cur < GDIR_MAX_PACKS) {
+		mark_keep(s_pack[s_cur].camera);
+	}
+	for (int v = 0; v < s_view_n; v++) {
+		mark_keep(s_view_cam[v]);
+	}
 	for (unsigned n = 0; n < s_node_n; n++) {
 		PackNode *pn = &s_nodes[n];
 		const int p = pn->parent;
-		const int pvis = (p >= 0 && (unsigned)p < n) ? s_vis[p] : 1;
+		const int has_p = p >= 0 && (unsigned)p < n;
+		const int pvis = has_p ? s_vis[p] : 1;
 		s_vis[n] = (unsigned char)(((pn->flags & 1) && pvis) ? 1 : 0);
+		int redo = all || s_ndirty[n] || (has_p && s_wchanged[p]);
+		if (all || s_ndirty[n]) {
+			s_lstale[n] = 1;
+		}
+		/* a hidden node's world waits until it is shown (its children are
+		 * hidden too, and are redone with it) */
+		if (redo && !s_vis[n] && !all && !s_keep[n]) {
+			s_ndirty[n] = 1;
+			redo = 0;
+		} else {
+			s_ndirty[n] = 0;
+		}
+		s_wchanged[n] = (unsigned char)redo;
+		if (!redo) {
+			continue;
+		}
 		if (!(pn->flags & 2)) {
 			/* Non-3D nodes pass the parent's transform through. */
-			if (p >= 0 && (unsigned)p < n) {
+			if (has_p) {
 				memcpy(s_world[n], s_world[p], sizeof(s_world[n]));
 			} else {
 				const float id[12] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0 };
@@ -618,19 +740,26 @@ static void recompute_nodes(void)
 			}
 			continue;
 		}
-		float local[12];
-		mat_from_trs(pn->lpos, pn->lrot, pn->lscale, local);
-		if (p >= 0 && (unsigned)p < n) {
-			mat_mul34(s_world[p], local, s_world[n]);
+		/* the local matrix only when the node's own TRS changed */
+		if (s_lstale[n]) {
+			mat_from_trs(pn->lpos, pn->lrot, pn->lscale, s_local[n]);
+			s_lstale[n] = 0;
+		}
+		if (has_p) {
+			mat_mul34(s_world[p], s_local[n], s_world[n]);
 		} else {
-			memcpy(s_world[n], local, sizeof(local));
+			memcpy(s_world[n], s_local[n], sizeof(s_local[n]));
 		}
 	}
+	s_all_dirty = 0;
 	for (unsigned n = 0; n < s_node_n; n++) {
 		const PackNode *pn = &s_nodes[n];
 		gs_draw_node_hidden((int)n, !s_vis[n]);
 		if (pn->hud >= 0) {
 			sys_io_hud_set_hidden(pn->hud, !s_vis[n]);
+		}
+		if (!s_wchanged[n]) {
+			continue; /* the renderer keeps the matrix it has */
 		}
 		if (!(pn->flags & 2)) {
 			gs_draw_node_matrix((int)n, 0);
@@ -716,9 +845,7 @@ static Val get_prop(const Val &o, int prop)
 		case GP_TEXT:
 			return vstr(hud >= 0 ? sys_io_hud_text(hud) : "");
 		case GP_GLOBAL_POSITION:
-			if (s_dirty) {
-				recompute_nodes();
-			}
+			world_fresh(o.i);
 			if (pn->flags & 4) {
 				return vvec(T_VEC2, pn->w0[3] - pn->w0[0] + pn->lpos[0], pn->w0[7] - pn->w0[1] + pn->lpos[1], 0.0f);
 			}
@@ -764,22 +891,22 @@ static Val set_prop(Val o, int prop, const Val &v)
 				control_pos_changed(o.i);
 			} else {
 				pn->lpos[2] = v.t == T_VEC3 ? v.v[2] : 0.0f;
-				s_dirty = 1;
+				mark_node(o.i);
 			}
 			break;
 		case GP_ROTATION:
 			memcpy(pn->lrot, v.v, sizeof(pn->lrot));
-			s_dirty = 1;
+			mark_node(o.i);
 			break;
 		case GP_ROTATION_DEGREES:
 			for (int k = 0; k < 3; k++) {
 				pn->lrot[k] = v.v[k] * 0.01745329f;
 			}
-			s_dirty = 1;
+			mark_node(o.i);
 			break;
 		case GP_SCALE:
 			memcpy(pn->lscale, v.v, sizeof(pn->lscale));
-			s_dirty = 1;
+			mark_node(o.i);
 			break;
 		case GP_VISIBLE:
 			if (truthy(v)) {
@@ -1015,7 +1142,7 @@ static void rotate_node(int n, int axis, float a)
 	PackNode *pn = &s_nodes[n];
 	if (axis == 1 && pn->lrot[0] == 0.0f && pn->lrot[2] == 0.0f) {
 		pn->lrot[1] += a;
-		s_dirty = 1;
+		mark_node(n);
 		return;
 	}
 	/* R' = R_axis(a) * R (parent space), back to YXZ euler. */
@@ -1028,7 +1155,7 @@ static void rotate_node(int n, int axis, float a)
 	mat_from_trs(zero, e, one, r);
 	mat_mul34(r, m, o);
 	euler_yxz(o, pn->lrot);
-	s_dirty = 1;
+	mark_node(n);
 }
 
 static Val native(unsigned inst, int id, Val *a, int n)
@@ -1457,7 +1584,7 @@ static Val native(unsigned inst, int id, Val *a, int n)
 				for (int r = 0; r < 3; r++) {
 					pn->lpos[r] += m[r * 4 + 0] * a[1].v[0] + m[r * 4 + 1] * a[1].v[1] + m[r * 4 + 2] * a[1].v[2];
 				}
-				s_dirty = 1;
+				mark_node(a[0].i);
 			}
 			return vnil();
 		case GN_NODE_HIDE:
@@ -1489,16 +1616,14 @@ static Val native(unsigned inst, int id, Val *a, int n)
 		case GN_NODE_LOOK_AT:
 			if (a[0].t == T_NODE && node_ok(a[0].i)) {
 				PackNode *pn = &s_nodes[a[0].i];
-				if (s_dirty) {
-					recompute_nodes();
-				}
+				world_fresh(a[0].i);
 				const float *w = s_world[a[0].i];
 				const float dx = a[1].v[0] - w[3], dy = a[1].v[1] - w[7], dz = a[1].v[2] - w[11];
 				const float h = sqrtf(dx * dx + dz * dz);
 				pn->lrot[1] = atan2f(-dx, -dz);
 				pn->lrot[0] = atan2f(dy, h);
 				pn->lrot[2] = 0.0f;
-				s_dirty = 1;
+				mark_node(a[0].i);
 			}
 			return vnil();
 		case GN_NODE_CHILD_COUNT: {
@@ -1986,6 +2111,7 @@ static void enter_pack(int pack)
 		c += 7;
 	}
 	s_dirty = 1;
+	s_all_dirty = 1;
 	recompute_nodes();
 	/* member initialisers in tree order, then _ready children first */
 	for (unsigned i = 0; i < s_inst_n; i++) {
@@ -2010,6 +2136,14 @@ static void enter_pack(int pack)
 	recompute_nodes();
 }
 
+/* a program past one of this build's tables (the PS1's are smaller) */
+static void init_limit(const char *what, unsigned n, int max)
+{
+	char m[96];
+	snprintf(m, sizeof(m), "GDIR program has %u %s; this runtime holds %d", n, what, max);
+	fail(m);
+}
+
 int gdir_vm_init(const unsigned char *b, unsigned sz)
 {
 	s_mem_gc = s_mem;
@@ -2018,10 +2152,12 @@ int gdir_vm_init(const unsigned char *b, unsigned sz)
 	s_active = 0;
 	s_err[0] = 0;
 	if (!b || sz < 12 || b[0] != 'G' || b[1] != 'D' || b[2] != 'I' || b[3] != 'R' || ru16(b + 4) != GDIR_VERSION) {
+		fail("not a GDIR program (header or version)");
 		return 0;
 	}
 	const unsigned total = ru32(b + 8);
 	if (total > sz) {
+		fail("GDIR program is cut short");
 		return 0;
 	}
 	const unsigned char *p = b + 12;
@@ -2030,6 +2166,7 @@ int gdir_vm_init(const unsigned char *b, unsigned sz)
 	p += 4;
 	s_karr_n = 0;
 	if (s_k_n > GDIR_MAX_CONSTS) {
+		init_limit("constants", s_k_n, GDIR_MAX_CONSTS);
 		return 0;
 	}
 	for (unsigned i = 0; i < s_k_n && p < end; i++) {
@@ -2065,6 +2202,7 @@ int gdir_vm_init(const unsigned char *b, unsigned sz)
 			case GDIR_K_ARRAY: {
 				const unsigned n = ru16(p);
 				if (s_karr_n >= GDIR_MAX_KARR) {
+					init_limit("constant arrays", s_karr_n + 1, GDIR_MAX_KARR);
 					return 0;
 				}
 				s_karr[s_karr_n] = p;
@@ -2073,6 +2211,7 @@ int gdir_vm_init(const unsigned char *b, unsigned sz)
 				p += 2 + n * 2;
 			} break;
 			default:
+				fail("GDIR program has an unknown constant type");
 				return 0;
 		}
 		s_k[i] = v;
@@ -2081,6 +2220,7 @@ int gdir_vm_init(const unsigned char *b, unsigned sz)
 	p += 2;
 	s_fn_n = 0;
 	if (s_cls_n > GDIR_MAX_CLASSES) {
+		init_limit("classes", s_cls_n, GDIR_MAX_CLASSES);
 		return 0;
 	}
 	for (unsigned c = 0; c < s_cls_n; c++) {
@@ -2096,6 +2236,7 @@ int gdir_vm_init(const unsigned char *b, unsigned sz)
 		k->first_func = (unsigned short)s_fn_n;
 		for (unsigned f = 0; f < k->funcs; f++) {
 			if (s_fn_n >= GDIR_MAX_FUNCS) {
+				init_limit("functions", s_fn_n + 1, GDIR_MAX_FUNCS);
 				return 0;
 			}
 			s_fn[s_fn_n].argc = p[0];
