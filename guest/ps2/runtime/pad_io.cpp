@@ -2,6 +2,7 @@
 // (XSIO2MAN, XPADMAN, XMTAPMAN) for up to four pads with a multitap.
 
 #include "pad_io.h"
+#include "mc_io.h"
 
 #include <kernel.h>
 #include <loadfile.h>
@@ -190,13 +191,18 @@ int pad_io_init(void)
 #ifdef BLAZIUM_PS2_HAS_IRX_FILEXIO
 	load_rom_or_buf("host:fileXio.irx", irx_fileXio, size_irx_fileXio);
 #endif
-	/* The X modules: XPADMAN talks to a multitap through XMTAPMAN (libpadx
-	 * and libmtap), and mc_io loads XMCMAN / XMCSERV to match. */
+	/* The X modules, all at boot and in the order the BIOS's own browser
+	 * uses: the SIO2 driver, the multitap, the pads, then the memory card
+	 * (mc_io). Loading the card modules later, while XPADMAN and XMTAPMAN
+	 * are polling the SIO2 bus, brought PCSX2 down. */
 	SifLoadModule("rom0:XSIO2MAN", 0, NULL);
+	const int mtap_ok = SifLoadModule("rom0:XMTAPMAN", 0, NULL) >= 0;
 	if (SifLoadModule("rom0:XPADMAN", 0, NULL) < 0) {
+		mc_io_boot();
 		return 0;
 	}
-	if (SifLoadModule("rom0:XMTAPMAN", 0, NULL) >= 0) {
+	mc_io_boot();
+	if (mtap_ok) {
 		mtapInit();
 		s_mtap = 1;
 		mtapPortOpen(0);
