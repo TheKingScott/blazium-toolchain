@@ -24,6 +24,12 @@ func installGuestRuntime(prefix string) error {
 	return guest.Install(GuestDir(prefix))
 }
 
+// GDIRGuestDir is <prefix>/ps1/guest/gdir — the bundled GDIR runtime
+// (build --sample gdir), for scenes cooked by the PS2 exporter.
+func GDIRGuestDir(prefix string) string {
+	return filepath.Join(cache.PlatformDir(prefix, ID), "guest", "gdir")
+}
+
 const psxMagic = "PS-X EXE"
 
 type envRunner interface {
@@ -54,13 +60,21 @@ func (t *Tool) Build(ctx context.Context, opts platforms.BuildOptions) error {
 		}
 		src = ""
 	}
-	if src == "" && sample != "" {
+	if src == "" && sample == "gdir" {
+		src = GDIRGuestDir(opts.Prefix)
+		if err := os.RemoveAll(src); err != nil {
+			return err
+		}
+		if err := guest.InstallGDIR(src); err != nil {
+			return err
+		}
+	} else if src == "" && sample != "" {
 		src, err = resolveSample(opts.Prefix, sample)
 		if err != nil {
 			return err
 		}
 	}
-	if overlay != "" && sample == "" {
+	if overlay != "" && (sample == "" || sample == "gdir") {
 		merge := filepath.Join(cache.PlatformDir(opts.Prefix, ID), "work", "guest-src")
 		if err := os.RemoveAll(merge); err != nil {
 			return err
@@ -309,7 +323,7 @@ func resolveSample(prefix, sample string) (string, error) {
 	case "gte":
 		marker = filepath.Join("share", "psn00bsdk", "examples", "graphics", "gte", "CMakeLists.txt")
 	default:
-		return "", report.Usage("--sample must be template or gte")
+		return "", report.Usage("--sample must be template, gte or gdir")
 	}
 	if hit := findRelFile(plat, marker); hit != "" {
 		return filepath.Dir(hit), nil

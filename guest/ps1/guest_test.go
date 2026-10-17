@@ -104,3 +104,39 @@ func TestLockstepWithEditorRuntime(t *testing.T) {
 		}
 	}
 }
+
+func TestInstallGDIR(t *testing.T) {
+	dir := t.TempDir()
+	if err := InstallGDIR(dir); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"CMakeLists.txt", "main.cpp", "gpu_draw.cpp", "ps1_libc.c", "shim/stdio.h"} {
+		if _, err := os.Stat(filepath.Join(dir, filepath.FromSlash(name))); err != nil {
+			t.Fatalf("missing %s: %v", name, err)
+		}
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "CMakeLists.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(raw, []byte("psn00bsdk_add_executable(runtime")) {
+		t.Fatal("GDIR CMakeLists does not build the runtime target")
+	}
+}
+
+// The GDIR guest runs the PS2 guest's VM: the shared files must not drift.
+func TestGDIRSharedMatchesPS2(t *testing.T) {
+	for _, name := range GDIRShared {
+		p1, err := gdirFiles.ReadFile("gdir/runtime/" + name)
+		if err != nil {
+			t.Fatalf("embed missing %s: %v", name, err)
+		}
+		p2, err := os.ReadFile(filepath.Join("..", "ps2", "runtime", name))
+		if err != nil {
+			t.Fatalf("ps2 %s: %v", name, err)
+		}
+		if !bytes.Equal(p1, p2) {
+			t.Errorf("guest/ps1/gdir/runtime/%s differs from guest/ps2/runtime/%s (copy it across)", name, name)
+		}
+	}
+}

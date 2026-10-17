@@ -263,7 +263,7 @@ func runBuild(ctx context.Context, p platforms.Platform, args []string, base pla
 	fs.SetOutput(io.Discard)
 	src := fs.String("src", "", "guest CMake source dir (full replace of the bundled stub)")
 	out := fs.String("out", "", "output PS-X EXE path")
-	sample := fs.String("sample", "", "official SDK sample: template or gte (when --src is empty)")
+	sample := fs.String("sample", "", "official SDK sample (template, gte) or the bundled guest (ps1: gdir), when --src is empty")
 	overlay := fs.String("overlay", "", "extra or replacement *.cpp on top of the bundled stub (or --src); also BLAZIUM_PS1_OVERLAY")
 	exportSrc := fs.String("export-src", "", "write the resolved guest C++ tree here")
 	tim := fs.String("tim", "", "optional cooked TIM to embed in the guest (PS1)")
