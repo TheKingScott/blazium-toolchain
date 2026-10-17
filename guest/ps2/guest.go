@@ -40,6 +40,8 @@ var RuntimeNames = []string{
 	"vu1_draw.h",
 	"gdir_vm.cpp",
 	"gdir_vm.h",
+	"mc_io.cpp",
+	"mc_io.h",
 	"gdir_ops.h",
 	"iso_path.h",
 	"draw_3D.vsm",

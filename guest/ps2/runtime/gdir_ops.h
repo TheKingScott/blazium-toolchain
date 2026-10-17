@@ -197,6 +197,9 @@ enum GdirNative {
 	GN_PS2_POKE = 114, // off, byte: 24 KiB that survives change_scene
 	GN_PS2_PEEK = 115, // off
 	GN_PS2_SET_FOG = 116, // Color, near, far (no args, or far <= near: off)
+	GN_PS2_SAVE_SLOT = 117, // slot: the poke bytes (up to the last non-zero one) to the memory card
+	GN_PS2_LOAD_SLOT = 118, // slot: the memory card save back into the poke bytes; bytes, -1 none, -2 no card
+	GN_PS2_MEMCARD_PRESENT = 119, // a formatted PS2 memory card is in slot 1
 	GN_COUNT = 128,
 };
 

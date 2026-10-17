@@ -444,3 +444,18 @@ func TestOverlayReplacesAndAdds(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestRuntimeNamesHasMemoryCard(t *testing.T) {
+	var cpp, hdr bool
+	for _, name := range RuntimeNames {
+		switch name {
+		case "mc_io.cpp":
+			cpp = true
+		case "mc_io.h":
+			hdr = true
+		}
+	}
+	if !cpp || !hdr {
+		t.Fatalf("RuntimeNames missing mc_io files: %v", RuntimeNames)
+	}
+}
