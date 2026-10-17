@@ -112,7 +112,10 @@ type ISOOptions struct {
 	VolumeID string
 	// BootELF is the product-code name the boot ELF gets on a PS2 disc
 	// (SLUS_000.01); empty uses ps2.default_elf, else SLUS_000.01.
-	BootELF                                                                               string
+	BootELF string
+	// BootLogo is a raw 8-bit grey PS2 boot logo (384x64 NTSC, 344x71 PAL)
+	// for a PS2 disc's first 12 sectors; empty leaves them blank.
+	BootLogo                                                                              string
 	Extra                                                                                 []string
 	ExtrasDir                                                                             string
 	Recursive                                                                             bool

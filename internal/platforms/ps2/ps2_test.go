@@ -391,3 +391,46 @@ func TestISOBootELFOption(t *testing.T) {
 		t.Fatal("a non-product-code --boot-elf should be refused")
 	}
 }
+
+func TestBootLogoKeyMatchesPCSX2(t *testing.T) {
+	// SLUS-00001: letters "SLUS", numbers 1 -> ((1&0x1f)<<3) | 5
+	if k := bootLogoKey("SLUS_000.01"); k != 0x0d {
+		t.Fatalf("key %#x", k)
+	}
+}
+
+func TestISOBootLogo(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "GAME.ELF"), []byte{0x7f, 'E', 'L', 'F', 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	logo := make([]byte, 384*64)
+	logo[1] = 0xe0
+	lp := filepath.Join(dir, "BOOTLOGO.RAW")
+	if err := os.WriteFile(lp, logo, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(t.TempDir(), "g.iso")
+	opts := platforms.ISOOptions{CommonOptions: platforms.CommonOptions{Prefix: t.TempDir()}, Dir: dir, Out: out, BootELF: "SLUS_000.01", BootLogo: lp}
+	if err := New().ISO(context.Background(), opts); err != nil {
+		t.Fatal(err)
+	}
+	disc, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// PS2LOGO: XOR with the key, then rotate right 5
+	key := bootLogoKey("SLUS_000.01")
+	for i, want := range []byte{0x00, 0xe0} {
+		x := disc[i] ^ key
+		if got := (x >> 5) | (x << 3); got != want {
+			t.Fatalf("logo byte %d decrypts to %#x", i, got)
+		}
+	}
+	if strings.Contains(string(disc), "BOOTLOGO") {
+		t.Fatal("BOOTLOGO.RAW should not be a file on the disc")
+	}
+	if string(disc[16*2048+1:16*2048+6]) != "CD001" {
+		t.Fatal("the volume descriptor moved")
+	}
+}

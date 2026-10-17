@@ -426,6 +426,7 @@ func runISO(ctx context.Context, p platforms.Platform, args []string, base platf
 	out := fs.String("out", "", "output path")
 	volume := fs.String("volume", "", "ISO9660 volume label")
 	bootELF := fs.String("boot-elf", "", "ps2: product-code name for the boot ELF on the disc (SLUS_000.01)")
+	bootLogo := fs.String("boot-logo", "", "ps2: raw 8-bit grey boot logo (384x64 NTSC, 344x71 PAL) for the disc's logo sectors")
 	title := fs.String("title", "", "movie / disc title")
 	publisher := fs.String("publisher", "", "publisher identifier")
 	preparer := fs.String("preparer", "", "data preparer")
@@ -472,7 +473,7 @@ func runISO(ctx context.Context, p platforms.Platform, args []string, base platf
 		return report.Usage(err.Error())
 	}
 	return p.ISO(ctx, platforms.ISOOptions{
-		CommonOptions: base, XML: *xml, Dir: *dir, Out: *out, VolumeID: *volume, BootELF: *bootELF,
+		CommonOptions: base, XML: *xml, Dir: *dir, Out: *out, VolumeID: *volume, BootELF: *bootELF, BootLogo: *bootLogo,
 		Extra: extras, ExtrasDir: *extrasDir, Recursive: *recursive,
 		Title: *title, Publisher: *publisher, Preparer: *preparer, Application: *application,
 		System: *system, Provider: *provider,

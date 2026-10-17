@@ -283,6 +283,17 @@ func (t *Tool) ISO(ctx context.Context, opts platforms.ISOOptions) error {
 	if err := iso.WriteDataISOSubdir(src, opts.Out, vol, keep, ISODataDir, skipOnDisc); err != nil {
 		return err
 	}
+	if logo := strings.TrimSpace(opts.BootLogo); logo != "" {
+		if !isSerialELFName(boot) {
+			return report.Fail("boot logo needs a product-code boot ELF ("+boot+")", "pass --boot-elf SLUS_000.01")
+		}
+		if err := writeBootLogo(opts.Out, logo, boot); err != nil {
+			return err
+		}
+		if opts.Stdout != nil {
+			report.Line(opts.Stdout, report.Note, "boot logo written to the disc's logo sectors")
+		}
+	}
 	if n := iso.LargestDirRecords(opts.Out); n > 1 && opts.Stdout != nil {
 		report.Line(opts.Stdout, report.Note, fmt.Sprintf("a directory on %s spans %d sectors; the PS2 boot ROM reads only the first", opts.Out, n))
 	}
@@ -567,6 +578,9 @@ const ISODataDir = "DATA"
 // cooker wrote empty (header only: the guest treats a missing one the same).
 func skipOnDisc(name string, size int64, isDir bool) bool {
 	up := strings.ToUpper(name)
+	if !isDir && up == "BOOTLOGO.RAW" {
+		return true // goes in the logo sectors, not the file system
+	}
 	if isDir {
 		return up == "GUEST" || up == "EXTRA"
 	}
@@ -678,6 +692,48 @@ func linkOrCopy(from, to string) error {
 		return err
 	}
 	return os.WriteFile(to, raw, 0o644)
+}
+
+// BootLogoSectors is how much of the disc's system area holds the logo.
+const BootLogoSectors = 12
+
+// bootLogoKey is the byte the BIOS's PS2LOGO decrypts the logo with. It
+// comes from the disc's product code (the boot ELF name): byte 4 of the
+// disc key, as PCSX2's cdvdReadKey and loser's ps2boot.txt work it out.
+func bootLogoKey(serial string) byte {
+	up := strings.ToUpper(serial)
+	numbers := 0
+	for _, c := range up[5:8] + up[9:11] {
+		numbers = numbers*10 + int(c-'0')
+	}
+	letters := int(up[3]&0x7f) | int(up[2]&0x7f)<<7 | int(up[1]&0x7f)<<14 | int(up[0]&0x7f)<<21
+	return byte(((numbers & 0x1f) << 3) | ((letters & 0x0e000000) >> 25))
+}
+
+// writeBootLogo scrambles a raw 8-bit grey logo the way a pressed disc
+// holds it (each byte rotated left 5, then XORed with the key) and writes it
+// over the start of the ISO. PS2LOGO shows it during a full boot, and does
+// not start the game when the sectors are blank.
+func writeBootLogo(isoPath, logoPath, serial string) error {
+	raw, err := os.ReadFile(logoPath)
+	if err != nil {
+		return err
+	}
+	if len(raw) == 0 || len(raw) > BootLogoSectors*2048 {
+		return report.Fail(fmt.Sprintf("boot logo %s is %d bytes", logoPath, len(raw)), "use a raw 8-bit grey image of 384x64 (NTSC) or 344x71 (PAL)")
+	}
+	key := bootLogoKey(serial)
+	enc := make([]byte, len(raw))
+	for i, b := range raw {
+		enc[i] = ((b << 5) | (b >> 3)) ^ key
+	}
+	f, err := os.OpenFile(isoPath, os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = f.WriteAt(enc, 0)
+	return err
 }
 
 // bootELFName returns the file SYSTEM.CNF's BOOT2 line points at ("" if none).
