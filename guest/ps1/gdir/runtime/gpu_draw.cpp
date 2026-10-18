@@ -34,6 +34,11 @@
  * needs no squeeze: the projection distance is 112 lines over tan(fov/2). */
 #define SAFE_Y 8
 #define OT_LEN 1024
+/* The OT's farthest bins: OT_LEN - 1 the backdrop (NFOG), the 8 before it
+ * the ground layers (LAYR: render priority -8 drawn first, -1 last), and
+ * the rest, OT_N bins, everything else by depth */
+#define OT_LAYERS 8
+#define OT_N (OT_LEN - 1 - OT_LAYERS)
 #define PRIM_BYTES (64 * 1024) /* ~1500 textured triangles a frame */
 #define MAX_TEX 64
 #ifdef GDIR_MAX_NODES
@@ -133,6 +138,8 @@ static int32_t g_isph[MAX_NODES][4];
 static uint8_t g_isrc[MAX_NODES];
 static uint16_t g_isrc_c0[MAX_NODES], g_isrc_c1[MAX_NODES];
 static uint8_t g_nfog[MAX_NODES];
+static int8_t g_nlayer[MAX_NODES]; /* LAYR's render priority: -8..-1 a ground layer, 1..16 a decal (5 cm nearer a step) */
+#define DECAL_STEP_M 0.05f
 static int g_ready;
 
 /* node matrices, converted once when the VM sends them (not every frame:
@@ -446,6 +453,7 @@ static void parse_extras(const uint8_t *b, unsigned sz)
 	g_inst_n = 0;
 	memset(g_isrc, 0, sizeof(g_isrc));
 	memset(g_nfog, 0, sizeof(g_nfog));
+	memset(g_nlayer, 0, sizeof(g_nlayer));
 	unsigned off = 0;
 	while (off + 8 <= sz) {
 		const uint8_t *h = b + off;
@@ -495,6 +503,24 @@ static void parse_extras(const uint8_t *b, unsigned sz)
 				}
 			}
 			off += (n * 2 + 3) & ~3u;
+		} else if (memcmp(h, "LAYR", 4) == 0) {
+			/* u16 node, s16 render priority. Negative: drawn before
+			 * everything but the backdrop, lowest first, so flat layers
+			 * (a floor, a path on it) don't swap places with no depth
+			 * buffer to settle which is on top. Positive: a decal (a patch
+			 * on a body), sorted 5 cm a step nearer than its depth */
+			if (off + n * 4 > sz) {
+				break;
+			}
+			for (unsigned i = 0; i < n; i++) {
+				const unsigned node = rd16(b + off + i * 4);
+				int pri = (int16_t)rd16(b + off + i * 4 + 2);
+				pri = pri < -OT_LAYERS ? -OT_LAYERS : (pri > 16 ? 16 : pri);
+				if (node < MAX_NODES) {
+					g_nlayer[node] = (int8_t)pri;
+				}
+			}
+			off += n * 4;
 		} else {
 			break;
 		}
@@ -907,6 +933,9 @@ struct DrawCtx {
 	int32_t near_clip_u;
 	int fog;  /* untextured triangles fade to the fog colour (GTE depth cue) */
 	int nfog; /* this chunk's node is NFOG (the backdrop): no fog, no far cut */
+	int layer; /* 0, or the OT bin this node's ground layer goes in (LAYR) */
+	int32_t zbias4; /* a decal's nearness (LAYR), in OT depth units (SZ / 4) */
+	int32_t decal4; /* DECAL_STEP_M in OT depth units */
 	int32_t far_fog_u;
 	int32_t fog_n, fog_k; /* fog start (mesh units) and 4096*65536 / its length */
 #ifdef P1_DBG_NODE
@@ -1146,12 +1175,15 @@ static int emit_fan(DrawCtx *c, const CV *v, const int *sx, const int *sy, int p
 	/* sorted by its farthest corner: these are the big pieces near the
 	 * camera (the road and the ground beside and under the kart), and by
 	 * their average depth they went in front of the karts standing on them */
-	int idx = (zmax / 4) >> c->ot_shift;
-	if (idx >= OT_LEN) {
+	int idx = (zmax / 4 - c->zbias4) >> c->ot_shift;
+	if (idx >= OT_N) {
 		return 0;
 	}
 	if (idx < 1) {
 		idx = 1;
+	}
+	if (c->layer) {
+		idx = c->layer;
 	}
 #ifdef P1_DBG_NODE
 	const int textured = 0;
@@ -1495,8 +1527,8 @@ static void draw_prims(DrawCtx *c, unsigned first, unsigned n)
 		}
 		/* average depth / 4 */
 		const int32_t zsum = quad ? z0 + z1 + z2 + z3 : z0 + z1 + z2;
-		int idx = (quad ? zsum >> 4 : (zsum * 1365) >> 14) >> ot_shift;
-		if (idx >= OT_LEN) {
+		int idx = ((quad ? zsum >> 4 : (zsum * 1365) >> 14) - c->zbias4) >> ot_shift;
+		if (idx >= OT_N) {
 			if (!c->nfog) {
 				continue;
 			}
@@ -1504,6 +1536,9 @@ static void draw_prims(DrawCtx *c, unsigned first, unsigned n)
 		}
 		if (idx < 1) {
 			idx = 1;
+		}
+		if (c->layer) {
+			idx = c->layer;
 		}
 #ifdef P1_DBG_NODE
 		const unsigned tex = 0xffff;
@@ -1651,6 +1686,10 @@ static void draw_group(DrawCtx *c, const FxM *vfx, const FxM *vfx1, unsigned gi,
 	const unsigned node = g->node;
 	const int moved = node < MAX_NODES && g_nodes_live && g_nm_on[node];
 	c->nfog = node < MAX_NODES && g_nfog[node];
+	/* the OT draws from its far end: priority -8 first */
+	const int pri = node < MAX_NODES ? g_nlayer[node] : 0;
+	c->layer = pri < 0 ? OT_N - 1 - pri : 0;
+	c->zbias4 = pri > 0 ? pri * c->decal4 : 0;
 	/* the backdrop (NFOG, far off) in the mesh's own units: at VIEW_K its
 	 * view coordinates would pass the GTE's 16 bits */
 	const int k1 = c->nfog;
@@ -1710,6 +1749,8 @@ static void draw_scene_mesh(DrawCtx *c, const float *view)
 			draw_group(c, &vfx, &vfx1, gi, &loaded);
 		}
 	}
+	c->layer = 0; /* instances are not ground layers or decals */
+	c->zbias4 = 0;
 	/* MultiMesh instances: each one draws its source node's chunks. The
 	 * instance's world matrix and sphere are kept until its node moves; the
 	 * sphere is tested before any per-frame matrix work. */
@@ -1972,7 +2013,7 @@ void gs_draw_scene(void)
 		/* average-depth OT index: otz = sz / 4, spread over OT_LEN */
 		const int otz_max = (int)(c.far_m * vs) / 4;
 		c.ot_shift = 0;
-		while ((otz_max >> c.ot_shift) >= OT_LEN && c.ot_shift < 16) {
+		while ((otz_max >> c.ot_shift) >= OT_N && c.ot_shift < 16) {
 			c.ot_shift++;
 		}
 		gte_SetGeomScreen((int)c.h);
@@ -1983,6 +2024,7 @@ void gs_draw_scene(void)
 			c.near_u = (int32_t)c.h / 2 + 1;
 		}
 		c.near_clip_u = (int32_t)(NEAR_CLIP_M * vs);
+		c.decal4 = (int32_t)(DECAL_STEP_M * vs / 4.0f);
 		if (c.near_clip_u < 1) {
 			c.near_clip_u = 1;
 		}
