@@ -901,7 +901,18 @@ struct DrawCtx {
 	int nfog; /* this chunk's node is NFOG (the backdrop): no fog, no far cut */
 	int32_t far_fog_u;
 	int32_t fog_n, fog_k; /* fog start (mesh units) and 4096*65536 / its length */
+#ifdef P1_DBG_NODE
+	unsigned dbg_node; /* dev: each node's primitives in a colour of their own */
+#endif
 };
+
+static inline int32_t fog_at(const DrawCtx *c, int32_t z)
+{
+	/* 32x32 -> 64: one mult (a 64-bit operand would be a libgcc call) */
+	const int32_t d = z - c->fog_n;
+	const int32_t f = (int32_t)(((int64_t)d * c->fog_k) >> 16);
+	return f < 0 ? 0 : (f > 4096 ? 4096 : f);
+}
 
 static void *alloc_prim(unsigned n)
 {
@@ -974,6 +985,10 @@ static inline void ot_append(int idx, void *first, void *last)
 	g_tail[idx] = last;
 }
 
+/* a 32-bit word of a primitive, which is word aligned (a memcpy to a
+ * uint8_t member would be four byte stores) */
+typedef uint32_t __attribute__((may_alias, aligned(4))) pword;
+
 /* ---- the vertex cache: each corner a chunk's triangles share is turned
  * through the GTE once (RTPS) and kept in the scratchpad, 1 KiB of
  * one-cycle RAM, until the matrix changes. Direct-mapped by index. */
@@ -1024,14 +1039,53 @@ struct CV {
  * each corner projected once, one facing test, then a fan of primitives */
 static int emit_fan(DrawCtx *c, const CV *v, const int *sx, const int *sy, int pn, unsigned tex);
 
+/* H/SZ as the GTE's RTPS works it out (1.16 fixed, its own reciprocal
+ * table: "GTE Division Inaccuracy" in psx-spx), so a corner projected here
+ * lands on the very pixel the GTE puts it on for the primitives beside */
+static uint32_t gte_divide(uint32_t h, uint32_t sz)
+{
+	static uint8_t unr[257];
+	static int ready;
+	if (!ready) {
+		for (int i = 0; i < 257; i++) {
+			const int u = (0x40000 / (i + 0x100) + 1) / 2 - 0x101;
+			unr[i] = (uint8_t)(u > 0 ? u : 0);
+		}
+		ready = 1;
+	}
+	if (h >= sz * 2) {
+		return 0x1ffff;
+	}
+	int z = 0;
+	while (!(sz & (0x8000u >> z))) {
+		z++;
+	}
+	const uint64_t n = (uint64_t)h << z;
+	uint32_t d = sz << z;
+	const uint32_t u = unr[(d - 0x7fc0) >> 7] + 0x101;
+	d = (0x2000080 - d * u) >> 8;
+	d = (0x0000080 + d * u) >> 8;
+	const uint64_t q = (n * d + 0x8000) >> 16;
+	return q > 0x1ffff ? 0x1ffff : (uint32_t)q;
+}
+
+/* RTPS's screen coordinate from a view coordinate (IR1/IR2) and H/SZ */
+static inline int gte_screen(int32_t ir, uint32_t q, int32_t centre)
+{
+	ir = ir > 0x7fff ? 0x7fff : (ir < -0x8000 ? -0x8000 : ir);
+	const int32_t s = (int32_t)(((int64_t)ir * q + ((int64_t)centre << 16)) >> 16);
+	return s > 1023 ? 1023 : (s < -1024 ? -1024 : s);
+}
+
 static int emit_poly(DrawCtx *c, const CV *v, int pn, unsigned tex)
 {
 	int sx[9], sy[9];
-	const int32_t h = (int32_t)c->h;
+	const uint32_t h = (uint32_t)(int32_t)c->h; /* as gte_SetGeomScreen has it */
 	for (int k = 0; k < pn; k++) {
-		const int32_t z = v[k].z > 0 ? v[k].z : 1;
-		sx[k] = SCR_W / 2 + v[k].x * h / z;
-		sy[k] = SCR_H / 2 + v[k].y * h / z;
+		const int32_t z = v[k].z;
+		const uint32_t q = gte_divide(h, z < 1 ? 1u : (z > 0xffff ? 0xffffu : (uint32_t)z));
+		sx[k] = gte_screen(v[k].x, q, SCR_W / 2);
+		sy[k] = gte_screen(v[k].y, q, SCR_H / 2);
 	}
 	return emit_fan(c, v, sx, sy, pn, tex);
 }
@@ -1067,7 +1121,34 @@ static int emit_fan(DrawCtx *c, const CV *v, const int *sx, const int *sy, int p
 	if (idx < 1) {
 		idx = 1;
 	}
+#ifdef P1_DBG_NODE
+	const int textured = 0;
+	(void)tex;
+#else
 	const int textured = tex < (unsigned)g_tex_n && g_tex[tex].ready;
+#endif
+	/* untextured: each corner's colour, fogged by its depth as the fast
+	 * path's corners are */
+	CVECTOR rgb[9] __attribute__((aligned(4)));
+	if (!textured) {
+		const int fog = c->fog && !c->nfog;
+		for (int k = 0; k < pn; k++) {
+			CVECTOR in;
+			in.r = (uint8_t)(v[k].r >> 8);
+			in.g = (uint8_t)(v[k].g >> 8);
+			in.b = (uint8_t)(v[k].b >> 8);
+			in.cd = 0;
+			if (fog) {
+				const int32_t f = fog_at(c, v[k].z);
+				__asm__ volatile("mtc2 %0, $8" : : "r"(f));
+				gte_ldrgb(&in);
+				gte_dpcs();
+				gte_strgb(&rgb[k]);
+			} else {
+				rgb[k] = in;
+			}
+		}
+	}
 	int n = 0;
 	for (int i = 1; i + 1 < pn; i++) {
 		const int a = 0, b = i, d = i + 1;
@@ -1108,11 +1189,11 @@ static int emit_fan(DrawCtx *c, const CV *v, const int *sx, const int *sy, int p
 			}
 			POLY_G3 *p = (POLY_G3 *)g_pp;
 			g_pp += sizeof(POLY_G3);
+			*(pword *)&p->r0 = *(const pword *)&rgb[a];
+			*(pword *)&p->r1 = *(const pword *)&rgb[b];
+			*(pword *)&p->r2 = *(const pword *)&rgb[d];
 			setPolyG3(p);
 			setXY3(p, sx[a], sy[a], sx[b], sy[b], sx[d], sy[d]);
-			setRGB0(p, v[a].r >> 8, v[a].g >> 8, v[a].b >> 8);
-			setRGB1(p, v[b].r >> 8, v[b].g >> 8, v[b].b >> 8);
-			setRGB2(p, v[d].r >> 8, v[d].g >> 8, v[d].b >> 8);
 			ot_append(idx, p, p);
 		}
 		n++;
@@ -1183,11 +1264,15 @@ static int draw_tri_slow(DrawCtx *c, const P1Vert *va, const P1Vert *vb, const P
 		int on = 0;
 		for (int i = 0; i < pn; i++) {
 			const int j = i + 1 < pn ? i + 1 : 0;
-			const CV &a = in[i], &b = in[j];
-			const int32_t da = d[i], db = d[j];
-			if (da >= 0) {
-				out[on++] = a;
+			if (d[i] >= 0) {
+				out[on++] = in[i];
 			}
+			/* from the same end whichever way round the edge is (the
+			 * neighbour across it cuts it at the same point) */
+			const CV &e0 = in[i], &e1 = in[j];
+			const int swap = e0.x != e1.x ? e0.x > e1.x : (e0.y != e1.y ? e0.y > e1.y : e0.z > e1.z);
+			const CV &a = swap ? e1 : e0, &b = swap ? e0 : e1;
+			const int32_t da = swap ? d[j] : d[i], db = swap ? d[i] : d[j];
 			if ((da >= 0) != (db >= 0) && on < 9) {
 				/* the point at d = 0 on a..b */
 				int32_t na = da, nb = db;
@@ -1268,11 +1353,16 @@ static int draw_tri_near(DrawCtx *c, const P1Vert *va, const P1Vert *vb, const P
 	int pn = 0;
 	const int32_t nz = c->near_u;
 	for (int i = 0; i < 3; i++) {
-		const NV &a = in[i], &b = in[i + 1 < 3 ? i + 1 : 0];
-		const int32_t da = a.vz - nz, db = b.vz - nz;
-		if (da >= 0) {
-			out[pn++] = a;
+		const NV &e0 = in[i], &e1 = in[i + 1 < 3 ? i + 1 : 0];
+		if (e0.vz - nz >= 0) {
+			out[pn++] = e0;
 		}
+		/* the point is worked out from the same end whichever way round
+		 * the edge is: the triangle on its other side cuts it at the very
+		 * same point (else a line of gaps shows between them) */
+		const int swap = e0.x != e1.x ? e0.x > e1.x : (e0.y != e1.y ? e0.y > e1.y : e0.z > e1.z);
+		const NV &a = swap ? e1 : e0, &b = swap ? e0 : e1;
+		const int32_t da = a.vz - nz, db = b.vz - nz;
 		if ((da >= 0) != (db >= 0)) {
 			int32_t na = da, nb = db;
 			while (na > 0x7ffff || na < -0x7ffff || nb > 0x7ffff || nb < -0x7ffff) {
@@ -1403,11 +1493,19 @@ static void draw_prims(DrawCtx *c, unsigned first, unsigned n)
 			continue;
 		}
 		const DVECTOR s0 = ca->sxy, s1 = cb->sxy, s2 = cc->sxy, s3 = cd->sxy;
-		/* front faces only (the GTE's NCLIP sign; a quad is flat enough
-		 * that its first triangle speaks for it) */
+		/* front faces only (the GTE's NCLIP sign). A quad is out only if
+		 * both its halves face away: over a crest one half can be edge on
+		 * while the other still shows (else a hole in the road) */
 		const int32_t nclip = (s1.vx - s0.vx) * (s2.vy - s0.vy) - (s2.vx - s0.vx) * (s1.vy - s0.vy);
 		if (nclip <= 0) {
-			continue; /* back face or edge on */
+			if (!QUAD) {
+				continue; /* back face or edge on */
+			}
+			/* the second half c, b, d */
+			const int32_t nclip2 = (s1.vx - s2.vx) * (s3.vy - s2.vy) - (s3.vx - s2.vx) * (s1.vy - s2.vy);
+			if (nclip2 <= 0) {
+				continue;
+			}
 		}
 		{
 			/* the GPU drops a primitive wider than 1023 or taller than
@@ -1428,7 +1526,10 @@ static void draw_prims(DrawCtx *c, unsigned first, unsigned n)
 			if (x1 < 0 || x0 >= SCR_W || y1 < 0 || y0 >= SCR_H) {
 				continue;
 			}
-			if (x1 - x0 > 1000 || y1 - y0 > 500) {
+			if (x1 - x0 > 1000 || y1 - y0 > 500 || x0 <= -1024 || x1 >= 1023 || y0 <= -1024 || y1 >= 1023) {
+				/* too big for the GPU, or a corner the GTE pinned to the
+				 * end of its range (SX/SY saturate at -1024 and 1023: the
+				 * shape would be wrong) */
 				drawn += draw_tri_slow(c, va, vb, vc, pr->uv, pr->tex);
 				if (vd) {
 					const uint8_t uv2[6] = { pr->uv[4], pr->uv[5], pr->uv[2], pr->uv[3], pr->uv[6], pr->uv[7] };
@@ -1449,7 +1550,11 @@ static void draw_prims(DrawCtx *c, unsigned first, unsigned n)
 		if (idx < 1) {
 			idx = 1;
 		}
+#ifdef P1_DBG_NODE
+		const unsigned tex = 0xffff;
+#else
 		const unsigned tex = pr->tex;
+#endif
 		if (tex < (unsigned)g_tex_n && g_tex[tex].ready) {
 			const Tex *tx = &g_tex[tex];
 			const unsigned need = (quad ? sizeof(POLY_GT4) : sizeof(POLY_GT3)) + (tx->tiled ? 2 * sizeof(DR_TWIN) : 0);
@@ -1508,9 +1613,7 @@ static void draw_prims(DrawCtx *c, unsigned first, unsigned n)
 			g_pp += sizeof(POLY_G4);
 			if (fog) {
 				/* towards the fog colour by the quad's average depth */
-				int32_t f = (int32_t)((((int64_t)(zsum >> 2) - c->fog_n) * c->fog_k) >> 16);
-				f = f < 0 ? 0 : (f > 4096 ? 4096 : f);
-				__asm__ volatile("mtc2 %0, $8" : : "r"(f));
+				__asm__ volatile("mtc2 %0, $8" : : "r"(fog_at(c, zsum >> 2)));
 				gte_ldrgb3(&va->r, &vb->r, &vc->r);
 				gte_dpct();
 				gte_strgb3_g4(q);
@@ -1523,6 +1626,15 @@ static void draw_prims(DrawCtx *c, unsigned first, unsigned n)
 				setRGB2(q, vc->r, vc->g, vc->b);
 				setRGB3(q, vd->r, vd->g, vd->b);
 			}
+#ifdef P1_DBG_NODE
+			{
+				const unsigned nd = c->dbg_node * 2654435761u;
+				setRGB0(q, nd >> 24, nd >> 16, nd >> 8);
+				setRGB1(q, nd >> 24, nd >> 16, nd >> 8);
+				setRGB2(q, nd >> 24, nd >> 16, nd >> 8);
+				setRGB3(q, nd >> 24, nd >> 16, nd >> 8);
+			}
+#endif
 			setPolyG4(q);
 			setXY4(q, s0.vx, s0.vy, s1.vx, s1.vy, s2.vx, s2.vy, s3.vx, s3.vy);
 			ot_append(idx, q, q);
@@ -1535,9 +1647,7 @@ static void draw_prims(DrawCtx *c, unsigned first, unsigned n)
 			if (fog) {
 				/* the colours towards the fog colour by the triangle's
 				 * average depth: IR0 0 at the fog's near, 4096 at its far */
-				int32_t f = (int32_t)((((int64_t)(zsum / 3) - c->fog_n) * c->fog_k) >> 16);
-				f = f < 0 ? 0 : (f > 4096 ? 4096 : f);
-				__asm__ volatile("mtc2 %0, $8" : : "r"(f));
+				__asm__ volatile("mtc2 %0, $8" : : "r"(fog_at(c, zsum / 3)));
 				gte_ldrgb3(&va->r, &vb->r, &vc->r);
 				gte_dpct();
 				gte_strgb3_g3(p);
@@ -1546,6 +1656,14 @@ static void draw_prims(DrawCtx *c, unsigned first, unsigned n)
 				setRGB1(p, vb->r, vb->g, vb->b);
 				setRGB2(p, vc->r, vc->g, vc->b);
 			}
+#ifdef P1_DBG_NODE
+			{
+				const unsigned nd = c->dbg_node * 2654435761u;
+				setRGB0(p, nd >> 24, nd >> 16, nd >> 8);
+				setRGB1(p, nd >> 24, nd >> 16, nd >> 8);
+				setRGB2(p, nd >> 24, nd >> 16, nd >> 8);
+			}
+#endif
 			setPolyG3(p);
 			setXY3(p, s0.vx, s0.vy, s1.vx, s1.vy, s2.vx, s2.vy);
 			ot_append(idx, p, p);
@@ -1559,6 +1677,9 @@ static inline void draw_chunk(DrawCtx *c, unsigned ci)
 {
 	const uint8_t *ch = g_chunks + ci * CHUNK_SZ;
 	const unsigned first = rd32(ch), nq = rd16(ch + 4), nt = rd16(ch + 24);
+#ifdef P1_DBG_NODE
+	c->dbg_node = rd16(ch + 6);
+#endif
 	if (nq) {
 		draw_prims<1>(c, first, nq);
 	}
@@ -1988,7 +2109,11 @@ void gs_draw_scene(void)
 	} while (VSync(-1) - s_flip_at < s_pace);
 	s_flip_at = VSync(-1);
 	PutDispEnv(&f->disp);
+#ifdef P1_DBG_NODE
+	setRGB0(&f->draw, 0, 255, 255);
+#else
 	setRGB0(&f->draw, g_clear_r, g_clear_g, g_clear_b);
+#endif
 	PutDrawEnv(&f->draw);
 	DrawOTag(f->ot + OT_LEN - 1);
 	g_cur ^= 1;

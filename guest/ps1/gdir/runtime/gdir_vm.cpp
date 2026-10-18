@@ -3256,6 +3256,21 @@ void gdir_vm_process(float delta)
 	if (!s_active) {
 		return;
 	}
+#ifdef GDIR_FREEZE_AT
+	/* dev: stop the scripts GDIR_FREEZE_AT frames into pack
+	 * GDIR_FREEZE_PACK, so a screenshot shows the same frame run to run */
+	{
+		static int fpack = -9;
+		static unsigned fn;
+		if (s_cur != fpack) {
+			fpack = s_cur;
+			fn = 0;
+		}
+		if (s_cur == GDIR_FREEZE_PACK && ++fn > GDIR_FREEZE_AT) {
+			return;
+		}
+	}
+#endif
 	s_delta = delta;
 	s_ticks_ms += (unsigned)(delta * 1000.0f);
 	s_ops = 0;
