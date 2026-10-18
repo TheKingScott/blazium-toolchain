@@ -55,6 +55,17 @@ static uint8_t *load_file(const char *name, unsigned *size)
 	return b;
 }
 
+static const unsigned char *s_mesh0;
+
+static unsigned char *reload_gtex0(const unsigned char *mesh, unsigned *size)
+{
+	*size = 0;
+	if (!mesh || mesh != s_mesh0) {
+		return 0;
+	}
+	return load_file("GTEX00.BIN", size);
+}
+
 static int read_disp_region(void)
 {
 	unsigned n = 0;
@@ -99,7 +110,9 @@ int main(int argc, const char **argv)
 	if (!mesh || !gs_draw_init(mesh, mesh_sz, gtex, gtex_sz, node, node_sz)) {
 		halt("No scene on the disc (MESH00).");
 	}
-	/* VRAM has the textures now */
+	s_mesh0 = mesh;
+	gs_draw_set_gtex_reload(reload_gtex0);
+	/* VRAM has the textures now; pack 0 coming back reads them again */
 	free(gtex);
 	gtex = 0;
 	gtex_sz = 0;

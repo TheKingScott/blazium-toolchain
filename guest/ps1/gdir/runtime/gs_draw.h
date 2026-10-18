@@ -81,6 +81,10 @@ void gs_draw_hud_style(int slot, int kind, int scale, int align, int hidden, int
 void gs_draw_scene(void);
 // The GPU, the display and the font: once, before gs_draw_init.
 void gs_draw_boot(int pal);
+/* PS1: pack 0's GTEX is freed once it is in VRAM. When pack 0 comes back
+ * (gs_draw_init with no GTEX), this reads it again for that mesh; it returns
+ * a malloc'd blob or NULL. */
+void gs_draw_set_gtex_reload(unsigned char *(*fn)(const unsigned char *mesh, unsigned *size));
 
 void gs_draw_camera(float *x, float *y, float *z);
 float gs_draw_world_yaw(void);

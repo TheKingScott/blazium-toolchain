@@ -1107,6 +1107,13 @@ void gs_draw_scene(void)
 }
 
 /* ------------------------------------------------------------ API */
+static unsigned char *(*g_gtex_reload)(const unsigned char *, unsigned *);
+
+void gs_draw_set_gtex_reload(unsigned char *(*fn)(const unsigned char *mesh, unsigned *size))
+{
+	g_gtex_reload = fn;
+}
+
 int gs_draw_init(const unsigned char *mesh, unsigned mesh_sz, const unsigned char *gtex, unsigned gtex_sz,
 		const unsigned char *node, unsigned node_sz)
 {
@@ -1117,7 +1124,15 @@ int gs_draw_init(const unsigned char *mesh, unsigned mesh_sz, const unsigned cha
 	memset(g_nrot, 0, sizeof(g_nrot));
 	DrawSync(0);
 	parse_camera(node, node_sz);
-	parse_textures(gtex, gtex_sz);
+	if (!gtex && g_gtex_reload) {
+		/* back to pack 0: its textures left RAM after the first upload */
+		unsigned sz = 0;
+		unsigned char *again = g_gtex_reload(mesh, &sz);
+		parse_textures(again, sz);
+		free(again);
+	} else {
+		parse_textures(gtex, gtex_sz);
+	}
 	if (!parse_mesh(mesh, mesh_sz)) {
 		printf("P1: mesh did not parse\n");
 		return 0;

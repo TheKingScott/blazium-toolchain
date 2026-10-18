@@ -26,8 +26,11 @@ import (
 const GDIRDataDir = "DATA"
 
 // GDIRBootName is the boot EXE's name on a GDIR disc when --boot-elf is
-// not given.
-const GDIRBootName = "SLUS_000.01"
+// not given. The PS1 BIOS boots any name SYSTEM.CNF gives, but emulators
+// take the name as the disc's serial and look it up in their game lists
+// (DuckStation shows SLUS_000.01 as "Air Combat" and applies that game's
+// settings), so the default is a prefix no retail disc uses.
+const GDIRBootName = "BLAZ_000.01"
 
 func (t *Tool) gdirISO(ctx context.Context, opts platforms.ISOOptions) error {
 	if opts.Out == "" {
