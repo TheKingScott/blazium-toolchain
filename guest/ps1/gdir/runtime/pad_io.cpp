@@ -4,6 +4,8 @@
 
 #include "pad_io.h"
 
+#include "mc_io.h"
+
 #include <psxapi.h>
 #include <psxpad.h>
 #include <string.h>
@@ -45,6 +47,8 @@ int pad_io_init(void)
 	InitPAD(s_buf[0], 34, s_buf[1], 34);
 	StartPAD();
 	ChangeClearPAD(0);
+	/* the card driver shares the pads' port: InitCARD(1) after InitPAD */
+	mc_io_boot();
 	s_ready = 1;
 	return 1;
 }

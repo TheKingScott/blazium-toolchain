@@ -95,6 +95,11 @@ func (t *Tool) gdirISO(ctx context.Context, opts platforms.ISOOptions) error {
 	if moved > 0 && opts.Stdout != nil {
 		report.Linef(opts.Stdout, report.Note, "%d bytes of scene node records moved from SCRP00 to PNOD files", moved)
 	}
+	if made, err := MakeMCPS1(data, boot); err != nil {
+		return report.Fail("memory card save header: "+err.Error(), "re-export the scenes with the PlayStation 2 cook")
+	} else if made && opts.Stdout != nil {
+		report.Linef(opts.Stdout, report.Note, "MCPS1.BIN: the memory card save's name, title and icon from MCSAVE.BIN")
+	}
 	cnf := filepath.Join(stage, "SYSTEM.CNF")
 	if err := os.WriteFile(cnf, []byte(systemCNF(boot)), 0o644); err != nil {
 		return err
