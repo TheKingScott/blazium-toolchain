@@ -93,6 +93,7 @@ struct Val {
 struct Func {
 	unsigned char argc;
 	unsigned char locals;
+	unsigned short need; /* stack slots a call takes (locals and operands), 0xffff unknown */
 	unsigned code;
 	unsigned short name; /* const index */
 };
@@ -183,6 +184,12 @@ static unsigned s_pver[GDIR_MAX_NODES];
 static unsigned s_sent[GDIR_MAX_NODES];
 static unsigned char s_vis_sent[GDIR_MAX_NODES]; /* the visibility the renderer has */
 static unsigned char s_lident[GDIR_MAX_NODES]; /* s_local is the identity */
+static unsigned char s_lmove[GDIR_MAX_NODES]; /* s_local is a translation only */
+static short s_par[GDIR_MAX_NODES]; /* the parent, -1 none (always a lower index) */
+/* children in node order: first child, next sibling (-1 none), with counts */
+static short s_child0[GDIR_MAX_NODES];
+static short s_sib[GDIR_MAX_NODES];
+static short s_nchild[GDIR_MAX_NODES];
 
 /* Whether the renderer draws anything with a node's matrix. A guest
  * renderer that knows (the PS1's) defines this; otherwise every node's
@@ -194,11 +201,28 @@ static int node_drawn(int n)
 }
 static float s_local[GDIR_MAX_NODES][12];
 static unsigned char s_all_dirty = 1;
+/* The node pass looks only at the nodes moved since the last one and their
+ * children: when the pack lists nodes depth first (each node's subtree the
+ * nodes n .. s_subend[n] - 1), that is a run of indices per moved node. It
+ * looks at all of them after a visibility or camera change (s_pass_full),
+ * or when more nodes than GDIR_MARKS moved. */
+#define GDIR_MARKS 32
+static short s_mark[GDIR_MARKS];
+static unsigned s_mark_n;
+static unsigned short s_subend[GDIR_MAX_NODES];
+static unsigned char s_preorder;
+static unsigned char s_pass_full = 1;
 
 static void mark_node(int n)
 {
 	s_dirty = 1;
 	if (n >= 0 && n < GDIR_MAX_NODES) {
+		if (!s_ndirty[n]) {
+			if (s_mark_n < GDIR_MARKS) {
+				s_mark[s_mark_n] = (short)n;
+			}
+			s_mark_n++;
+		}
 		s_ndirty[n] = 1;
 		s_lstale[n] = 1;
 	} else {
@@ -220,6 +244,16 @@ static PackConn s_conn[64];
 /* ---- execution ---- */
 static Val s_stack[GDIR_STACK];
 static unsigned s_sp;
+/* A guest with a small fast RAM (the PS1's 1 KiB scratchpad, free while the
+ * scripts run) gives it as a second stack: a call whose frame fits goes
+ * there, the rest to s_stack. Frames in either are last in, first out. */
+#ifdef GDIR_FAST_STACK_AT
+#ifndef GDIR_FAST_STACK
+#define GDIR_FAST_STACK 64
+#endif
+#define s_fast ((Val *)(GDIR_FAST_STACK_AT))
+#endif
+static unsigned s_fsp;
 static int s_depth;
 static unsigned s_ops;
 static char s_ring[GDIR_RING][GDIR_STR];
@@ -259,7 +293,7 @@ static int is_arr(const struct Val &v);
 static int alen(const struct Val &v);
 static struct Val aget(const struct Val &v, int i);
 
-static void fail(const char *msg)
+static __attribute__((noinline, cold)) void fail(const char *msg)
 {
 	if (!s_err[0]) {
 		strncpy(s_err, msg, sizeof(s_err) - 1);
@@ -271,7 +305,10 @@ static void fail(const char *msg)
 static Val vnil(void)
 {
 	Val v;
-	memset(&v, 0, sizeof(v));
+	v.t = T_NIL;
+	v.v[0] = 0.0f;
+	v.v[1] = 0.0f;
+	v.v[2] = 0.0f;
 	return v;
 }
 
@@ -517,6 +554,7 @@ static int vequal(const Val &a, const Val &b)
 
 static unsigned s_mem_n_gc;
 static unsigned s_sp_gc;
+static unsigned s_fsp_gc;
 static Val *s_mem_gc;
 static Val *s_stack_gc;
 
@@ -549,6 +587,13 @@ static void arr_gc(void)
 			arr_mark(s_stack_gc[i].i, mark);
 		}
 	}
+#ifdef GDIR_FAST_STACK_AT
+	for (unsigned i = 0; i < s_fsp_gc; i++) {
+		if (s_fast[i].t == 8) {
+			arr_mark(s_fast[i].i, mark);
+		}
+	}
+#endif
 	for (int i = 0; i < GDIR_ARRAYS; i++) {
 		s_arr_used[i] = mark[i];
 	}
@@ -559,6 +604,7 @@ static int arr_new(void)
 {
 	if (s_sp_live) {
 		s_sp_gc = *s_sp_live;
+		s_fsp_gc = s_fsp;
 	}
 	for (int pass = 0; pass < 2; pass++) {
 		for (int i = 0; i < GDIR_ARRAYS; i++) {
@@ -588,6 +634,31 @@ static void arr_set(int a, int i, const Val &v)
 static void mat_from_trs(const float *p, const float *r, const float *s, float *m)
 {
 	/* Godot Basis::from_euler(YXZ): Ry * Rx * Rz, then scale columns. */
+	if (r[0] == 0.0f && r[2] == 0.0f) {
+		/* a yaw only (most moving nodes): Ry */
+		const float cy = cosf(r[1]), sy = sinf(r[1]);
+		const float s0 = s[0], s1 = s[1], s2 = s[2];
+		const int one = s0 == 1.0f && s1 == 1.0f && s2 == 1.0f;
+		m[0] = one ? cy : cy * s0;
+		m[1] = 0.0f;
+		m[2] = one ? sy : sy * s2;
+		m[3] = p[0];
+		m[4] = 0.0f;
+		m[5] = s1;
+		m[6] = 0.0f;
+		m[7] = p[1];
+		m[8] = one ? -sy : -sy * s0;
+		m[9] = 0.0f;
+		m[10] = one ? cy : cy * s2;
+		m[11] = p[2];
+		if (r[1] == 0.0f) {
+			m[0] = s0;
+			m[2] = 0.0f;
+			m[8] = 0.0f;
+			m[10] = s2;
+		}
+		return;
+	}
 	const float cx = cosf(r[0]), sx = sinf(r[0]);
 	const float cy = cosf(r[1]), sy = sinf(r[1]);
 	const float cz = cosf(r[2]), sz = sinf(r[2]);
@@ -618,9 +689,11 @@ static void mat_mul34(const float *a, const float *b, float *o)
 {
 	float t[12];
 	for (int r = 0; r < 3; r++) {
-		for (int c = 0; c < 4; c++) {
-			t[r * 4 + c] = a[r * 4 + 0] * b[0 * 4 + c] + a[r * 4 + 1] * b[1 * 4 + c] + a[r * 4 + 2] * b[2 * 4 + c] + (c == 3 ? a[r * 4 + 3] : 0.0f);
-		}
+		const float a0 = a[r * 4 + 0], a1 = a[r * 4 + 1], a2 = a[r * 4 + 2];
+		t[r * 4 + 0] = a0 * b[0] + a1 * b[4] + a2 * b[8];
+		t[r * 4 + 1] = a0 * b[1] + a1 * b[5] + a2 * b[9];
+		t[r * 4 + 2] = a0 * b[2] + a1 * b[6] + a2 * b[10];
+		t[r * 4 + 3] = a0 * b[3] + a1 * b[7] + a2 * b[11] + a[r * 4 + 3];
 	}
 	memcpy(o, t, sizeof(t));
 }
@@ -692,8 +765,7 @@ static void mark_keep(int n)
 
 static int node_parent(int n)
 {
-	const int p = s_nodes[n].parent;
-	return (p >= 0 && p < n) ? p : -1;
+	return s_par[n];
 }
 
 static int node_stale(int n)
@@ -727,11 +799,23 @@ static void compute_one(int n)
 			mat_from_trs(pn->lpos, pn->lrot, pn->lscale, s_local[n]);
 			s_lstale[n] = 0;
 			const float *l = s_local[n];
-			s_lident[n] = l[0] == 1.0f && l[5] == 1.0f && l[10] == 1.0f && l[1] == 0.0f && l[2] == 0.0f && l[3] == 0.0f &&
-					l[4] == 0.0f && l[6] == 0.0f && l[7] == 0.0f && l[8] == 0.0f && l[9] == 0.0f && l[11] == 0.0f;
+			s_lmove[n] = l[0] == 1.0f && l[5] == 1.0f && l[10] == 1.0f && l[1] == 0.0f && l[2] == 0.0f && l[4] == 0.0f &&
+					l[6] == 0.0f && l[8] == 0.0f && l[9] == 0.0f;
+			s_lident[n] = s_lmove[n] && l[3] == 0.0f && l[7] == 0.0f && l[11] == 0.0f;
 		}
 		if (p >= 0 && s_lident[n]) {
 			memcpy(s_world[n], s_world[p], sizeof(s_world[n])); /* a child at its parent's origin */
+		} else if (p >= 0 && s_lmove[n]) {
+			/* a child moved but not turned: the parent's basis, its origin moved */
+			const float *w = s_world[p], *l = s_local[n];
+			float *o = s_world[n];
+			const float x = l[3], y = l[7], z = l[11];
+			for (int r = 0; r < 3; r++) {
+				o[r * 4 + 0] = w[r * 4 + 0];
+				o[r * 4 + 1] = w[r * 4 + 1];
+				o[r * 4 + 2] = w[r * 4 + 2];
+				o[r * 4 + 3] = w[r * 4 + 0] * x + w[r * 4 + 1] * y + w[r * 4 + 2] * z + w[r * 4 + 3];
+			}
 		} else if (p >= 0) {
 			mat_mul34(s_world[p], s_local[n], s_world[n]);
 		} else {
@@ -780,20 +864,11 @@ static int node_visible(int n)
 	return 1;
 }
 
-static void recompute_nodes(void)
+/* the node pass, first half: visibility and worlds for nodes [a, b) */
+static void pass_worlds(unsigned a, unsigned b, int all)
 {
-	/* Parents come before children, so one pass carries a change down: a
-	 * node's world is redone when it or an ancestor moved. */
-	const int all = s_all_dirty;
-	memset(s_keep, 0, s_node_n);
-	if (s_cur >= 0 && s_cur < GDIR_MAX_PACKS) {
-		mark_keep(s_pack[s_cur].camera);
-	}
-	for (int v = 0; v < s_view_n; v++) {
-		mark_keep(s_view_cam[v]);
-	}
-	for (unsigned n = 0; n < s_node_n; n++) {
-		PackNode *pn = &s_nodes[n];
+	for (unsigned n = a; n < b; n++) {
+		const PackNode *pn = &s_nodes[n];
 		const int p = node_parent((int)n);
 		const int pvis = p >= 0 ? s_vis[p] : 1;
 		s_vis[n] = (unsigned char)(((pn->flags & 1) && pvis) ? 1 : 0);
@@ -808,8 +883,12 @@ static void recompute_nodes(void)
 			compute_one((int)n);
 		}
 	}
-	s_all_dirty = 0;
-	for (unsigned n = 0; n < s_node_n; n++) {
+}
+
+/* second half: what changed to the renderer */
+static void pass_send(unsigned a, unsigned b, int all)
+{
+	for (unsigned n = a; n < b; n++) {
 		const PackNode *pn = &s_nodes[n];
 		/* visibility only when it changed (or the pack is new) */
 		if (all || s_vis_sent[n] != s_vis[n]) {
@@ -841,6 +920,42 @@ static void recompute_nodes(void)
 				fabsf(d[3]) < eps && fabsf(d[7]) < eps && fabsf(d[11]) < eps;
 		gs_draw_node_matrix((int)n, ident ? 0 : d);
 	}
+}
+
+static void recompute_nodes(void)
+{
+	/* Parents come before children, so one pass carries a change down: a
+	 * node's world is redone when it or an ancestor moved. */
+	const int all = s_all_dirty;
+	const int full = all || s_pass_full || !s_preorder || s_mark_n > GDIR_MARKS;
+	if (full) {
+		memset(s_keep, 0, s_node_n);
+		if (s_cur >= 0 && s_cur < GDIR_MAX_PACKS) {
+			mark_keep(s_pack[s_cur].camera);
+		}
+		for (int v = 0; v < s_view_n; v++) {
+			mark_keep(s_view_cam[v]);
+		}
+		pass_worlds(0, s_node_n, all);
+		pass_send(0, s_node_n, all);
+	} else {
+		/* each moved node's subtree (overlaps only repeat cheap checks) */
+		for (unsigned i = 0; i < s_mark_n; i++) {
+			const unsigned n = (unsigned)s_mark[i];
+			if (n < s_node_n) {
+				pass_worlds(n, s_subend[n], 0);
+			}
+		}
+		for (unsigned i = 0; i < s_mark_n; i++) {
+			const unsigned n = (unsigned)s_mark[i];
+			if (n < s_node_n) {
+				pass_send(n, s_subend[n], 0);
+			}
+		}
+	}
+	s_all_dirty = 0;
+	s_pass_full = 0;
+	s_mark_n = 0;
 	const Pack *pk = &s_pack[s_cur];
 	for (int v = 0; v < s_view_n; v++) {
 		const int cn = s_view_cam[v];
@@ -976,14 +1091,14 @@ static Val set_prop(Val o, int prop, const Val &v)
 			memcpy(pn->lscale, v.v, sizeof(pn->lscale));
 			mark_node(o.i);
 			break;
-		case GP_VISIBLE:
-			if (truthy(v)) {
-				pn->flags |= 1;
-			} else {
-				pn->flags &= (unsigned char)~1;
+		case GP_VISIBLE: {
+			const unsigned char f = (unsigned char)(truthy(v) ? (pn->flags | 1) : (pn->flags & ~1));
+			if (f != pn->flags) {
+				pn->flags = f;
+				s_dirty = 1;
+				s_pass_full = 1;
 			}
-			s_dirty = 1;
-			break;
+		} break;
 		case GP_TEXT:
 			if (pn->hud >= 0) {
 				char tmp[GDIR_STR];
@@ -1197,6 +1312,7 @@ extern "C" unsigned GDIR_CLOCK(void);
 /* GDIR_CLOCK(): a 16-bit tick counter the guest provides; time in natives */
 static unsigned s_nat_time[GN_COUNT], s_nat_calls[GN_COUNT];
 static unsigned s_recompute_ticks; /* the frame-end node pass */
+static unsigned s_script_ticks; /* _process and _physics_process */
 #endif
 #endif
 static unsigned s_ops_last; /* interpreter ops of the last frame (GS_FRAMELOG) */
@@ -1703,21 +1819,14 @@ static Val native(unsigned inst, int id, Val *a, int n)
 				mark_node(a[0].i);
 			}
 			return vnil();
-		case GN_NODE_CHILD_COUNT: {
-			int c = 0;
-			if (a[0].t == T_NODE) {
-				for (unsigned i = 0; i < s_node_n; i++) {
-					c += s_nodes[i].parent == a[0].i;
-				}
-			}
-			return vint(c);
-		}
+		case GN_NODE_CHILD_COUNT:
+			return vint(a[0].t == T_NODE && node_ok(a[0].i) ? s_nchild[a[0].i] : 0);
 		case GN_NODE_GET_CHILD: {
 			int want = inum(a[1]);
-			if (a[0].t == T_NODE) {
-				for (unsigned i = 0; i < s_node_n; i++) {
-					if (s_nodes[i].parent == a[0].i && want-- == 0) {
-						return vnode((int)i);
+			if (a[0].t == T_NODE && node_ok(a[0].i) && want >= 0) {
+				for (int c = s_child0[a[0].i]; c >= 0; c = s_sib[c]) {
+					if (want-- == 0) {
+						return vnode(c);
 					}
 				}
 			}
@@ -1812,6 +1921,7 @@ static Val native(unsigned inst, int id, Val *a, int n)
 			s_view_n = nv;
 			gs_draw_set_views(nv);
 			s_dirty = 1;
+			s_pass_full = 1;
 			return vbool(nv >= 2);
 		}
 		case GN_PS2_PAD_COUNT:
@@ -1827,7 +1937,282 @@ static Val native(unsigned inst, int id, Val *a, int n)
 	return vnil();
 }
 
+/* ------------------------------------------------------------ stack needs */
+/* The deepest the operand stack goes in the function at code [start, end),
+ * by following its jumps (each place has one depth: the compiler emits
+ * structured code). -1 if it can't tell. */
+static int operand_depth(unsigned start, unsigned end)
+{
+	/* scratch: s_stack is idle while the program loads (depth + 1 per byte) */
+	unsigned char *seen = (unsigned char *)s_stack;
+	if (end <= start || end - start > sizeof(s_stack)) {
+		return -1;
+	}
+	memset(seen, 0, end - start);
+	unsigned wpc[48];
+	int wd[48];
+	int wn = 0;
+	wpc[wn] = start;
+	wd[wn++] = 0;
+	int maxd = 0;
+	while (wn > 0) {
+		wn--;
+		unsigned pc = wpc[wn];
+		int d = wd[wn];
+		while (pc >= start && pc < end && !seen[pc - start]) {
+			if (d > 200) {
+				return -1;
+			}
+			seen[pc - start] = (unsigned char)(d + 1);
+			const unsigned op = s_code[pc];
+			unsigned len = 1;
+			int eff = 0, stop = 0, branch = 0, keep = 0;
+			switch (op) {
+				case GOP_NOP: break;
+				case GOP_CONST: len = 3; eff = 1; break;
+				case GOP_NIL: case GOP_TRUE: case GOP_FALSE: case GOP_SELF: case GOP_DUP: eff = 1; break;
+				case GOP_LLOAD: case GOP_MLOAD: case GOP_NODEREF: len = 2; eff = 1; break;
+				case GOP_LSTORE: case GOP_MSTORE: case GOP_SETP: len = 2; eff = -1; break;
+				case GOP_GETP: len = 2; break;
+				case GOP_ADD: case GOP_SUB: case GOP_MUL: case GOP_DIV: case GOP_MOD: case GOP_BAND: case GOP_BOR:
+				case GOP_EQ: case GOP_NE: case GOP_LT: case GOP_LE: case GOP_GT: case GOP_GE: case GOP_IN:
+				case GOP_INDEX: case GOP_POP: eff = -1; break;
+				case GOP_NEG: case GOP_NOT: break;
+				case GOP_SETINDEX: eff = -3; break;
+				case GOP_JMP: len = 5; stop = 1; branch = 1; break;
+				case GOP_JZ: case GOP_JNZ: len = 5; eff = -1; branch = 1; break;
+				case GOP_JZK: case GOP_JNZK: len = 5; eff = -1; branch = 1; keep = 1; break;
+				case GOP_CALL: len = 4; eff = 1 - (int)s_code[pc + 3]; break;
+				case GOP_NATIVE: len = 3; eff = 1 - (int)s_code[pc + 2]; break;
+				case GOP_ARRAY: len = 2; eff = 1 - (int)s_code[pc + 1]; break;
+				case GOP_RET: case GOP_RETNIL: stop = 1; break;
+				default: return -1;
+			}
+			if (pc + len > end) {
+				return -1;
+			}
+			if (branch) {
+				const unsigned to = ru32(s_code + pc + 1);
+				const int td = keep ? d : d + eff;
+				if (op == GOP_JMP) {
+					pc = to;
+					continue;
+				}
+				if (wn >= 48) {
+					return -1;
+				}
+				wpc[wn] = to;
+				wd[wn++] = td < 0 ? 0 : td;
+			}
+			if (stop) {
+				break;
+			}
+			d += eff;
+			if (d < 0) {
+				d = 0;
+			}
+			if (d > maxd) {
+				maxd = d;
+			}
+			pc += len;
+		}
+	}
+	return maxd;
+}
+
+/* each function's need: its locals, its operands and a little room (a native
+ * or a call's result is written over its arguments, the arguments stay) */
+static void plan_stacks(void)
+{
+	for (unsigned i = 0; i < s_fn_n; i++) {
+		const unsigned start = s_fn[i].code;
+		unsigned end = s_code_n;
+		for (unsigned j = 0; j < s_fn_n; j++) {
+			if (s_fn[j].code > start && s_fn[j].code < end) {
+				end = s_fn[j].code;
+			}
+		}
+		const int d = operand_depth(start, end);
+		s_fn[i].need = d < 0 ? 0xffff : (unsigned short)(s_fn[i].locals + d + 2);
+	}
+}
+
 /* ------------------------------------------------------------ interpreter */
+/* The loop keeps the stack pointer, the code and the op count in registers
+ * and has inline paths only for the common cases (locals, members, consts,
+ * int and float arithmetic and compares, bool jumps); everything else is a
+ * call out of line, so the loop stays small (the PS1 has a 4 KiB I-cache).
+ * The stack top is written back before any of those calls (array GC scans
+ * the stack). */
+#define VM_NOINLINE __attribute__((noinline))
+
+static const Val k_vtrue = { T_BOOL, { 1 } };
+
+/* a value copy that moves the vector words only for vectors: on the PS1
+ * every word is a trip to main RAM */
+static inline void vcopy(Val *d, const Val *s)
+{
+	unsigned w0, w1;
+	memcpy(&w0, s, 4);
+	memcpy(&w1, (const char *)s + 4, 4);
+	memcpy(d, &w0, 4);
+	memcpy((char *)d + 4, &w1, 4);
+	if ((unsigned)((w0 & 0xff) - T_VEC2) <= (unsigned)(T_VEC3 - T_VEC2)) {
+		unsigned w2, w3;
+		memcpy(&w2, (const char *)s + 8, 4);
+		memcpy(&w3, (const char *)s + 12, 4);
+		memcpy((char *)d + 8, &w2, 4);
+		memcpy((char *)d + 12, &w3, 4);
+	}
+}
+static const Val k_vfalse = { T_BOOL, { 0 } };
+
+static VM_NOINLINE void op_arith(int op, Val *a)
+{
+	*a = arith(op, a[0], a[1]);
+}
+
+static VM_NOINLINE void op_compare(int op, Val *a)
+{
+	*a = vbool(compare(op, a[0], a[1]));
+}
+
+static VM_NOINLINE int op_truthy(const Val *v)
+{
+	return truthy(*v);
+}
+
+static VM_NOINLINE void op_getp(Val *o, int p)
+{
+	*o = get_prop(*o, p);
+}
+
+/* [value obj] -> [obj'] */
+static VM_NOINLINE void op_setp(Val *v, int p)
+{
+	*v = set_prop(v[1], p, v[0]);
+}
+
+static VM_NOINLINE void op_mstore(unsigned m, const Val *v)
+{
+	s_mem[m] = persist(*v, s_memstr[m], GDIR_STR);
+}
+
+static VM_NOINLINE void op_noderef(Val *o, unsigned inst, unsigned r)
+{
+	int nd = -1;
+	if (r < s_cls[s_inst[inst].cls].noderefs) {
+		const unsigned v = ru16(s_inst[inst].refs + r * 2);
+		nd = v == 0xffff ? -1 : (int)v;
+	}
+	*o = vnode(nd);
+}
+
+static VM_NOINLINE void op_neg(Val *v)
+{
+	if (v->t == T_INT) {
+		v->i = -v->i;
+	} else if (v->t == T_FLOAT) {
+		v->f = -v->f;
+	} else if (v->t == T_VEC2 || v->t == T_VEC3) {
+		v->v[0] = -v->v[0];
+		v->v[1] = -v->v[1];
+		v->v[2] = -v->v[2];
+	}
+}
+
+/* [value container] -> [bool] */
+static VM_NOINLINE void op_in(Val *a, unsigned inst)
+{
+	Val pair[2] = { a[1], a[0] };
+	*a = native(inst, GN_ARR_HAS, pair, 2);
+}
+
+/* natives read their arguments in place (none writes to them); the result
+ * goes over the first */
+static VM_NOINLINE void op_native(Val *a, unsigned inst, int id, int argc)
+{
+#if defined(GDIR_STATS) && defined(GDIR_CLOCK)
+	const unsigned t0 = GDIR_CLOCK();
+	const Val r = native(inst, id, a, argc);
+	if (id >= 0 && id < GN_COUNT) {
+		s_nat_time[id] += (GDIR_CLOCK() - t0) & 0xffff;
+		s_nat_calls[id]++;
+	}
+	*a = r;
+#else
+	*a = native(inst, id, a, argc);
+#endif
+}
+
+/* [elements...] -> [array] (s_sp still above the elements: they stay marked) */
+static VM_NOINLINE void op_array(Val *a, int cnt)
+{
+	const int ai = arr_new();
+	Val v = vnil();
+	v.t = T_ARR;
+	v.i = ai;
+	if (ai >= 0) {
+		for (int i = 0; i < cnt && i < GDIR_ARR_LEN; i++) {
+			arr_set(ai, i, a[i]);
+		}
+		s_arr_n[ai] = (unsigned char)(cnt < GDIR_ARR_LEN ? cnt : GDIR_ARR_LEN);
+	}
+	*a = v;
+}
+
+/* [base index] -> [value] */
+static VM_NOINLINE void op_index(Val *a)
+{
+	const Val b = a[0];
+	Val r = vnil();
+	int i = inum(a[1]);
+	if (is_arr(b)) {
+		const int ln = alen(b);
+		if (i < 0) {
+			i += ln;
+		}
+		if (i >= 0 && i < ln) {
+			r = aget(b, i);
+		} else {
+			fail("array index out of range");
+		}
+	} else if (b.t == T_STR) {
+		const int l = (int)strlen(b.s);
+		if (i < 0) {
+			i += l;
+		}
+		char *o = ring_str();
+		if (i >= 0 && i < l) {
+			o[0] = b.s[i];
+			o[1] = 0;
+		}
+		r = vstr(o);
+	} else if (b.t == T_VEC2 || b.t == T_VEC3) {
+		r = vfloat((i >= 0 && i < 3) ? b.v[i] : 0.0f);
+	}
+	*a = r;
+}
+
+/* [value base index] -> [] */
+static VM_NOINLINE void op_setindex(const Val *a)
+{
+	const Val v = a[0], b = a[1], idx = a[2];
+	if (b.t == T_KARR) {
+		fail("const arrays are read-only");
+	} else if (b.t == T_ARR && b.i >= 0) {
+		int i = inum(idx);
+		if (i < 0) {
+			i += s_arr_n[b.i];
+		}
+		if (i >= 0 && i < s_arr_n[b.i]) {
+			arr_set(b.i, i, v);
+		} else {
+			fail("array index out of range");
+		}
+	}
+}
+
 static Val call(unsigned inst, unsigned func, const Val *args, int argc)
 {
 	if (func >= s_fn_n || s_err[0]) {
@@ -1838,285 +2223,330 @@ static Val call(unsigned inst, unsigned func, const Val *args, int argc)
 		return vnil();
 	}
 	const Func *f = &s_fn[func];
-	const unsigned base = s_sp;
-	if (base + f->locals + 64 >= GDIR_STACK) {
-		fail("stack overflow");
+	Val *stk = s_stack;
+	unsigned *spv = &s_sp;
+#ifdef GDIR_FAST_STACK_AT
+	if (f->need != 0xffff && s_fsp + f->need <= GDIR_FAST_STACK) {
+		stk = s_fast;
+		spv = &s_fsp;
+	} else
+#endif
+	{
+		const unsigned need = f->need != 0xffff ? f->need : f->locals + 64u;
+		if (s_sp + need >= GDIR_STACK) {
+			fail("stack overflow");
+			return vnil();
+		}
+	}
+	const unsigned base = *spv;
+	if (f->code >= s_code_n) {
+		fail("pc out of range");
 		return vnil();
 	}
+	Val *const lb = stk + base; /* locals */
 	for (unsigned i = 0; i < f->locals; i++) {
-		s_stack[base + i] = (int)i < argc ? args[i] : vnil();
+		lb[i] = (int)i < argc ? args[i] : vnil();
 	}
-	s_sp = base + f->locals;
+	Val *sp = lb + f->locals;
 	s_depth++;
 #ifdef GDIR_STATS
 	const unsigned ops0 = s_ops;
 #endif
-	const unsigned mem = s_inst_mem[inst];
-	const unsigned cls = s_inst[inst].cls;
+	Val *const mb = s_mem + s_inst_mem[inst]; /* members */
+	const unsigned char *const code = s_code;
+	const unsigned code_n = s_code_n;
 	unsigned pc = f->code;
+	/* s_ops counts each op for the stats; otherwise only jumps back and
+	 * calls (what a runaway script repeats), which keeps the loop lean */
+	unsigned nops = 0; /* counted since s_ops was last brought up to date */
 	Val ret = vnil();
-	char lbuf[GDIR_STR];
-	(void)lbuf;
+#define VM_SYNC() (*spv = (unsigned)(sp - stk))
+#define VM_CHECK() \
+	if (s_err[0]) \
+	goto done
 	for (;;) {
-		if (++s_ops > GDIR_OPS_PER_FRAME) {
-			fail("script ran too long in one frame (infinite loop?)");
-			break;
-		}
-		if (pc >= s_code_n) {
-			fail("pc out of range");
-			break;
-		}
-		const unsigned char op = s_code[pc++];
+		const unsigned op = code[pc++];
+#if defined(GDIR_STATS) || defined(GS_FRAMELOG)
+		nops++;
+#define VM_COUNT_BACK()
+#else
+#define VM_COUNT_BACK() nops++
+#endif
 		switch (op) {
 			case GOP_NOP:
 				break;
 			case GOP_CONST: {
-				const unsigned k = ru16(s_code + pc);
+				const unsigned k = ru16(code + pc);
 				pc += 2;
-				s_stack[s_sp++] = k < s_k_n ? s_k[k] : vnil();
+				if (k < s_k_n) {
+					vcopy(sp++, &s_k[k]);
+				} else {
+					*sp++ = vnil();
+				}
 			} break;
 			case GOP_NIL:
-				s_stack[s_sp++] = vnil();
+				*sp++ = vnil();
 				break;
 			case GOP_TRUE:
-				s_stack[s_sp++] = vbool(1);
+				*sp++ = k_vtrue;
 				break;
 			case GOP_FALSE:
-				s_stack[s_sp++] = vbool(0);
+				*sp++ = k_vfalse;
 				break;
 			case GOP_LLOAD:
-				s_stack[s_sp] = s_stack[base + s_code[pc++]];
-				s_sp++;
+				vcopy(sp++, &lb[code[pc++]]);
 				break;
 			case GOP_LSTORE:
-				s_stack[base + s_code[pc++]] = s_stack[--s_sp];
+				--sp;
+				vcopy(&lb[code[pc++]], sp);
 				break;
 			case GOP_MLOAD:
-				s_stack[s_sp++] = s_mem[mem + s_code[pc++]];
+				vcopy(sp++, &mb[code[pc++]]);
 				break;
 			case GOP_MSTORE: {
-				const unsigned m = mem + s_code[pc++];
-				s_mem[m] = persist(s_stack[--s_sp], s_memstr[m], GDIR_STR);
+				Val *m = mb + code[pc++];
+				--sp;
+				if (sp->t == T_STR) {
+					VM_SYNC();
+					op_mstore((unsigned)(m - s_mem), sp);
+				} else {
+					vcopy(m, sp);
+				}
 			} break;
 			case GOP_SELF:
-				s_stack[s_sp++] = vnode(s_inst[inst].node);
+				*sp++ = vnode(s_inst[inst].node);
 				break;
-			case GOP_NODEREF: {
-				const unsigned r = s_code[pc++];
-				int nd = -1;
-				if (r < s_cls[cls].noderefs) {
-					const unsigned v = ru16(s_inst[inst].refs + r * 2);
-					nd = v == 0xffff ? -1 : (int)v;
-				}
-				s_stack[s_sp++] = vnode(nd);
-			} break;
+			case GOP_NODEREF:
+				op_noderef(sp++, inst, code[pc++]);
+				break;
 			case GOP_GETP: {
-				const int p = s_code[pc++];
-				s_stack[s_sp - 1] = get_prop(s_stack[s_sp - 1], p);
+				const int p = code[pc++];
+				Val *o = sp - 1;
+				if (o->t == T_VEC3 || o->t == T_VEC2) {
+					/* .x .y .z of a vector */
+					const int k = (p == GP_X || p == GP_R) ? 0 : ((p == GP_Y || p == GP_G) ? 1 : ((p == GP_Z || p == GP_B) ? 2 : 3));
+					if (k < 2 || (k == 2 && o->t == T_VEC3)) {
+						o->f = o->v[k];
+						o->t = T_FLOAT;
+						break;
+					}
+				}
+				VM_SYNC();
+				op_getp(o, p);
+				VM_CHECK();
 			} break;
-			case GOP_SETP: {
-				const int p = s_code[pc++];
-				const Val o = s_stack[--s_sp];
-				const Val v = s_stack[--s_sp];
-				s_stack[s_sp++] = set_prop(o, p, v);
-			} break;
+			case GOP_SETP:
+				sp -= 2;
+				VM_SYNC();
+				op_setp(sp++, code[pc++]);
+				VM_CHECK();
+				break;
 			case GOP_ADD:
 			case GOP_SUB:
-			case GOP_MUL:
+			case GOP_MUL: {
+				Val *a = sp - 2;
+				const unsigned ta = a[0].t, tb = a[1].t;
+				if (ta == T_INT && tb == T_INT) {
+					const int x = a[0].i, y = a[1].i;
+					a->i = op == GOP_ADD ? x + y : (op == GOP_SUB ? x - y : x * y);
+					sp--;
+					break;
+				}
+				if ((ta == T_FLOAT || ta == T_INT) && (tb == T_FLOAT || tb == T_INT)) {
+					const float x = ta == T_FLOAT ? a[0].f : (float)a[0].i;
+					const float y = tb == T_FLOAT ? a[1].f : (float)a[1].i;
+					a->f = op == GOP_ADD ? x + y : (op == GOP_SUB ? x - y : x * y);
+					a->t = T_FLOAT;
+					sp--;
+					break;
+				}
+				sp--;
+				VM_SYNC();
+				op_arith((int)op, a);
+				VM_CHECK();
+			} break;
 			case GOP_DIV:
 			case GOP_MOD:
 			case GOP_BAND:
-			case GOP_BOR: {
-				const Val b = s_stack[--s_sp];
-				const Val a = s_stack[--s_sp];
-				s_stack[s_sp++] = arith(op, a, b);
-			} break;
-			case GOP_NEG: {
-				Val v = s_stack[s_sp - 1];
-				if (v.t == T_INT) {
-					v.i = -v.i;
-				} else if (v.t == T_FLOAT) {
-					v.f = -v.f;
-				} else if (v.t == T_VEC2 || v.t == T_VEC3) {
-					v.v[0] = -v.v[0];
-					v.v[1] = -v.v[1];
-					v.v[2] = -v.v[2];
-				}
-				s_stack[s_sp - 1] = v;
-			} break;
-			case GOP_EQ:
-			case GOP_NE:
+			case GOP_BOR:
+				sp--;
+				VM_SYNC();
+				op_arith((int)op, sp - 1);
+				VM_CHECK();
+				break;
+			case GOP_NEG:
+				op_neg(sp - 1);
+				break;
 			case GOP_LT:
 			case GOP_LE:
 			case GOP_GT:
 			case GOP_GE: {
-				const Val b = s_stack[--s_sp];
-				const Val a = s_stack[--s_sp];
-				s_stack[s_sp++] = vbool(compare(op, a, b));
+				Val *a = sp - 2;
+				const unsigned ta = a[0].t, tb = a[1].t;
+				int c;
+				if (ta == T_INT && tb == T_INT) {
+					c = (a[0].i > a[1].i) - (a[0].i < a[1].i);
+				} else if ((ta == T_FLOAT || ta == T_INT) && (tb == T_FLOAT || tb == T_INT)) {
+					const float x = ta == T_FLOAT ? a[0].f : (float)a[0].i;
+					const float y = tb == T_FLOAT ? a[1].f : (float)a[1].i;
+					c = x < y ? -1 : (x > y ? 1 : 0);
+				} else {
+					sp--;
+					VM_SYNC();
+					op_compare((int)op, a);
+					VM_CHECK();
+					break;
+				}
+				a->t = T_BOOL;
+				a->i = op == GOP_LT ? c < 0 : (op == GOP_LE ? c <= 0 : (op == GOP_GT ? c > 0 : c >= 0));
+				sp--;
 			} break;
-			case GOP_IN: {
-				const Val c = s_stack[--s_sp];
-				const Val v = s_stack[--s_sp];
-				Val pair[2] = { c, v };
-				s_stack[s_sp++] = native(inst, GN_ARR_HAS, pair, 2);
+			case GOP_EQ:
+			case GOP_NE: {
+				Val *a = sp - 2;
+				const unsigned ta = a[0].t;
+				if (ta == a[1].t && (ta == T_INT || ta == T_BOOL || ta == T_NODE)) {
+					const int e = a[0].i == a[1].i;
+					a->t = T_BOOL;
+					a->i = op == GOP_EQ ? e : !e;
+					sp--;
+					break;
+				}
+				sp--;
+				VM_SYNC();
+				op_compare((int)op, a);
+				VM_CHECK();
 			} break;
-			case GOP_NOT:
-				s_stack[s_sp - 1] = vbool(!truthy(s_stack[s_sp - 1]));
+			case GOP_IN:
+				sp--;
+				VM_SYNC();
+				op_in(sp - 1, inst);
+				VM_CHECK();
 				break;
+			case GOP_NOT: {
+				Val *v = sp - 1;
+				const int t = v->t == T_BOOL ? v->i != 0 : op_truthy(v);
+				v->t = T_BOOL;
+				v->i = !t;
+			} break;
 			case GOP_JMP:
-				pc = ru32(s_code + pc);
-				break;
-			case GOP_JZ: {
-				const unsigned to = ru32(s_code + pc);
-				pc += 4;
-				if (!truthy(s_stack[--s_sp])) {
-					pc = to;
-				}
-			} break;
-			case GOP_JNZ: {
-				const unsigned to = ru32(s_code + pc);
-				pc += 4;
-				if (truthy(s_stack[--s_sp])) {
-					pc = to;
-				}
-			} break;
-			case GOP_JZK: {
-				const unsigned to = ru32(s_code + pc);
-				pc += 4;
-				if (!truthy(s_stack[s_sp - 1])) {
-					pc = to;
-				} else {
-					s_sp--;
-				}
-			} break;
+			case GOP_JZ:
+			case GOP_JNZ:
+			case GOP_JZK:
 			case GOP_JNZK: {
-				const unsigned to = ru32(s_code + pc);
+				const unsigned to = ru32(code + pc);
 				pc += 4;
-				if (truthy(s_stack[s_sp - 1])) {
-					pc = to;
-				} else {
-					s_sp--;
+				if (op != GOP_JMP) {
+					Val *v = sp - 1;
+					const int t = v->t == T_BOOL ? v->i != 0 : op_truthy(v);
+					/* JZ/JZK jump when falsy, JNZ/JNZK when truthy; the K
+					 * forms keep the value when they jump */
+					const int jump = (op == GOP_JZ || op == GOP_JZK) ? !t : t;
+					if (!jump || op == GOP_JZ || op == GOP_JNZ) {
+						sp--;
+					}
+					if (!jump) {
+						break;
+					}
 				}
+				if (to >= code_n) {
+					fail("pc out of range");
+					goto done;
+				}
+				if (to < pc) {
+					/* a loop: the per-frame budget catches a runaway one */
+					VM_COUNT_BACK();
+					if (s_ops + nops > GDIR_OPS_PER_FRAME) {
+						fail("script ran too long in one frame (infinite loop?)");
+						goto done;
+					}
+				}
+				pc = to;
 			} break;
 			case GOP_POP:
-				s_sp--;
+				sp--;
 				break;
 			case GOP_DUP:
-				s_stack[s_sp] = s_stack[s_sp - 1];
-				s_sp++;
+				vcopy(sp, sp - 1);
+				sp++;
 				break;
 			case GOP_CALL: {
-				const unsigned fn = ru16(s_code + pc);
-				const int argc2 = s_code[pc + 2];
+				const unsigned fn = ru16(code + pc);
+				const int argc2 = code[pc + 2];
 				pc += 3;
-				Val a[16];
-				for (int i = argc2 - 1; i >= 0; i--) {
-					a[i] = s_stack[--s_sp];
+				VM_COUNT_BACK();
+				s_ops += nops;
+				nops = 0;
+				if (s_ops > GDIR_OPS_PER_FRAME) {
+					fail("script ran too long in one frame (infinite loop?)");
+					goto done;
 				}
-				const Val r = call(inst, s_cls[cls].first_func + fn, a, argc2);
-				s_stack[s_sp++] = r;
+				/* the arguments stay on the stack (marked) under the callee's frame */
+				VM_SYNC();
+				const Val r = call(inst, s_cls[s_inst[inst].cls].first_func + fn, sp - argc2, argc2);
+				sp -= argc2;
+				*sp++ = r;
+				VM_CHECK();
 			} break;
 			case GOP_NATIVE: {
-				const int id = s_code[pc];
-				const int argc2 = s_code[pc + 1];
+				const int id = code[pc];
+				const int argc2 = code[pc + 1];
 				pc += 2;
-				Val a[16];
-				for (int i = argc2 - 1; i >= 0; i--) {
-					a[i] = s_stack[--s_sp];
-				}
-#if defined(GDIR_STATS) && defined(GDIR_CLOCK)
-				const unsigned t0 = GDIR_CLOCK();
-				s_stack[s_sp++] = native(inst, id, a, argc2);
-				if (id >= 0 && id < GN_COUNT) {
-					s_nat_time[id] += (GDIR_CLOCK() - t0) & 0xffff;
-					s_nat_calls[id]++;
-				}
-#else
-				s_stack[s_sp++] = native(inst, id, a, argc2);
-#endif
+				s_ops += nops;
+				nops = 0;
+				VM_SYNC();
+				sp -= argc2;
+				op_native(sp, inst, id, argc2);
+				sp++;
+				VM_CHECK();
 			} break;
 			case GOP_RET:
-				ret = s_stack[--s_sp];
+				ret = *--sp;
 				goto done;
 			case GOP_RETNIL:
 				goto done;
 			case GOP_ARRAY: {
-				const int cnt = s_code[pc++];
-				const int ai = arr_new(); /* before popping: elements stay marked */
-				Val v = vnil();
-				v.t = T_ARR;
-				v.i = ai;
-				s_sp -= (unsigned)cnt;
-				if (ai >= 0) {
-					for (int i = 0; i < cnt && i < GDIR_ARR_LEN; i++) {
-						arr_set(ai, i, s_stack[s_sp + i]);
-					}
-					s_arr_n[ai] = (unsigned char)(cnt < GDIR_ARR_LEN ? cnt : GDIR_ARR_LEN);
-				}
-				s_stack[s_sp++] = v;
+				const int cnt = code[pc++];
+				VM_SYNC();
+				sp -= cnt;
+				op_array(sp, cnt);
+				sp++;
+				VM_CHECK();
 			} break;
 			case GOP_INDEX: {
-				const Val idx = s_stack[--s_sp];
-				const Val b = s_stack[--s_sp];
-				Val r = vnil();
-				int i = inum(idx);
-				if (is_arr(b)) {
-					const int ln = alen(b);
-					if (i < 0) {
-						i += ln;
-					}
-					if (i >= 0 && i < ln) {
-						r = aget(b, i);
-					} else {
-						fail("array index out of range");
-					}
-				} else if (b.t == T_STR) {
-					const int l = (int)strlen(b.s);
-					if (i < 0) {
-						i += l;
-					}
-					char *o = ring_str();
-					if (i >= 0 && i < l) {
-						o[0] = b.s[i];
-						o[1] = 0;
-					}
-					r = vstr(o);
-				} else if (b.t == T_VEC2 || b.t == T_VEC3) {
-					r = vfloat((i >= 0 && i < 3) ? b.v[i] : 0.0f);
-				}
-				s_stack[s_sp++] = r;
-			} break;
-			case GOP_SETINDEX: {
-				const Val idx = s_stack[--s_sp];
-				const Val b = s_stack[--s_sp];
-				const Val v = s_stack[--s_sp];
-				if (b.t == T_KARR) {
-					fail("const arrays are read-only");
-				} else if (b.t == T_ARR && b.i >= 0) {
-					int i = inum(idx);
-					if (i < 0) {
-						i += s_arr_n[b.i];
-					}
-					if (i >= 0 && i < s_arr_n[b.i]) {
-						arr_set(b.i, i, v);
-					} else {
-						fail("array index out of range");
+				Val *a = sp - 2;
+				sp--;
+				if (a[0].t == T_ARR && a[1].t == T_INT && a[0].i >= 0) {
+					const unsigned i = (unsigned)a[1].i;
+					if (i < s_arr_n[a[0].i]) {
+						vcopy(a, &s_arr[a[0].i][i]);
+						break;
 					}
 				}
+				VM_SYNC();
+				op_index(a);
+				VM_CHECK();
 			} break;
+			case GOP_SETINDEX:
+				sp -= 3;
+				VM_SYNC();
+				op_setindex(sp);
+				VM_CHECK();
+				break;
 			default:
 				fail("bad opcode");
 				goto done;
 		}
-		if (s_err[0]) {
-			break;
-		}
 	}
 done:
+#undef VM_SYNC
+#undef VM_CHECK
+#undef VM_COUNT_BACK
+	s_ops += nops;
 #ifdef GDIR_STATS
 	s_fn_ops[func] += s_ops - ops0;
 #endif
-	s_sp = base;
+	*spv = base;
 	s_depth--;
 	return ret;
 }
@@ -2160,6 +2590,43 @@ static void enter_pack(int pack)
 			mat_inv34(pn->w0, s_w0inv[n]);
 		}
 	}
+	/* child lists for get_child / get_child_count, in node order */
+	for (unsigned n = 0; n < s_node_n; n++) {
+		const int pa = s_nodes[n].parent;
+		s_par[n] = (short)((pa >= 0 && pa < (int)n) ? pa : -1);
+		s_child0[n] = -1;
+		s_sib[n] = -1;
+		s_nchild[n] = 0;
+	}
+	for (int n = (int)s_node_n - 1; n >= 0; n--) {
+		const int pa = s_par[n];
+		if (pa >= 0) {
+			s_sib[n] = s_child0[pa];
+			s_child0[pa] = (short)n;
+			s_nchild[pa]++;
+		}
+	}
+	/* subtree sizes (children have higher indices), then whether each
+	 * subtree is the run of indices after its node */
+	for (unsigned n = 0; n < s_node_n; n++) {
+		s_subend[n] = 1;
+	}
+	for (int n = (int)s_node_n - 1; n >= 0; n--) {
+		if (s_par[n] >= 0) {
+			s_subend[s_par[n]] = (unsigned short)(s_subend[s_par[n]] + s_subend[n]);
+		}
+	}
+	for (unsigned n = 0; n < s_node_n; n++) {
+		s_subend[n] = (unsigned short)(s_subend[n] + n);
+	}
+	s_preorder = 1;
+	for (unsigned n = 0; n < s_node_n; n++) {
+		const int pa = s_par[n];
+		if (pa >= 0 && s_subend[n] > s_subend[pa]) {
+			s_preorder = 0;
+		}
+	}
+	s_mark_n = 0;
 	gs_draw_nodes_begin();
 	if (pk->has_clear) {
 		gs_draw_set_clear(pk->clear[0], pk->clear[1], pk->clear[2]);
@@ -2198,6 +2665,7 @@ static void enter_pack(int pack)
 	}
 	s_dirty = 1;
 	s_all_dirty = 1;
+	s_pass_full = 1;
 	recompute_nodes();
 	/* member initialisers in tree order, then _ready children first */
 	for (unsigned i = 0; i < s_inst_n; i++) {
@@ -2337,6 +2805,7 @@ int gdir_vm_init(const unsigned char *b, unsigned sz)
 	p += 4;
 	s_code = p;
 	p += s_code_n;
+	plan_stacks();
 	const unsigned npk = ru16(p);
 	p += 2;
 	memset(s_pack, 0, sizeof(s_pack));
@@ -2402,6 +2871,7 @@ void gdir_vm_process(float delta)
 	s_ops = 0;
 	s_mem_n_gc = s_mem_n;
 	s_sp_gc = 0;
+	s_fsp_gc = 0;
 	arr_gc();
 	if (pack_io_current() != s_entered) {
 		enter_pack(pack_io_current());
@@ -2425,6 +2895,9 @@ void gdir_vm_process(float delta)
 	if (s_cur >= 0 && !sys_io_paused() && !s_err[0]) {
 		for (unsigned i = 0; i < s_inst_n && s_pending < 0; i++) {
 			const Class *k = &s_cls[s_inst[i].cls];
+#if defined(GDIR_STATS) && defined(GDIR_CLOCK)
+			const unsigned ts0 = GDIR_CLOCK();
+#endif
 			if (k->fn_process >= 0) {
 				const Val d = vfloat(delta);
 				call(i, k->first_func + (unsigned)k->fn_process, &d, 1);
@@ -2433,6 +2906,9 @@ void gdir_vm_process(float delta)
 				const Val d = vfloat(delta);
 				call(i, k->first_func + (unsigned)k->fn_physics, &d, 1);
 			}
+#if defined(GDIR_STATS) && defined(GDIR_CLOCK)
+			s_script_ticks += (GDIR_CLOCK() - ts0) & 0xffff;
+#endif
 		}
 	}
 #if defined(GDIR_STATS) && defined(GDIR_CLOCK)
@@ -2474,8 +2950,10 @@ void gdir_vm_process(float delta)
 #ifdef GDIR_CLOCK
 			printf("  node pass          %u ticks/frame (%u worlds computed, %u sent per frame)\n", s_recompute_ticks / 300,
 					s_st_computed / 300, s_st_sent / 300);
+			printf("  scripts            %u ticks/frame\n", s_script_ticks / 300);
 			s_st_computed = s_st_sent = 0;
 			s_recompute_ticks = 0;
+			s_script_ticks = 0;
 			/* the six natives that took the most time, ticks per frame */
 			for (int top = 0; top < 6; top++) {
 				unsigned best = 0, bi = 0;

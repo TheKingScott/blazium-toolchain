@@ -87,7 +87,7 @@ static inline uint32_t pack(uint32_t sign, int32_t e, uint32_t m)
 	return sign | ((uint32_t)e << 23) | (m & MANT_MASK);
 }
 
-static uint32_t add_bits(uint32_t a, uint32_t b)
+static inline __attribute__((always_inline)) uint32_t add_bits(uint32_t a, uint32_t b)
 {
 	uint32_t ea = (a >> 23) & 0xff, eb = (b >> 23) & 0xff;
 	if (ea == 0xff || eb == 0xff) {
@@ -212,10 +212,21 @@ float __divsf3(float a, float b)
 	const uint32_t ma = (ua & MANT_MASK) | 0x00800000u;
 	const uint32_t mb = (ub & MANT_MASK) | 0x00800000u;
 	int32_t e = (int32_t)ea - (int32_t)eb + 127;
-	/* quotient of ma << 31 / mb: 31 or 32 significant bits */
-	const uint64_t n = (uint64_t)ma << 31;
-	uint32_t q = (uint32_t)(n / mb);
-	const uint32_t r = (uint32_t)(n - (uint64_t)q * mb);
+	/* q = ma << 31 / mb (31 or 32 significant bits), by long division in
+	 * 8-bit steps with the R3000's 32-bit divide (a 64-bit one is a libgcc
+	 * loop): the remainder stays under mb < 2^24, so r << 8 fits */
+	uint32_t n = ma << 8;
+	uint32_t q = n / mb;
+	uint32_t r = n % mb;
+	n = r << 8;
+	q = (q << 8) | (n / mb);
+	r = n % mb;
+	n = r << 8;
+	q = (q << 8) | (n / mb);
+	r = n % mb;
+	n = r << 7;
+	q = (q << 7) | (n / mb);
+	r = n % mb;
 	uint32_t m;
 	if (q & 0x80000000u) {
 		m = (q >> 1) | (q & 1) | (r != 0);
@@ -361,4 +372,45 @@ float __floatunsisf(unsigned a)
 float __negsf2(float a)
 {
 	return bitsf(fbits(a) ^ SIGN);
+}
+
+/* sqrtf, correctly rounded (subnormals flushed): the root's 24 bits one at
+ * a time from the mantissa, the classic restoring square root */
+float sqrtf(float x)
+{
+	const uint32_t u = fbits(x);
+	int32_t e = (int32_t)((u >> 23) & 0xff);
+	if (e == 0) {
+		return bitsf(u & SIGN); /* +-0 (or flushed) */
+	}
+	if (u & SIGN) {
+		return bitsf(QNAN);
+	}
+	if (e == 0xff) {
+		return x; /* inf or NaN */
+	}
+	uint32_t m = (u & MANT_MASK) | 0x00800000u;
+	e -= 127;
+	if (e & 1) { /* an even exponent: the odd bit goes into the mantissa */
+		m <<= 1;
+	}
+	e >>= 1; /* floor */
+	/* m in [2^23, 2^25): root bits from 2^24 down, 25 of them (one to round) */
+	m <<= 1;
+	uint32_t q = 0, s = 0, bit = 0x01000000u;
+	while (bit) {
+		const uint32_t t = s + bit;
+		if (t <= m) {
+			s = t + bit;
+			m -= t;
+			q += bit;
+		}
+		m <<= 1;
+		bit >>= 1;
+	}
+	/* q: 25 bits, the lowest the round bit; m != 0: inexact (sticky) */
+	if (m) {
+		q += q & 1;
+	}
+	return bitsf(((uint32_t)(e + 126) << 23) + (q >> 1));
 }

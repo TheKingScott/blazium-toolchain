@@ -628,17 +628,7 @@ float fabsf(float x)
 	return u2f(f2u(x) & 0x7fffffffu);
 }
 
-float sqrtf(float x)
-{
-	if (x <= 0.0f) {
-		return 0.0f;
-	}
-	float y = u2f(0x1fbd1df5u + (f2u(x) >> 1));
-	y = 0.5f * (y + x / y);
-	y = 0.5f * (y + x / y);
-	y = 0.5f * (y + x / y);
-	return y;
-}
+/* sqrtf: in ps1_float.c */
 
 float floorf(float x)
 {

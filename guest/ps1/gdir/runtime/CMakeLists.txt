@@ -18,6 +18,11 @@ psn00bsdk_add_executable(runtime GPREL
 target_include_directories(runtime BEFORE PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/shim")
 target_include_directories(runtime PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_options(runtime PRIVATE -O2 $<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions -fno-rtti>)
+# PSn00bSDK builds freestanding with -fno-builtin, so every memcpy, memset
+# and fabsf is a call, even for four bytes. Source options come after the
+# SDK's, so -fbuiltin here puts the compiler's inline forms back.
+get_target_property(runtime_sources runtime SOURCES)
+set_source_files_properties(${runtime_sources} PROPERTIES COMPILE_OPTIONS "-fbuiltin")
 # the GDIR VM's tables sized for 2 MiB, and the PS2 budgets as the PS1's
 target_compile_definitions(runtime PRIVATE
 	BLAZIUM_PS1_GDIR=1
@@ -33,6 +38,7 @@ target_compile_definitions(runtime PRIVATE
 	GDIR_MAX_FUNCS=512
 	GDIR_MAX_MEMBERS=512
 	GDIR_STACK=512
+	GDIR_FAST_STACK_AT=0x1f800000u
 	GDIR_RING=64
 	GDIR_ARRAYS=64
 	GDIR_ARR_STR=16
