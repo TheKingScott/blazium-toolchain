@@ -1959,6 +1959,30 @@ void gs_draw_scene(void)
 	} else {
 		s_calm = 0;
 	}
+#ifdef P1_STATS
+	{
+		/* how many fields the frames needed (pacing aside) */
+		static unsigned s_nd[4], s_ndn;
+		s_nd[need < 1 ? 0 : (need > 3 ? 3 : need - 1)]++;
+		if (++s_ndn == 120) {
+			printf("P1 need: 1 field %u, 2 %u, 3 %u, more %u of 120\n", s_nd[0], s_nd[1], s_nd[2], s_nd[3]);
+			memset(s_nd, 0, sizeof(s_nd));
+			s_ndn = 0;
+		}
+	}
+#endif
+#ifdef P1_PACE_LOG
+	{
+		/* the pacing, seldom printed (a print takes a field or more) */
+		static unsigned s_pc[4], s_pcn;
+		s_pc[s_pace > 3 ? 3 : s_pace]++;
+		if (++s_pcn == 1200) {
+			printf("P1 pace: 1 field %u, 2 %u, 3 %u of 1200 frames\n", s_pc[1], s_pc[2], s_pc[3]);
+			memset(s_pc, 0, sizeof(s_pc));
+			s_pcn = 0;
+		}
+	}
+#endif
 	do {
 		VSync(0);
 	} while (VSync(-1) - s_flip_at < s_pace);

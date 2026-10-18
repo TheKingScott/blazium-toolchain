@@ -1283,6 +1283,28 @@ static Val arith(int op, const Val &a, const Val &b)
 	return vnil();
 }
 
+/* -1, 0, 1 as x < y, neither, x > y (a NaN: 0). The PS1 has no FPU: its
+ * float compares are calls, so it compares the bits, as sign and size. */
+static inline int fcmp(float x, float y)
+{
+#ifdef BLAZIUM_PS1_GDIR
+	unsigned ux, uy;
+	memcpy(&ux, &x, 4);
+	memcpy(&uy, &y, 4);
+	if ((ux & 0x7fffffffu) > 0x7f800000u || (uy & 0x7fffffffu) > 0x7f800000u) {
+		return 0;
+	}
+	/* subnormals are zero, as ps1_float.c has them */
+	const int mx = (ux & 0x7f800000u) ? (int)(ux & 0x7fffffffu) : 0;
+	const int my = (uy & 0x7f800000u) ? (int)(uy & 0x7fffffffu) : 0;
+	const int kx = (ux & 0x80000000u) ? -mx : mx;
+	const int ky = (uy & 0x80000000u) ? -my : my;
+	return (kx > ky) - (kx < ky);
+#else
+	return x < y ? -1 : (x > y ? 1 : 0);
+#endif
+}
+
 static int compare(int op, const Val &a, const Val &b)
 {
 	if (op == GOP_EQ) {
@@ -1296,7 +1318,7 @@ static int compare(int op, const Val &a, const Val &b)
 		c = strcmp(a.s, b.s);
 	} else {
 		const float x = num(a), y = num(b);
-		c = x < y ? -1 : (x > y ? 1 : 0);
+		c = fcmp(x, y);
 	}
 	switch (op) {
 		case GOP_LT: return c < 0;
@@ -1311,6 +1333,10 @@ static int compare(int op, const Val &a, const Val &b)
 static Val call(unsigned inst, unsigned func, const Val *args, int argc);
 #ifdef GDIR_STATS
 static unsigned s_fn_ops[GDIR_MAX_FUNCS]; /* inclusive, since the last report */
+#if defined(GDIR_STATS) && defined(GDIR_CLOCK)
+static unsigned s_fn_self[GDIR_MAX_FUNCS]; /* clock ticks in the function itself */
+static unsigned s_child_ticks; /* the running function's callees' so far */
+#endif
 #ifdef GDIR_CLOCK
 extern "C" unsigned GDIR_CLOCK(void);
 /* GDIR_CLOCK(): a 16-bit tick counter the guest provides; time in natives */
@@ -2054,31 +2080,33 @@ static const Val k_vtrue = { T_BOOL, { 1 } };
 
 /* a value copy that moves the vector words only for vectors: on the PS1
  * every word is a trip to main RAM */
+typedef unsigned __attribute__((may_alias)) vword;
 static inline void vcopy(Val *d, const Val *s)
 {
-	unsigned w0, w1;
-	memcpy(&w0, s, 4);
-	memcpy(&w1, (const char *)s + 4, 4);
-	memcpy(d, &w0, 4);
-	memcpy((char *)d + 4, &w1, 4);
+	const vword *sw = (const vword *)s;
+	vword *dw = (vword *)d;
+	const unsigned w0 = sw[0], w1 = sw[1];
+	dw[0] = w0;
+	dw[1] = w1;
 	if ((unsigned)((w0 & 0xff) - T_VEC2) <= (unsigned)(T_VEC3 - T_VEC2)) {
-		unsigned w2, w3;
-		memcpy(&w2, (const char *)s + 8, 4);
-		memcpy(&w3, (const char *)s + 12, 4);
-		memcpy((char *)d + 8, &w2, 4);
-		memcpy((char *)d + 12, &w3, 4);
+		const unsigned w2 = sw[2], w3 = sw[3];
+		dw[2] = w2;
+		dw[3] = w3;
 	}
 }
 static const Val k_vfalse = { T_BOOL, { 0 } };
 
-static VM_NOINLINE void op_arith(int op, Val *a)
+/* the helpers return s_err[0], for gdir_aot.inc's checks */
+static VM_NOINLINE int op_arith(int op, Val *a)
 {
 	*a = arith(op, a[0], a[1]);
+	return s_err[0];
 }
 
-static VM_NOINLINE void op_compare(int op, Val *a)
+static VM_NOINLINE int op_compare(int op, Val *a)
 {
 	*a = vbool(compare(op, a[0], a[1]));
+	return s_err[0];
 }
 
 static VM_NOINLINE int op_truthy(const Val *v)
@@ -2086,15 +2114,17 @@ static VM_NOINLINE int op_truthy(const Val *v)
 	return truthy(*v);
 }
 
-static VM_NOINLINE void op_getp(Val *o, int p)
+static VM_NOINLINE int op_getp(Val *o, int p)
 {
 	*o = get_prop(*o, p);
+	return s_err[0];
 }
 
 /* [value obj] -> [obj'] */
-static VM_NOINLINE void op_setp(Val *v, int p)
+static VM_NOINLINE int op_setp(Val *v, int p)
 {
 	*v = set_prop(v[1], p, v[0]);
+	return s_err[0];
 }
 
 static VM_NOINLINE void op_mstore(unsigned m, const Val *v)
@@ -2126,15 +2156,16 @@ static VM_NOINLINE void op_neg(Val *v)
 }
 
 /* [value container] -> [bool] */
-static VM_NOINLINE void op_in(Val *a, unsigned inst)
+static VM_NOINLINE int op_in(Val *a, unsigned inst)
 {
 	Val pair[2] = { a[1], a[0] };
 	*a = native(inst, GN_ARR_HAS, pair, 2);
+	return s_err[0];
 }
 
 /* natives read their arguments in place (none writes to them); the result
  * goes over the first */
-static VM_NOINLINE void op_native(Val *a, unsigned inst, int id, int argc)
+static VM_NOINLINE int op_native(Val *a, unsigned inst, int id, int argc)
 {
 #if defined(GDIR_STATS) && defined(GDIR_CLOCK)
 	const unsigned t0 = GDIR_CLOCK();
@@ -2147,10 +2178,11 @@ static VM_NOINLINE void op_native(Val *a, unsigned inst, int id, int argc)
 #else
 	*a = native(inst, id, a, argc);
 #endif
+	return s_err[0];
 }
 
 /* [elements...] -> [array] (s_sp still above the elements: they stay marked) */
-static VM_NOINLINE void op_array(Val *a, int cnt)
+static VM_NOINLINE int op_array(Val *a, int cnt)
 {
 	const int ai = arr_new();
 	Val v = vnil();
@@ -2163,10 +2195,11 @@ static VM_NOINLINE void op_array(Val *a, int cnt)
 		s_arr_n[ai] = (unsigned char)(cnt < GDIR_ARR_LEN ? cnt : GDIR_ARR_LEN);
 	}
 	*a = v;
+	return s_err[0];
 }
 
 /* [base index] -> [value] */
-static VM_NOINLINE void op_index(Val *a)
+static VM_NOINLINE int op_index(Val *a)
 {
 	const Val b = a[0];
 	Val r = vnil();
@@ -2196,10 +2229,11 @@ static VM_NOINLINE void op_index(Val *a)
 		r = vfloat((i >= 0 && i < 3) ? b.v[i] : 0.0f);
 	}
 	*a = r;
+	return s_err[0];
 }
 
 /* [value base index] -> [] */
-static VM_NOINLINE void op_setindex(const Val *a)
+static VM_NOINLINE int op_setindex(const Val *a)
 {
 	const Val v = a[0], b = a[1], idx = a[2];
 	if (b.t == T_KARR) {
@@ -2215,7 +2249,297 @@ static VM_NOINLINE void op_setindex(const Val *a)
 			fail("array index out of range");
 		}
 	}
+	return s_err[0];
 }
+
+/* ------------------------------------------------------------ ahead of time */
+/* GDIR_AOT (the PS1 build, when its export had SCRP00.BIN): gdir_aot.inc has
+ * the program's hottest functions as C (internal/platforms/ps1/gdiraot.go).
+ * Each does what the interpreter does, on the same frame: L the locals, S
+ * the operands, each slot at a depth the compiler worked out, so there is no
+ * stack pointer to move, no code to fetch and no dispatch, and a constant,
+ * local or member is read where it is used rather than pushed. Ints with a
+ * constant are inline; the rest are the helpers below (the PS1's floats are
+ * calls anyway), so the code stays small. The stack top is written back
+ * (A_SYNC) before what can run a script or make an array (a call, a native,
+ * an array literal, `in`): nothing else reads it. */
+#if defined(GDIR_AOT) && defined(__has_include)
+#if __has_include("gdir_aot.inc")
+#define GDIR_AOT_ON 1
+typedef Val (*AotFn)(unsigned inst, Val *L, Val *stk, unsigned *spv, Val *mb);
+struct AotEntry {
+	unsigned short fn;
+	AotFn f;
+};
+static AotFn s_aot[GDIR_MAX_FUNCS];
+/* compiled for size: straight-line code runs once a call, from RAM more
+ * than the I-cache, and -Os measured as fast as -O2 at four fifths the size */
+#define AOT_ATTR __attribute__((optimize("Os")))
+static unsigned s_aot_n;
+
+/* + - * / % & |, reading the operands where they are (a local, a member, a
+ * constant or the frame) and writing the result to d */
+static VM_NOINLINE int aot_bin(int op, Val *d, const Val *a, const Val *b)
+{
+	if (a->t == T_FLOAT && b->t == T_FLOAT && op <= GOP_MUL) {
+		/* the common case, read in place */
+		const float x = a->f, y = b->f;
+		d->f = op == GOP_ADD ? x + y : (op == GOP_SUB ? x - y : x * y);
+		d->t = T_FLOAT;
+		return 0;
+	}
+	Val p[2];
+	vcopy(&p[0], a);
+	vcopy(&p[1], b);
+	if (op == GOP_ADD || op == GOP_SUB || op == GOP_MUL) {
+		const unsigned ta = p[0].t, tb = p[1].t;
+		if (ta == T_INT && tb == T_INT) {
+			const int x = p[0].i, y = p[1].i;
+			d->i = op == GOP_ADD ? x + y : (op == GOP_SUB ? x - y : x * y);
+			d->t = T_INT;
+			return 0;
+		}
+		if ((ta == T_FLOAT || ta == T_INT) && (tb == T_FLOAT || tb == T_INT)) {
+			const float x = ta == T_FLOAT ? p[0].f : (float)p[0].i;
+			const float y = tb == T_FLOAT ? p[1].f : (float)p[1].i;
+			d->f = op == GOP_ADD ? x + y : (op == GOP_SUB ? x - y : x * y);
+			d->t = T_FLOAT;
+			return 0;
+		}
+	}
+	const int e = op_arith(op, p);
+	*d = p[0];
+	return e;
+}
+
+/* a compare's truth (-1 on an error), its bool to d if there is one */
+static VM_NOINLINE int aot_rel(int op, Val *d, const Val *a, const Val *b)
+{
+	if (a->t == T_FLOAT && b->t == T_FLOAT && op >= GOP_LT) {
+		const int c = fcmp(a->f, b->f);
+		const int r = op == GOP_LT ? c < 0 : (op == GOP_LE ? c <= 0 : (op == GOP_GT ? c > 0 : c >= 0));
+		if (d) {
+			d->t = T_BOOL;
+			d->i = r;
+		}
+		return r;
+	}
+	Val p[2];
+	vcopy(&p[0], a);
+	vcopy(&p[1], b);
+	const unsigned ta = p[0].t, tb = p[1].t;
+	int r;
+	if (op >= GOP_LT && (ta == T_FLOAT || ta == T_INT) && (tb == T_FLOAT || tb == T_INT)) {
+		int c;
+		if (ta == T_INT && tb == T_INT) {
+			c = (p[0].i > p[1].i) - (p[0].i < p[1].i);
+		} else {
+			const float x = ta == T_FLOAT ? p[0].f : (float)p[0].i;
+			const float y = tb == T_FLOAT ? p[1].f : (float)p[1].i;
+			c = fcmp(x, y);
+		}
+		r = op == GOP_LT ? c < 0 : (op == GOP_LE ? c <= 0 : (op == GOP_GT ? c > 0 : c >= 0));
+	} else if (op < GOP_LT && ta == tb && (ta == T_INT || ta == T_BOOL || ta == T_NODE)) {
+		r = (p[0].i == p[1].i) == (op == GOP_EQ);
+	} else {
+		if (op_compare(op, p)) {
+			return -1;
+		}
+		r = p[0].t == T_BOOL && p[0].i;
+	}
+	if (d) {
+		d->t = T_BOOL;
+		d->i = r;
+	}
+	return r;
+}
+
+/* [base index] -> d */
+static VM_NOINLINE int aot_index(Val *d, const Val *b, const Val *i)
+{
+	if (b->t == T_ARR && i->t == T_INT && b->i >= 0 && (unsigned)i->i < s_arr_n[b->i]) {
+		vcopy(d, &s_arr[b->i][i->i]);
+		return 0;
+	}
+	Val p[2];
+	vcopy(&p[0], b);
+	vcopy(&p[1], i);
+	const int e = op_index(p);
+	*d = p[0];
+	return e;
+}
+
+/* o's property p -> d */
+static VM_NOINLINE int aot_getp(Val *d, const Val *o, int p)
+{
+	vcopy(d, o);
+	return op_getp(d, p);
+}
+
+/* the commonest natives (as native() has them), from their arguments where
+ * they are */
+static VM_NOINLINE void aot_float(Val *d, const Val *a)
+{
+	const float f = a->t == T_STR ? (float)atof(a->s) : num(*a);
+	d->f = f;
+	d->t = T_FLOAT;
+}
+
+static VM_NOINLINE void aot_int(Val *d, const Val *a)
+{
+	const int i = a->t == T_STR ? atoi(a->s) : inum(*a);
+	d->i = i;
+	d->t = T_INT;
+}
+
+static VM_NOINLINE void aot_abs(Val *d, const Val *a)
+{
+	if (a->t == T_INT) {
+		const int i = a->i < 0 ? -a->i : a->i;
+		d->i = i;
+		d->t = T_INT;
+	} else {
+		const float f = fabsf(num(*a));
+		d->f = f;
+		d->t = T_FLOAT;
+	}
+}
+
+static VM_NOINLINE void aot_len(Val *d, const Val *a)
+{
+	const int n = a->t == T_STR ? (int)strlen(a->s) : (is_arr(*a) ? alen(*a) : 0);
+	d->i = n;
+	d->t = T_INT;
+}
+
+static VM_NOINLINE void aot_vec3(Val *d, const Val *a, const Val *b, const Val *c)
+{
+	const float x = num(*a), y = num(*b), z = num(*c);
+	d->v[0] = x;
+	d->v[1] = y;
+	d->v[2] = z;
+	d->t = T_VEC3;
+}
+
+#define AOT_PROLOGUE(nloc) \
+	Val *const S = L + (nloc); \
+	Val ret; \
+	ret.t = T_NIL; \
+	ret.v[0] = ret.v[1] = ret.v[2] = 0.0f; \
+	const unsigned sb = (unsigned)(S - stk); \
+	(void)sb; \
+	(void)spv; \
+	(void)mb
+#define AOT_EPILOGUE() \
+	done: \
+	return ret
+#define A_SYNC(n) (*spv = sb + (n))
+static const Val k_vnil = { T_NIL, { 0 } };
+#define A_ZERO(v) \
+	do { \
+		vword *w_ = (vword *)&(v); \
+		w_[0] = 0; \
+		w_[1] = 0; \
+		w_[2] = 0; \
+		w_[3] = 0; \
+	} while (0)
+#define A_CHECK() \
+	if (s_err[0]) \
+	goto done
+#define A_MSTORE(d, m) \
+	do { \
+		if (S[d].t == T_STR) { \
+			op_mstore((unsigned)(mb + (m) - s_mem), &S[d]); \
+		} else { \
+			vcopy(&mb[m], &S[d]); \
+		} \
+	} while (0)
+#define A_SELF(d) \
+	do { \
+		S[d].t = T_NODE; \
+		S[d].i = s_inst[inst].node; \
+	} while (0)
+#define A_NODEREF(d, r) op_noderef(&S[d], inst, (r))
+#define A_SETP(d, p) \
+	do { \
+		if (op_setp(&S[d], (p))) \
+			goto done; \
+	} while (0)
+#define A_ARITH(d, op) \
+	do { \
+		if (op_arith((op), &S[d])) \
+			goto done; \
+	} while (0)
+#define A_NEG(d) op_neg(&S[d])
+#define A_IN(d) \
+	do { \
+		A_SYNC((d) + 1); \
+		if (op_in(&S[d], inst)) \
+			goto done; \
+	} while (0)
+#define A_BACK() \
+	do { \
+		if (++s_ops > GDIR_OPS_PER_FRAME) { \
+			fail("script ran too long in one frame (infinite loop?)"); \
+			goto done; \
+		} \
+	} while (0)
+#define A_DUP(d) vcopy(&S[d], &S[(d) - 1])
+#define A_CALL(d, fn, argc) \
+	do { \
+		if (++s_ops > GDIR_OPS_PER_FRAME) { \
+			fail("script ran too long in one frame (infinite loop?)"); \
+			goto done; \
+		} \
+		A_SYNC((d) + (argc)); \
+		const Val r_ = call(inst, s_cls[s_inst[inst].cls].first_func + (fn), &S[d], (argc)); \
+		S[d] = r_; \
+		A_CHECK(); \
+	} while (0)
+#define A_NATIVE(d, id, argc) \
+	do { \
+		A_SYNC((d) + (argc)); \
+		if (op_native(&S[d], inst, (id), (argc))) \
+			goto done; \
+	} while (0)
+#define A_ARRAY(d, cnt) \
+	do { \
+		A_SYNC((d) + (cnt)); \
+		if (op_array(&S[d], (cnt))) \
+			goto done; \
+	} while (0)
+#define A_SETINDEX(d) \
+	do { \
+		if (op_setindex(&S[d])) \
+			goto done; \
+	} while (0)
+
+#include "gdir_aot.inc"
+
+/* the compiled functions, if the program is the one they were compiled from:
+ * the FNV-1a of its constants, classes and code ([p, e), as gdiraot.go's) */
+static void aot_bind(const unsigned char *p, const unsigned char *e)
+{
+	memset(s_aot, 0, sizeof(s_aot));
+	s_aot_n = 0;
+	unsigned h = 2166136261u;
+	for (; p < e; p++) {
+		h = (h ^ *p) * 16777619u;
+	}
+	if (h != GDIR_AOT_HASH || s_fn_n != GDIR_AOT_FUNCS) {
+		printf("GDIR: compiled scripts are for another program; interpreting\n");
+		return;
+	}
+	for (unsigned i = 0; i < sizeof(k_aot) / sizeof(k_aot[0]); i++) {
+		if (k_aot[i].fn < s_fn_n && s_fn[k_aot[i].fn].need != 0xffff) {
+			s_aot[k_aot[i].fn] = k_aot[i].f;
+			s_aot_n++;
+		}
+	}
+	printf("GDIR: %u function(s) compiled to C\n", s_aot_n);
+}
+#endif
+#endif
 
 static Val call(unsigned inst, unsigned func, const Val *args, int argc)
 {
@@ -2255,6 +2579,11 @@ static Val call(unsigned inst, unsigned func, const Val *args, int argc)
 	s_depth++;
 #ifdef GDIR_STATS
 	const unsigned ops0 = s_ops;
+#ifdef GDIR_CLOCK
+	const unsigned child0 = s_child_ticks;
+	s_child_ticks = 0;
+	const unsigned t0 = GDIR_CLOCK();
+#endif
 #endif
 	Val *const mb = s_mem + s_inst_mem[inst]; /* members */
 	const unsigned char *const code = s_code;
@@ -2264,6 +2593,16 @@ static Val call(unsigned inst, unsigned func, const Val *args, int argc)
 	 * calls (what a runaway script repeats), which keeps the loop lean */
 	unsigned nops = 0; /* counted since s_ops was last brought up to date */
 	Val ret = vnil();
+#ifdef GDIR_AOT_ON
+	if (s_aot[func]) {
+		(void)sp;
+		(void)code;
+		(void)code_n;
+		(void)pc;
+		ret = s_aot[func](inst, lb, stk, spv, mb);
+		goto done;
+	}
+#endif
 #define VM_SYNC() (*spv = (unsigned)(sp - stk))
 #define VM_CHECK() \
 	if (s_err[0]) \
@@ -2393,7 +2732,7 @@ static Val call(unsigned inst, unsigned func, const Val *args, int argc)
 				} else if ((ta == T_FLOAT || ta == T_INT) && (tb == T_FLOAT || tb == T_INT)) {
 					const float x = ta == T_FLOAT ? a[0].f : (float)a[0].i;
 					const float y = tb == T_FLOAT ? a[1].f : (float)a[1].i;
-					c = x < y ? -1 : (x > y ? 1 : 0);
+					c = fcmp(x, y);
 				} else {
 					sp--;
 					VM_SYNC();
@@ -2549,6 +2888,13 @@ done:
 	s_ops += nops;
 #ifdef GDIR_STATS
 	s_fn_ops[func] += s_ops - ops0;
+#ifdef GDIR_CLOCK
+	{
+		const unsigned dt = (GDIR_CLOCK() - t0) & 0xffff;
+		s_fn_self[func] += dt > s_child_ticks ? dt - s_child_ticks : 0;
+		s_child_ticks = child0 + dt;
+	}
+#endif
 #endif
 	*spv = base;
 	s_depth--;
@@ -2845,6 +3191,9 @@ int gdir_vm_init(const unsigned char *b, unsigned sz)
 	s_code = p;
 	p += s_code_n;
 	plan_stacks();
+#ifdef GDIR_AOT_ON
+	aot_bind(b + 12, s_code + s_code_n);
+#endif
 	const unsigned npk = ru16(p);
 	p += 2;
 	memset(s_pack, 0, sizeof(s_pack));
@@ -2962,9 +3311,67 @@ void gdir_vm_process(float delta)
 	s_recompute_ticks += (GDIR_CLOCK() - tr0) & 0xffff;
 #endif
 	s_ops_last = s_ops;
+#ifdef GDIR_TRACE
+	/* a hash of the members every 30 frames of a pack, to compare two
+	 * builds (the interpreter and the compiled scripts) run for run: give
+	 * both a fixed delta */
+	{
+		static int pack = -9;
+		static unsigned n;
+		if (s_cur != pack) {
+			pack = s_cur;
+			n = 0;
+		}
+		if (++n % 30 == 0) {
+			unsigned h = 2166136261u;
+			for (unsigned i = 0; i < s_mem_n; i++) {
+				const Val &v = s_mem[i];
+				unsigned w[4] = { v.t, 0, 0, 0 };
+				if (v.t == T_STR) {
+					for (const char *c = v.s; c && *c; c++) {
+						h = (h ^ (unsigned char)*c) * 16777619u;
+					}
+				} else if (v.t == T_ARR && v.i >= 0 && v.i < GDIR_ARRAYS) {
+					for (unsigned e = 0; e < s_arr_n[v.i]; e++) {
+						unsigned x;
+						memcpy(&x, &s_arr[v.i][e].i, 4);
+						h = (h ^ s_arr[v.i][e].t) * 16777619u;
+						h = (h ^ (s_arr[v.i][e].t == T_STR ? 0 : x)) * 16777619u;
+					}
+				} else if (v.t != T_NIL) {
+					memcpy(&w[1], &v.i, 4);
+					if (v.t == T_VEC2 || v.t == T_VEC3) {
+						memcpy(&w[2], &v.v[1], 8);
+					}
+				}
+				for (int k = 0; k < 4; k++) {
+					h = (h ^ w[k]) * 16777619u;
+				}
+			}
+			printf("GDIR trace %d/%u: %08x\n", s_cur, n, h);
+		}
+	}
+#endif
 #ifdef GDIR_STATS
 	{
 		static unsigned peak, frames;
+		static int spack = -9;
+		if (s_cur != spack) {
+			/* each pack's reports from its first frame (a run's reports
+			 * then line up with another's) */
+			spack = s_cur;
+			frames = 0;
+			peak = 0;
+			memset(s_fn_ops, 0, sizeof(s_fn_ops));
+#ifdef GDIR_CLOCK
+			memset(s_fn_self, 0, sizeof(s_fn_self));
+			memset(s_nat_time, 0, sizeof(s_nat_time));
+			memset(s_nat_calls, 0, sizeof(s_nat_calls));
+			s_st_computed = s_st_sent = 0;
+			s_recompute_ticks = 0;
+			s_script_ticks = 0;
+#endif
+		}
 		if (s_ops > peak) {
 			peak = s_ops;
 		}
@@ -2989,6 +3396,23 @@ void gdir_vm_process(float delta)
 			}
 			memset(s_fn_ops, 0, sizeof(s_fn_ops));
 #ifdef GDIR_CLOCK
+			/* where the time goes: the 16 heaviest by their own ticks */
+			for (int top = 0; top < 16; top++) {
+				unsigned best = 0, bi = 0;
+				for (unsigned f = 0; f < s_fn_n; f++) {
+					if (s_fn_self[f] > best) {
+						best = s_fn_self[f];
+						bi = f;
+					}
+				}
+				if (!best) {
+					break;
+				}
+				const Val nm = s_fn[bi].name < s_k_n ? s_k[s_fn[bi].name] : vnil();
+				printf("  self %3u %-16s %u ticks/frame\n", bi, nm.t == T_STR ? nm.s : "?", best / 300);
+				s_fn_self[bi] = 0;
+			}
+			memset(s_fn_self, 0, sizeof(s_fn_self));
 			printf("  node pass          %u ticks/frame (%u worlds computed, %u sent per frame)\n", s_recompute_ticks / 300,
 					s_st_computed / 300, s_st_sent / 300);
 			printf("  scripts            %u ticks/frame\n", s_script_ticks / 300);

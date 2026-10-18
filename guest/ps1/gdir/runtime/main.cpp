@@ -151,7 +151,11 @@ int main(int argc, const char **argv)
 		const int t0 = VSync(-1);
 #endif
 		if (gdir) {
+#ifdef P1_FIXED_DELTA
+			gdir_vm_process(P1_FIXED_DELTA);
+#else
 			gdir_vm_process((float)fields / hz);
+#endif
 			const char *err = gdir_vm_error();
 			if (err && err[0]) {
 				halt(err);
@@ -173,8 +177,9 @@ int main(int argc, const char **argv)
 			HeapUsage hu;
 			GetHeapUsage(&hu);
 			seq[60] = 0;
-			printf("P1 time: vm %d draw %d fields per 60 frames; heap %u of %u bytes in use (peak %u)\n", t_vm, t_draw,
-					(unsigned)hu.alloc, (unsigned)hu.heap, (unsigned)hu.alloc_max);
+			printf("P1 time: vm %d draw %d fields per 60 frames; heap %u of %u bytes in use (peak %u, %u past the peak)\n", t_vm,
+					t_draw, (unsigned)hu.alloc, (unsigned)hu.heap, (unsigned)hu.alloc_max,
+					(unsigned)(hu.total > hu.alloc_max ? hu.total - hu.alloc_max : 0));
 			printf("P1 fields: %s\n", seq);
 			t_vm = t_draw = t_n = 0;
 		}

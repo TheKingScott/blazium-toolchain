@@ -68,6 +68,16 @@ func (t *Tool) Build(ctx context.Context, opts platforms.BuildOptions) error {
 		if err := guest.InstallGDIR(src); err != nil {
 			return err
 		}
+		// the scripts' per-frame functions as C, from the export beside --out
+		if opts.Out != "" {
+			n, bytes, err := writeAOT(filepath.Dir(opts.Out), src)
+			if err != nil {
+				return report.Fail("compiling the scripts to C: "+err.Error(), "BLAZIUM_PS1_AOT_BYTES=0 builds without")
+			}
+			if n > 0 && opts.Stdout != nil {
+				fmt.Fprintf(opts.Stdout, "scripts: %d function(s), %d bytes of GDIR compiled to C\n", n, bytes)
+			}
+		}
 	} else if src == "" && sample != "" {
 		src, err = resolveSample(opts.Prefix, sample)
 		if err != nil {
