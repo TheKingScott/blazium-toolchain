@@ -1534,8 +1534,14 @@ static Val native(unsigned inst, int id, Val *a, int n)
 			return vvec(T_VEC2, x, y, 0.0f);
 		}
 		case GN_HAS_FEATURE:
+			/* a guest running the PS2's scenes elsewhere names itself too
+			 * (the PS1 build defines GDIR_FEATURE "ps1") */
 			return vbool(a[0].t == T_STR && (strcmp(a[0].s, "ps2") == 0 || strcmp(a[0].s, "release") == 0 ||
-													strcmp(a[0].s, "template") == 0));
+													strcmp(a[0].s, "template") == 0
+#ifdef GDIR_FEATURE
+													|| strcmp(a[0].s, GDIR_FEATURE) == 0
+#endif
+													));
 		case GN_CHANGE_SCENE:
 		case GN_CHANGE_SCENE_FADE: {
 			int pk = -1;

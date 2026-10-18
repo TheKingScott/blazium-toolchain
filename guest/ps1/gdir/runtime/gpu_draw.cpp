@@ -28,6 +28,11 @@
 #define SCR_H 240
 #define HUD_W 640.0f
 #define HUD_H 448.0f
+/* The PS2's 448 lines go onto the middle 224 of the PS1's 240: a TV (and
+ * an emulator's overscan crop) hides about 8 lines top and bottom. With
+ * that, one PS2 pixel is half a PS1 pixel both ways, and the 3D framing
+ * needs no squeeze: the projection distance is 112 lines over tan(fov/2). */
+#define SAFE_Y 8
 #define OT_LEN 1024
 #define PRIM_BYTES (96 * 1024)
 #define MAX_TEX 64
@@ -882,7 +887,14 @@ static int hx(float x)
 
 static int hy(float y)
 {
-	return (int)(y * ((float)SCR_H / HUD_H));
+	/* full-height panels still reach the screen's edges */
+	if (y <= 0.0f) {
+		return 0;
+	}
+	if (y >= HUD_H) {
+		return SCR_H;
+	}
+	return SAFE_Y + (int)(y * ((float)(SCR_H - 2 * SAFE_Y) / HUD_H));
 }
 
 static void hud_rect(uint32_t *ot, int x0, int y0, int x1, int y1, int r, int g, int b)
@@ -954,10 +966,23 @@ static void hud_text(uint32_t *ot, const HudQuad *h, int r, int g, int b)
 	if (h->styled && h->kind != 1) {
 		y_ps2 = h->y + (h->h - (lines * line_ps2 - 2 * sc)) / 2;
 	}
+	/* 3x5 text sits a line up: its 5 rows are taller than the PS2's 9-line
+	 * pitch at half scale, and it must clear outlines drawn round it */
+	const int lift = px ? 0 : 1;
+	const int min_pitch = px ? 8 * px : 6;
+	int last_y = -1000;
 	while (*t) {
 		int n = 0;
 		while (t[n] && t[n] != '\n') {
 			n++;
+		}
+		/* lines keep the PS2's place, but never closer than the font needs */
+		int ly = hy((float)y_ps2) - lift;
+		if (n > 0 && ly < last_y + min_pitch) {
+			ly = last_y + min_pitch;
+		}
+		if (n > 0) {
+			last_y = ly;
 		}
 		const int width = n * adv - (px ? px : 1);
 		int x = bx + 1;
@@ -968,7 +993,7 @@ static void hud_text(uint32_t *ot, const HudQuad *h, int r, int g, int b)
 		}
 		for (int k = 0; k < n; k++) {
 			if (t[k] != ' ') {
-				hud_glyph(ot, x + k * adv, hy((float)y_ps2), (unsigned char)t[k], r, g, b, px);
+				hud_glyph(ot, x + k * adv, ly, (unsigned char)t[k], r, g, b, px);
 			}
 		}
 		t += n;
@@ -1045,9 +1070,11 @@ void gs_draw_scene(void)
 		DrawCtx c;
 		memset(&c, 0, sizeof(c));
 		const float half = tanf(g_fov * 0.5f * 3.14159265f / 180.0f);
-		c.h = ((float)SCR_H * 0.5f) / (half > 0.01f ? half : 0.01f);
-		c.tan_y = half;
-		c.tan_x = half * (float)SCR_W / (float)SCR_H;
+		const float half_px = (float)SCR_H * 0.5f - (float)SAFE_Y;
+		c.h = half_px / (half > 0.01f ? half : 0.01f);
+		/* the whole 320x240 is drawn: cull against all of it */
+		c.tan_y = half * ((float)SCR_H * 0.5f) / half_px;
+		c.tan_x = half * ((float)SCR_W * 0.5f) / half_px;
 		c.far_m = g_fog_on ? g_fog_far : 400.0f;
 		const float max_far = 60000.0f / (float)g_scale;
 		if (c.far_m > max_far) {
@@ -1066,12 +1093,6 @@ void gs_draw_scene(void)
 		c.tany_fx = (int32_t)(c.tan_y * 4096.0f);
 		float view[12];
 		view_matrix(view);
-		/* The cook frames scenes for the PS2's 640x448 (aspect 640/448);
-		 * squeeze X so the PS1's 320x240 shows the same picture (the GTE
-		 * has one projection distance for both axes). */
-		for (int k = 0; k < 4; k++) {
-			view[k] *= ((float)SCR_W / (float)SCR_H) / (640.0f / 448.0f);
-		}
 		draw_scene_mesh(&c, view);
 		tris = c.tris;
 		static unsigned frames;

@@ -21,6 +21,7 @@ target_compile_options(runtime PRIVATE -O2 $<$<COMPILE_LANGUAGE:CXX>:-fno-except
 # the GDIR VM's tables sized for 2 MiB, and the PS2 budgets as the PS1's
 target_compile_definitions(runtime PRIVATE
 	BLAZIUM_PS1_GDIR=1
+	GDIR_FEATURE="ps1"
 	BLAZIUM_PS2_COOK_ABI=1
 	GDIR_MAX_NODES=256
 	GDIR_MAX_CONSTS=4096
