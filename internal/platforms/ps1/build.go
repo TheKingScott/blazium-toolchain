@@ -159,7 +159,7 @@ func (t *Tool) Build(ctx context.Context, opts platforms.BuildOptions) error {
 		"-G", "Ninja",
 		"-DCMAKE_TOOLCHAIN_FILE=" + sdkFile,
 		"-DPSN00BSDK_TC=" + env["PSN00BSDK_TC"],
-		"-DCMAKE_BUILD_TYPE=Debug",
+		"-DCMAKE_BUILD_TYPE=" + buildType(sample),
 		"-DCMAKE_MAKE_PROGRAM=" + ninja,
 	}
 	if opts.Tim != "" {
@@ -312,6 +312,20 @@ func (t *Tool) findHostTool(prefix, id, command string) string {
 		return p
 	}
 	return lookFile(command)
+}
+
+// buildType is the CMake configuration. PSn00bSDK's Debug adds -Og after a
+// project's own flags and links the debug libraries; the GDIR guest (a
+// script interpreter and a renderer on a 33 MHz CPU) builds as Release
+// (-O2). BLAZIUM_PS1_BUILD_TYPE overrides either.
+func buildType(sample string) string {
+	if v := strings.TrimSpace(os.Getenv("BLAZIUM_PS1_BUILD_TYPE")); v != "" {
+		return v
+	}
+	if sample == "gdir" {
+		return "Release"
+	}
+	return "Debug"
 }
 
 func resolveSample(prefix, sample string) (string, error) {

@@ -181,6 +181,17 @@ static unsigned char s_lstale[GDIR_MAX_NODES]; /* s_local needs mat_from_trs */
 static unsigned s_wver[GDIR_MAX_NODES];
 static unsigned s_pver[GDIR_MAX_NODES];
 static unsigned s_sent[GDIR_MAX_NODES];
+static unsigned char s_vis_sent[GDIR_MAX_NODES]; /* the visibility the renderer has */
+static unsigned char s_lident[GDIR_MAX_NODES]; /* s_local is the identity */
+
+/* Whether the renderer draws anything with a node's matrix. A guest
+ * renderer that knows (the PS1's) defines this; otherwise every node's
+ * matrix is sent. */
+extern "C" int gs_draw_node_drawn(int node) __attribute__((weak));
+static int node_drawn(int n)
+{
+	return gs_draw_node_drawn ? gs_draw_node_drawn(n) : 1;
+}
 static float s_local[GDIR_MAX_NODES][12];
 static unsigned char s_all_dirty = 1;
 
@@ -692,8 +703,14 @@ static int node_stale(int n)
 }
 
 /* n's world from its parent's (already current) and its own transform */
+#ifdef GDIR_STATS
+static unsigned s_st_computed, s_st_sent, s_st_passes;
+#endif
 static void compute_one(int n)
 {
+#ifdef GDIR_STATS
+	s_st_computed++;
+#endif
 	PackNode *pn = &s_nodes[n];
 	const int p = node_parent(n);
 	if (!(pn->flags & 2)) {
@@ -709,8 +726,13 @@ static void compute_one(int n)
 		if (s_lstale[n]) {
 			mat_from_trs(pn->lpos, pn->lrot, pn->lscale, s_local[n]);
 			s_lstale[n] = 0;
+			const float *l = s_local[n];
+			s_lident[n] = l[0] == 1.0f && l[5] == 1.0f && l[10] == 1.0f && l[1] == 0.0f && l[2] == 0.0f && l[3] == 0.0f &&
+					l[4] == 0.0f && l[6] == 0.0f && l[7] == 0.0f && l[8] == 0.0f && l[9] == 0.0f && l[11] == 0.0f;
 		}
-		if (p >= 0) {
+		if (p >= 0 && s_lident[n]) {
+			memcpy(s_world[n], s_world[p], sizeof(s_world[n])); /* a child at its parent's origin */
+		} else if (p >= 0) {
 			mat_mul34(s_world[p], s_local[n], s_world[n]);
 		} else {
 			memcpy(s_world[n], s_local[n], sizeof(s_local[n]));
@@ -789,14 +811,24 @@ static void recompute_nodes(void)
 	s_all_dirty = 0;
 	for (unsigned n = 0; n < s_node_n; n++) {
 		const PackNode *pn = &s_nodes[n];
-		gs_draw_node_hidden((int)n, !s_vis[n]);
-		if (pn->hud >= 0) {
-			sys_io_hud_set_hidden(pn->hud, !s_vis[n]);
+		/* visibility only when it changed (or the pack is new) */
+		if (all || s_vis_sent[n] != s_vis[n]) {
+			s_vis_sent[n] = s_vis[n];
+			gs_draw_node_hidden((int)n, !s_vis[n]);
+			if (pn->hud >= 0) {
+				sys_io_hud_set_hidden(pn->hud, !s_vis[n]);
+			}
 		}
 		if (s_sent[n] == s_wver[n] && !all) {
 			continue; /* the renderer keeps the matrix it has */
 		}
 		s_sent[n] = s_wver[n];
+		if (!all && !node_drawn((int)n)) {
+			continue; /* nothing is drawn with it */
+		}
+#ifdef GDIR_STATS
+		s_st_sent++;
+#endif
 		if (!(pn->flags & 2)) {
 			gs_draw_node_matrix((int)n, 0);
 			continue;
@@ -2440,7 +2472,9 @@ void gdir_vm_process(float delta)
 			}
 			memset(s_fn_ops, 0, sizeof(s_fn_ops));
 #ifdef GDIR_CLOCK
-			printf("  node pass          %u ticks/frame\n", s_recompute_ticks / 300);
+			printf("  node pass          %u ticks/frame (%u worlds computed, %u sent per frame)\n", s_recompute_ticks / 300,
+					s_st_computed / 300, s_st_sent / 300);
+			s_st_computed = s_st_sent = 0;
 			s_recompute_ticks = 0;
 			/* the six natives that took the most time, ticks per frame */
 			for (int top = 0; top < 6; top++) {

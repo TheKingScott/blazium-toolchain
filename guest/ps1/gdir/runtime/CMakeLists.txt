@@ -12,7 +12,7 @@ project(
 )
 
 psn00bsdk_add_executable(runtime GPREL
-	main.cpp gpu_draw.cpp pad_io.cpp sfx_io.cpp mc_io.cpp ps1_libc.c
+	main.cpp ps1_float.c gpu_draw.cpp pad_io.cpp sfx_io.cpp mc_io.cpp ps1_libc.c
 	gdir_vm.cpp sys_io.cpp pack_io.cpp)
 # shim/ first: stdio.h (FILE over the CD), math.h and stdlib.h additions
 target_include_directories(runtime BEFORE PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/shim")

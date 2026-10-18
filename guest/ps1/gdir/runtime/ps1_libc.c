@@ -669,17 +669,10 @@ float fmodf(float x, float y)
 	return x - t * y;
 }
 
-/* sin on [-pi, pi]: reduce to [-pi/2, pi/2], then an odd polynomial */
-float sinf(float x)
+/* sin on [-pi, pi]: reduce to [-pi/2, pi/2], then an odd polynomial
+ * (fills the table below) */
+static float sin_poly(float x)
 {
-	if (x > P1_PI || x < -P1_PI) {
-		x = fmodf(x, P1_TAU);
-		if (x > P1_PI) {
-			x -= P1_TAU;
-		} else if (x < -P1_PI) {
-			x += P1_TAU;
-		}
-	}
 	if (x > P1_HALF_PI) {
 		x = P1_PI - x;
 	} else if (x < -P1_HALF_PI) {
@@ -689,9 +682,57 @@ float sinf(float x)
 	return x * (1.0f + x2 * (-0.16666667f + x2 * (0.0083333310f + x2 * (-0.00019840874f + x2 * 2.7525562e-6f))));
 }
 
+/* sinf/cosf by table: 1024 steps a turn of sin in 2.30 (one extra entry to
+ * interpolate into), filled once; the angle goes to 16.16 turns with one
+ * float multiply, and the rest is integer work (the polynomial costs about
+ * ten software float operations a call) */
+#define SIN_STEPS 1024
+static int32_t s_sin_tab[SIN_STEPS + 1];
+static int s_sin_ready;
+
+static void sin_fill(void)
+{
+	for (int i = 0; i <= SIN_STEPS; i++) {
+		float a = (float)i * (P1_TAU / (float)SIN_STEPS);
+		if (a > P1_PI) {
+			a -= P1_TAU;
+		}
+		s_sin_tab[i] = (int32_t)(sin_poly(a) * 1073741824.0f);
+	}
+	s_sin_ready = 1;
+}
+
+static float sin_turns(uint32_t ph)
+{
+	/* ph: a turn is 1 << 26; table index in the top 10 bits, 16 bits of
+	 * fraction below */
+	if (!s_sin_ready) {
+		sin_fill();
+	}
+	const uint32_t i = (ph >> 16) & (SIN_STEPS - 1);
+	const int32_t f = (int32_t)(ph & 0xffff);
+	const int32_t a = s_sin_tab[i], b = s_sin_tab[i + 1];
+	const int32_t v = a + (int32_t)(((int64_t)(b - a) * f) >> 16);
+	return (float)v * (1.0f / 1073741824.0f);
+}
+
+static uint32_t to_turns(float x)
+{
+	if (x > 150.0f || x < -150.0f) {
+		x = fmodf(x, P1_TAU); /* keeps x * 2^26 / 2 pi inside 32 bits */
+	}
+	/* 1 << 26 per 2 pi; the 32-bit phase wraps every 64 turns */
+	return (uint32_t)(int32_t)(x * 10680707.43f);
+}
+
+float sinf(float x)
+{
+	return sin_turns(to_turns(x));
+}
+
 float cosf(float x)
 {
-	return sinf(x + P1_HALF_PI);
+	return sin_turns(to_turns(x) + (1u << 24)); /* a quarter turn on */
 }
 
 float tanf(float x)

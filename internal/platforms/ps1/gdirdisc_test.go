@@ -88,3 +88,14 @@ func TestGDIRDiscFilesAndXML(t *testing.T) {
 		t.Error("SYSTEM.CNF")
 	}
 }
+
+func TestBuildType(t *testing.T) {
+	t.Setenv("BLAZIUM_PS1_BUILD_TYPE", "")
+	if buildType("gdir") != "Release" || buildType("") != "Debug" || buildType("template") != "Debug" {
+		t.Fatal("build types")
+	}
+	t.Setenv("BLAZIUM_PS1_BUILD_TYPE", "Debug")
+	if buildType("gdir") != "Debug" {
+		t.Fatal("override")
+	}
+}
