@@ -70,20 +70,23 @@ static int g_tex_n;
 static const uint8_t *g_mesh;
 static unsigned g_mesh_sz;
 static int g_scale = 1024;
-static unsigned g_vert_n, g_tri_n, g_chunk_n;
-/* P1MS v2: both 4-byte aligned, the vertex position is a GTE SVECTOR */
+static unsigned g_vert_n, g_prim_n, g_chunk_n;
+/* P1MS v3 (internal/platforms/ps1/gdirpack.go): the vertex position is a GTE
+ * SVECTOR; a primitive is a triangle (d 0xffff) or a quad a,b,c,d (the GPU
+ * draws a,b,c and b,c,d) */
 struct P1Vert {
 	SVECTOR p;
 	uint8_t r, g, b, pad;
 };
-struct P1Tri {
-	uint16_t a, b, c;
-	uint8_t uv[6];
+struct P1Prim {
+	uint16_t a, b, c, d;
+	uint8_t uv[8];
 	uint8_t tex, flags;
 	uint16_t pad;
 };
+#define CHUNK_SZ 28 /* first u32, quads u16, node u16, sphere f32 x4, triangles u16, pad */
 static const P1Vert *g_verts;
-static const P1Tri *g_tris;
+static const P1Prim *g_prims;
 static const uint8_t *g_chunks;
 /* each chunk's sphere in mesh units, for culling with the GTE */
 struct ChunkI {
@@ -492,7 +495,7 @@ static void parse_extras(const uint8_t *b, unsigned sz)
 		}
 	}
 	for (unsigned ci = 0; ci < g_chunk_n; ci++) {
-		const unsigned nd = rd16(g_chunks + ci * 24 + 6);
+		const unsigned nd = rd16(g_chunks + ci * CHUNK_SZ + 6);
 		if (nd >= MAX_NODES || !g_isrc[nd]) {
 			continue;
 		}
@@ -574,9 +577,9 @@ static void build_groups(void)
 	const int32_t max_r = 80 * g_scale; /* a run wider than ~160 m is split */
 	unsigned ci = 0;
 	while (ci < g_chunk_n) {
-		const unsigned node = rd16(g_chunks + ci * 24 + 6);
+		const unsigned node = rd16(g_chunks + ci * CHUNK_SZ + 6);
 		unsigned n = 1;
-		while (n < 16 && ci + n < g_chunk_n && rd16(g_chunks + (ci + n) * 24 + 6) == node) {
+		while (n < 16 && ci + n < g_chunk_n && rd16(g_chunks + (ci + n) * CHUNK_SZ + 6) == node) {
 			n++;
 		}
 		ChunkG *g = &g_grp[g_grp_n];
@@ -596,7 +599,7 @@ static void build_groups(void)
 
 static int parse_mesh(const uint8_t *b, unsigned sz)
 {
-	if (!b || sz < 32 || memcmp(b, "P1MS", 4) != 0 || rd16(b + 4) != 2 || ((uintptr_t)b & 3)) {
+	if (!b || sz < 32 || memcmp(b, "P1MS", 4) != 0 || rd16(b + 4) != 3 || ((uintptr_t)b & 3)) {
 		return 0;
 	}
 	g_scale = rd16(b + 6);
@@ -604,29 +607,40 @@ static int parse_mesh(const uint8_t *b, unsigned sz)
 		g_scale = 1;
 	}
 	g_vert_n = rd32(b + 8);
-	g_tri_n = rd32(b + 12);
+	g_prim_n = rd32(b + 12);
 	g_chunk_n = rd32(b + 16);
 	const unsigned extras = rd32(b + 20);
 	unsigned off = 32;
 	g_verts = (const P1Vert *)(b + off);
 	off += g_vert_n * sizeof(P1Vert);
-	g_tris = (const P1Tri *)(b + off);
-	off += g_tri_n * sizeof(P1Tri);
+	g_prims = (const P1Prim *)(b + off);
+	off += g_prim_n * sizeof(P1Prim);
 	off = (off + 3) & ~3u;
 	g_chunks = b + off;
-	off += g_chunk_n * 24;
+	off += g_chunk_n * CHUNK_SZ;
 	if (off + extras > sz) {
 		return 0;
 	}
 	g_mesh = b;
 	g_mesh_sz = sz;
+	/* a corner past the vertices (a damaged file) is pointed at vertex 0,
+	 * so the draw loops need not check */
+	{
+		P1Prim *pp = (P1Prim *)g_prims;
+		for (unsigned i = 0; i < g_prim_n; i++) {
+			if (pp[i].a >= g_vert_n) pp[i].a = 0;
+			if (pp[i].b >= g_vert_n) pp[i].b = 0;
+			if (pp[i].c >= g_vert_n) pp[i].c = 0;
+			if (pp[i].d != 0xffff && pp[i].d >= g_vert_n) pp[i].d = 0;
+		}
+	}
 	free(g_cint);
 	g_cint = (ChunkI *)malloc(sizeof(ChunkI) * (g_chunk_n ? g_chunk_n : 1));
 	if (!g_cint) {
 		return 0;
 	}
 	for (unsigned ci = 0; ci < g_chunk_n; ci++) {
-		const uint8_t *ch = g_chunks + ci * 24;
+		const uint8_t *ch = g_chunks + ci * CHUNK_SZ;
 		const float sc = (float)g_scale;
 		g_cint[ci].c.vx = (int16_t)(rdf(ch + 8) * sc);
 		g_cint[ci].c.vy = (int16_t)(rdf(ch + 12) * sc);
@@ -639,7 +653,7 @@ static int parse_mesh(const uint8_t *b, unsigned sz)
 	parse_extras(b + off, extras);
 	memset(g_ndrawn, 0, sizeof(g_ndrawn));
 	for (unsigned ci = 0; ci < g_chunk_n; ci++) {
-		const unsigned nd = rd16(g_chunks + ci * 24 + 6);
+		const unsigned nd = rd16(g_chunks + ci * CHUNK_SZ + 6);
 		if (nd < MAX_NODES) {
 			g_ndrawn[nd] = 1;
 		}
@@ -907,7 +921,7 @@ static int sphere_visible(const DrawCtx *c, const SVECTOR *centre, int32_t r0, i
 	if (r0 < 0) {
 		return 0;
 	}
-	const int32_t r = (int32_t)(((int64_t)r0 * sc_fx) >> 12);
+	const int32_t r = sc_fx == 4096 ? r0 : (int32_t)(((int64_t)r0 * sc_fx) >> 12);
 	VECTOR v;
 	gte_ldv0(centre);
 	gte_rt();
@@ -915,11 +929,21 @@ static int sphere_visible(const DrawCtx *c, const SVECTOR *centre, int32_t r0, i
 	if (v.vz + r < c->near_u || v.vz - r > c->far_u) {
 		return 0;
 	}
+	/* 32-bit (a 64-bit multiply is a libgcc call): zr < 2^20 here (far_u
+	 * plus a radius), tangents < 2^14 */
 	const int32_t zr = v.vz + r;
-	const int32_t lim_x = (int32_t)(((int64_t)zr * c->tanx_fx) >> 12) + r;
-	const int32_t lim_y = (int32_t)(((int64_t)zr * c->tany_fx) >> 12) + r;
+	const int32_t lim_x = (((zr >> 4) * c->tanx_fx) >> 8) + r;
+	const int32_t lim_y = (((zr >> 4) * c->tany_fx) >> 8) + r;
 	if (v.vx > lim_x || -v.vx > lim_x || v.vy > lim_y || -v.vy > lim_y) {
 		return 0;
+	}
+	/* 2: wholly inside the view, near to far (each chunk in it is too) */
+	const int32_t zn = v.vz - r;
+	if (zn >= c->near_u && zr <= c->far_u) {
+		const int32_t ix = (((zn >> 4) * c->tanx_fx) >> 8) - r, iy = (((zn >> 4) * c->tany_fx) >> 8) - r;
+		if (v.vx <= ix && -v.vx <= ix && v.vy <= iy && -v.vy <= iy) {
+			return 2;
+		}
 	}
 	return 1;
 }
@@ -954,31 +978,36 @@ static inline void ot_append(int idx, void *first, void *last)
  * through the GTE once (RTPS) and kept in the scratchpad, 1 KiB of
  * one-cycle RAM, until the matrix changes. Direct-mapped by index. */
 struct VCache {
-	uint16_t tag; /* vertex index, 0xffff empty */
-	uint16_t sz;
+	uint32_t tag; /* vertex index | the matrix's generation << 16 */
 	DVECTOR sxy;
+	int32_t sz;
 };
-#define VC_N 128
+#define VC_N 64 /* 12 bytes each: 768 of the scratchpad's 1024 */
 #define g_vc ((VCache *)0x1f800000)
+static uint32_t g_vc_gen; /* bumped when the matrix changes: no clearing */
 
 static void vc_clear(void)
 {
-	for (int i = 0; i < VC_N; i++) {
-		g_vc[i].tag = 0xffff;
+	g_vc_gen += 0x10000;
+	if (!g_vc_gen) {
+		/* wrapped: old tags could match again */
+		for (int i = 0; i < VC_N; i++) {
+			g_vc[i].tag = 0xffffffffu;
+		}
+		g_vc_gen = 0x10000;
 	}
 }
 
 static inline const VCache *vc_get(unsigned i, const P1Vert *v)
 {
 	VCache *e = &g_vc[i & (VC_N - 1)];
-	if (e->tag != i) {
+	const uint32_t tag = i | g_vc_gen;
+	if (e->tag != tag) {
 		gte_ldv0(&v->p);
 		gte_rtps();
 		gte_stsxy(&e->sxy);
-		int32_t z;
-		gte_stsz(&z);
-		e->sz = (uint16_t)z;
-		e->tag = (uint16_t)i;
+		gte_stsz(&e->sz);
+		e->tag = tag;
 	}
 	return e;
 }
@@ -991,147 +1020,28 @@ struct CV {
 	int32_t r, g, b, u, v; /* colour and texel, 8.8 */
 };
 
-static CV cv_mid(const CV &a, const CV &b)
-{
-	CV m;
-	m.x = (a.x + b.x) / 2;
-	m.y = (a.y + b.y) / 2;
-	m.z = (a.z + b.z) / 2;
-	m.r = (a.r + b.r) / 2;
-	m.g = (a.g + b.g) / 2;
-	m.b = (a.b + b.b) / 2;
-	m.u = (a.u + b.u) / 2;
-	m.v = (a.v + b.v) / 2;
-	return m;
-}
-
-static CV cv_at_near(const CV &a, const CV &b, int32_t near_z)
-{
-	/* the point on a..b at z = near_z (a in front, b behind) */
-	const int32_t t = (int32_t)(((int64_t)(a.z - near_z) << 12) / (a.z - b.z));
-	CV m;
-	m.x = a.x + (int32_t)(((int64_t)(b.x - a.x) * t) >> 12);
-	m.y = a.y + (int32_t)(((int64_t)(b.y - a.y) * t) >> 12);
-	m.z = near_z;
-	m.r = a.r + (((b.r - a.r) * t) >> 12);
-	m.g = a.g + (((b.g - a.g) * t) >> 12);
-	m.b = a.b + (((b.b - a.b) * t) >> 12);
-	m.u = a.u + (((b.u - a.u) * t) >> 12);
-	m.v = a.v + (((b.v - a.v) * t) >> 12);
-	return m;
-}
-
-static int emit_cv(DrawCtx *c, const CV *v, const P1Tri *tr, int depth)
-{
-	int sx[3], sy[3];
-	const int32_t h = (int32_t)c->h;
-	for (int k = 0; k < 3; k++) {
-		if (v[k].z <= 0) {
-			return 0;
-		}
-		const int32_t ax = v[k].x < 0 ? -v[k].x : v[k].x, ay = v[k].y < 0 ? -v[k].y : v[k].y;
-		if (ax < 0x400000 && ay < 0x400000 && h < 512) {
-			/* fits 32 bits: no 64-bit divide */
-			sx[k] = SCR_W / 2 + (int)((v[k].x * h) / v[k].z);
-			sy[k] = SCR_H / 2 + (int)((v[k].y * h) / v[k].z);
-		} else {
-			sx[k] = SCR_W / 2 + (int)(((int64_t)v[k].x * h) / v[k].z);
-			sy[k] = SCR_H / 2 + (int)(((int64_t)v[k].y * h) / v[k].z);
-		}
-	}
-	int x0 = sx[0], x1 = sx[0], y0 = sy[0], y1 = sy[0];
-	for (int k = 1; k < 3; k++) {
-		x0 = sx[k] < x0 ? sx[k] : x0;
-		x1 = sx[k] > x1 ? sx[k] : x1;
-		y0 = sy[k] < y0 ? sy[k] : y0;
-		y1 = sy[k] > y1 ? sy[k] : y1;
-	}
-	if (x1 < 0 || x0 >= SCR_W || y1 < 0 || y0 >= SCR_H) {
-		return 0;
-	}
-	if ((x1 - x0 > 1000 || y1 - y0 > 500) && depth < 5) {
-		/* four halves-of-edges triangles */
-		const CV ab = cv_mid(v[0], v[1]), bc = cv_mid(v[1], v[2]), ca = cv_mid(v[2], v[0]);
-		const CV t0[3] = { v[0], ab, ca }, t1[3] = { ab, v[1], bc }, t2[3] = { ca, bc, v[2] }, t3[3] = { ab, bc, ca };
-		return emit_cv(c, t0, tr, depth + 1) + emit_cv(c, t1, tr, depth + 1) + emit_cv(c, t2, tr, depth + 1) +
-				emit_cv(c, t3, tr, depth + 1);
-	}
-	if (x1 - x0 > 1023 || y1 - y0 > 511) {
-		return 0;
-	}
-	/* front faces only (the GTE's NCLIP sign) */
-	const int64_t ncl = (int64_t)sx[0] * sy[1] + (int64_t)sx[1] * sy[2] + (int64_t)sx[2] * sy[0] - (int64_t)sx[0] * sy[2] -
-			(int64_t)sx[1] * sy[0] - (int64_t)sx[2] * sy[1];
-	if (ncl <= 0) {
-		return 0;
-	}
-	int idx = ((v[0].z + v[1].z + v[2].z) / 12) >> c->ot_shift;
-	if (idx >= OT_LEN) {
-		return 0;
-	}
-	if (idx < 1) {
-		idx = 1;
-	}
-	const unsigned tex = tr->tex;
-	if (tex < (unsigned)g_tex_n && g_tex[tex].ready) {
-		const Tex *tx = &g_tex[tex];
-		const unsigned need = sizeof(POLY_GT3) + (tx->tiled ? 2 * sizeof(DR_TWIN) : 0);
-		if (g_pp + need > g_pend) {
-			return 0;
-		}
-		POLY_GT3 *p = (POLY_GT3 *)g_pp;
-		g_pp += sizeof(POLY_GT3);
-		setPolyGT3(p);
-		setXY3(p, sx[0], sy[0], sx[1], sy[1], sx[2], sy[2]);
-		setRGB0(p, v[0].r >> 8, v[0].g >> 8, v[0].b >> 8);
-		setRGB1(p, v[1].r >> 8, v[1].g >> 8, v[1].b >> 8);
-		setRGB2(p, v[2].r >> 8, v[2].g >> 8, v[2].b >> 8);
-		setUV3(p, (v[0].u >> 8) + tx->u0, (v[0].v >> 8) + tx->v0, (v[1].u >> 8) + tx->u0, (v[1].v >> 8) + tx->v0,
-				(v[2].u >> 8) + tx->u0, (v[2].v >> 8) + tx->v0);
-		p->tpage = tx->tpage;
-		p->clut = tx->clut;
-		if (tx->tiled) {
-			DR_TWIN *on = (DR_TWIN *)g_pp;
-			DR_TWIN *off = on + 1;
-			g_pp += 2 * sizeof(DR_TWIN);
-			setlen(off, 1);
-			off->code[0] = 0xe2000000u;
-			setlen(on, 1);
-			on->code[0] = tx->twin;
-			catPrim(on, p);
-			catPrim(p, off);
-			ot_append(idx, on, off);
-		} else {
-			ot_append(idx, p, p);
-		}
-	} else {
-		if (g_pp + sizeof(POLY_G3) > g_pend) {
-			return 0;
-		}
-		POLY_G3 *p = (POLY_G3 *)g_pp;
-		g_pp += sizeof(POLY_G3);
-		setPolyG3(p);
-		setXY3(p, sx[0], sy[0], sx[1], sy[1], sx[2], sy[2]);
-		setRGB0(p, v[0].r >> 8, v[0].g >> 8, v[0].b >> 8);
-		setRGB1(p, v[1].r >> 8, v[1].g >> 8, v[1].b >> 8);
-		setRGB2(p, v[2].r >> 8, v[2].g >> 8, v[2].b >> 8);
-		ot_append(idx, p, p);
-	}
-	return 1;
-}
-
 /* a clipped polygon (inside the guard band, in front of the near plane):
  * each corner projected once, one facing test, then a fan of primitives */
-static int emit_poly(DrawCtx *c, const CV *v, int pn, const P1Tri *tr)
+static int emit_fan(DrawCtx *c, const CV *v, const int *sx, const int *sy, int pn, unsigned tex);
+
+static int emit_poly(DrawCtx *c, const CV *v, int pn, unsigned tex)
 {
 	int sx[9], sy[9];
 	const int32_t h = (int32_t)c->h;
-	int32_t zs = 0;
-	int x0 = 1 << 30, x1 = -(1 << 30), y0 = 1 << 30, y1 = -(1 << 30);
 	for (int k = 0; k < pn; k++) {
 		const int32_t z = v[k].z > 0 ? v[k].z : 1;
 		sx[k] = SCR_W / 2 + v[k].x * h / z;
 		sy[k] = SCR_H / 2 + v[k].y * h / z;
+	}
+	return emit_fan(c, v, sx, sy, pn, tex);
+}
+
+/* a convex polygon already projected (corners' z, colour and texel in v) */
+static int emit_fan(DrawCtx *c, const CV *v, const int *sx, const int *sy, int pn, unsigned tex)
+{
+	int32_t zs = 0;
+	int x0 = 1 << 30, x1 = -(1 << 30), y0 = 1 << 30, y1 = -(1 << 30);
+	for (int k = 0; k < pn; k++) {
 		zs += v[k].z;
 		x0 = sx[k] < x0 ? sx[k] : x0;
 		x1 = sx[k] > x1 ? sx[k] : x1;
@@ -1157,7 +1067,6 @@ static int emit_poly(DrawCtx *c, const CV *v, int pn, const P1Tri *tr)
 	if (idx < 1) {
 		idx = 1;
 	}
-	const unsigned tex = tr->tex;
 	const int textured = tex < (unsigned)g_tex_n && g_tex[tex].ready;
 	int n = 0;
 	for (int i = 1; i + 1 < pn; i++) {
@@ -1211,7 +1120,8 @@ static int emit_poly(DrawCtx *c, const CV *v, int pn, const P1Tri *tr)
 	return n;
 }
 
-static int draw_tri_slow(DrawCtx *c, const P1Vert *va, const P1Vert *vb, const P1Vert *vc, const P1Tri *tr)
+/* uv: the three corners' texel UVs (u, v each) */
+static int draw_tri_slow(DrawCtx *c, const P1Vert *va, const P1Vert *vb, const P1Vert *vc, const uint8_t *uv, unsigned tex)
 {
 	const P1Vert *src[3] = { va, vb, vc };
 	CV v[3];
@@ -1226,8 +1136,8 @@ static int draw_tri_slow(DrawCtx *c, const P1Vert *va, const P1Vert *vb, const P
 		v[k].r = src[k]->r << 8;
 		v[k].g = src[k]->g << 8;
 		v[k].b = src[k]->b << 8;
-		v[k].u = tr->uv[k * 2] << 8;
-		v[k].v = tr->uv[k * 2 + 1] << 8;
+		v[k].u = uv[k * 2] << 8;
+		v[k].v = uv[k * 2 + 1] << 8;
 	}
 	for (int k = 0; k < 3; k++) {
 		if (v[k].x > 0xfffff || v[k].x < -0xfffff || v[k].y > 0xfffff || v[k].y < -0xfffff || v[k].z > 0xfffff) {
@@ -1310,68 +1220,226 @@ static int draw_tri_slow(DrawCtx *c, const P1Vert *va, const P1Vert *vb, const P
 		in = out;
 		out = t;
 	}
-	return emit_poly(c, in, pn, tr);
+	return emit_poly(c, in, pn, tex);
 }
 
-static void draw_tris(DrawCtx *c, unsigned first, unsigned n)
+/* A triangle through the near plane, the quick way: clipped there in
+ * object space (32-bit sums: positions are int16), the pieces projected by
+ * the GTE (RTPS: no divides in software). A corner the GTE can't place on
+ * screen (its SX/SY saturate) or a piece too big for the GPU goes to the
+ * exact routine (draw_tri_slow). */
+struct NV {
+	int32_t x, y, z;    /* object space, mesh units */
+	int32_t vx, vy, vz; /* view space */
+	int32_t r, g, b, u, v;
+};
+
+static int draw_tri_near(DrawCtx *c, const P1Vert *va, const P1Vert *vb, const P1Vert *vc, const uint8_t *uv, unsigned tex)
+{
+	const P1Vert *src[3] = { va, vb, vc };
+	NV in[3];
+	int behind = 0;
+	for (int k = 0; k < 3; k++) {
+		VECTOR o;
+		gte_ldv0(&src[k]->p);
+		gte_rt();
+		gte_stlvnl(&o);
+		if (o.vx > 0xfffff || o.vx < -0xfffff || o.vy > 0xfffff || o.vy < -0xfffff || o.vz > 0xfffff || o.vz < -0xfffff) {
+			return draw_tri_slow(c, va, vb, vc, uv, tex);
+		}
+		in[k].x = src[k]->p.vx;
+		in[k].y = src[k]->p.vy;
+		in[k].z = src[k]->p.vz;
+		in[k].vx = o.vx;
+		in[k].vy = o.vy;
+		in[k].vz = o.vz;
+		in[k].r = src[k]->r;
+		in[k].g = src[k]->g;
+		in[k].b = src[k]->b;
+		in[k].u = uv[k * 2];
+		in[k].v = uv[k * 2 + 1];
+		behind += o.vz < c->near_u;
+	}
+	if (behind == 3) {
+		return 0;
+	}
+	/* the near plane: a triangle becomes a triangle or a quad */
+	NV out[4];
+	int pn = 0;
+	const int32_t nz = c->near_u;
+	for (int i = 0; i < 3; i++) {
+		const NV &a = in[i], &b = in[i + 1 < 3 ? i + 1 : 0];
+		const int32_t da = a.vz - nz, db = b.vz - nz;
+		if (da >= 0) {
+			out[pn++] = a;
+		}
+		if ((da >= 0) != (db >= 0)) {
+			int32_t na = da, nb = db;
+			while (na > 0x7ffff || na < -0x7ffff || nb > 0x7ffff || nb < -0x7ffff) {
+				na >>= 1;
+				nb >>= 1;
+			}
+			const int32_t t = (na << 12) / (na - nb); /* 0..4096 along a..b */
+			NV &m = out[pn++];
+			m.x = a.x + (((b.x - a.x) * t) >> 12);
+			m.y = a.y + (((b.y - a.y) * t) >> 12);
+			m.z = a.z + (((b.z - a.z) * t) >> 12);
+			m.vx = a.vx + (((b.vx - a.vx) >> 4) * t >> 8);
+			m.vy = a.vy + (((b.vy - a.vy) >> 4) * t >> 8);
+			m.vz = nz;
+			m.r = a.r + (((b.r - a.r) * t) >> 12);
+			m.g = a.g + (((b.g - a.g) * t) >> 12);
+			m.b = a.b + (((b.b - a.b) * t) >> 12);
+			m.u = a.u + (((b.u - a.u) * t) >> 12);
+			m.v = a.v + (((b.v - a.v) * t) >> 12);
+		}
+	}
+	if (pn < 3) {
+		return 0;
+	}
+	/* wholly outside a side of the view (beside or above the camera):
+	 * nothing to draw. 12-bit tangents, a corner or two of slack. */
+	{
+		int out_l = 0, out_r = 0, out_t = 0, out_b = 0;
+		for (int k = 0; k < pn; k++) {
+			/* 32-bit: |vz| < 2^20, tangents < 2^14 */
+			const int32_t lx = (((out[k].vz >> 4) * c->tanx_fx) >> 8) + 2;
+			const int32_t ly = (((out[k].vz >> 4) * c->tany_fx) >> 8) + 2;
+			out_r += out[k].vx > lx;
+			out_l += out[k].vx < -lx;
+			out_b += out[k].vy > ly;
+			out_t += out[k].vy < -ly;
+		}
+		if (out_r == pn || out_l == pn || out_b == pn || out_t == pn) {
+			return 0;
+		}
+	}
+	int sx[4], sy[4];
+	CV cv[4];
+	for (int k = 0; k < pn; k++) {
+		SVECTOR p;
+		p.vx = (int16_t)out[k].x;
+		p.vy = (int16_t)out[k].y;
+		p.vz = (int16_t)out[k].z;
+		p.pad = 0;
+		DVECTOR s;
+		int32_t flag;
+		gte_ldv0(&p);
+		gte_rtps();
+		gte_stsxy(&s);
+		gte_stflg(&flag);
+		if (flag & 0x6000) {
+			/* SX2/SY2 saturated: off the GTE's screen range */
+			return draw_tri_slow(c, va, vb, vc, uv, tex);
+		}
+		sx[k] = s.vx;
+		sy[k] = s.vy;
+		cv[k].z = out[k].vz;
+		cv[k].r = out[k].r << 8;
+		cv[k].g = out[k].g << 8;
+		cv[k].b = out[k].b << 8;
+		cv[k].u = out[k].u << 8;
+		cv[k].v = out[k].v << 8;
+	}
+	int x0 = sx[0], x1 = sx[0], y0 = sy[0], y1 = sy[0];
+	for (int k = 1; k < pn; k++) {
+		x0 = sx[k] < x0 ? sx[k] : x0;
+		x1 = sx[k] > x1 ? sx[k] : x1;
+		y0 = sy[k] < y0 ? sy[k] : y0;
+		y1 = sy[k] > y1 ? sy[k] : y1;
+	}
+	if (x1 - x0 > 1000 || y1 - y0 > 500) {
+		return draw_tri_slow(c, va, vb, vc, uv, tex);
+	}
+	return emit_fan(c, cv, sx, sy, pn, tex);
+}
+
+/* a primitive through the slow path: a triangle, or a quad as its two */
+static int prim_slow(DrawCtx *c, const P1Prim *pr, const P1Vert *va, const P1Vert *vb, const P1Vert *vc, const P1Vert *vd)
+{
+	int n = draw_tri_near(c, va, vb, vc, pr->uv, pr->tex);
+	if (vd) {
+		/* the second triangle c,b,d (the source triangle's winding) */
+		const uint8_t uv2[6] = { pr->uv[4], pr->uv[5], pr->uv[2], pr->uv[3], pr->uv[6], pr->uv[7] };
+		n += draw_tri_near(c, vc, vb, vd, uv2, pr->tex);
+	}
+	return n;
+}
+
+/* a run of quads (QUAD 1) or of triangles: one loop for each, no
+ * per-primitive test of which */
+template <int QUAD>
+static void draw_prims(DrawCtx *c, unsigned first, unsigned n)
 {
 	const int32_t near_z = c->near_u;
 	const int ot_shift = c->ot_shift;
 	const int fog = c->fog && !c->nfog;
 	const P1Vert *const verts = g_verts;
-	const unsigned vn = g_vert_n;
 	unsigned end = first + n;
-	if (end > g_tri_n) {
-		end = g_tri_n;
+	if (end > g_prim_n) {
+		end = g_prim_n;
 	}
 	c->tested += n;
 	unsigned drawn = 0;
-	for (const P1Tri *tr = g_tris + first, *te = g_tris + end; tr < te; tr++) {
-		const unsigned ia = tr->a, ib = tr->b, ic = tr->c;
-		if ((tr->flags & 1) || ia >= vn || ib >= vn || ic >= vn) {
-			continue;
-		}
+	for (const P1Prim *pr = g_prims + first, *pe = g_prims + end; pr < pe; pr++) {
+		/* indices were checked when the mesh loaded (parse_mesh) */
+		const unsigned ia = pr->a, ib = pr->b, ic = pr->c, id = QUAD ? pr->d : 0;
+		const int quad = QUAD;
 		const P1Vert *va = verts + ia;
 		const P1Vert *vb = verts + ib;
 		const P1Vert *vc = verts + ic;
+		const P1Vert *vd = quad ? verts + id : 0;
 		const VCache *ca = vc_get(ia, va);
 		const VCache *cb = vc_get(ib, vb);
 		const VCache *cc = vc_get(ic, vc);
-		const int32_t z0 = ca->sz, z1 = cb->sz, z2 = cc->sz;
-		if (z0 < near_z || z1 < near_z || z2 < near_z) {
+		const VCache *cd = quad ? vc_get(id, vd) : cc;
+		const int32_t z0 = ca->sz, z1 = cb->sz, z2 = cc->sz, z3 = cd->sz;
+		if (z0 < near_z || z1 < near_z || z2 < near_z || z3 < near_z) {
 			/* through the near plane (the road under the kart): cut it
 			 * there instead of losing it */
-			if (z0 >= near_z || z1 >= near_z || z2 >= near_z) {
-				drawn += draw_tri_slow(c, va, vb, vc, tr);
+			if (z0 >= near_z || z1 >= near_z || z2 >= near_z || z3 >= near_z) {
+				drawn += prim_slow(c, pr, va, vb, vc, vd);
 			}
 			continue;
 		}
-		DVECTOR sxy[3] = { ca->sxy, cb->sxy, cc->sxy };
-		/* front faces only (the GTE's NCLIP sign) */
-		const int32_t nclip = (sxy[1].vx - sxy[0].vx) * (sxy[2].vy - sxy[0].vy) - (sxy[2].vx - sxy[0].vx) * (sxy[1].vy - sxy[0].vy);
+		const DVECTOR s0 = ca->sxy, s1 = cb->sxy, s2 = cc->sxy, s3 = cd->sxy;
+		/* front faces only (the GTE's NCLIP sign; a quad is flat enough
+		 * that its first triangle speaks for it) */
+		const int32_t nclip = (s1.vx - s0.vx) * (s2.vy - s0.vy) - (s2.vx - s0.vx) * (s1.vy - s0.vy);
 		if (nclip <= 0) {
 			continue; /* back face or edge on */
 		}
 		{
 			/* the GPU drops a primitive wider than 1023 or taller than
 			 * 511 pixels: big ones near the camera are split */
-			int x0 = sxy[0].vx, x1 = x0, y0 = sxy[0].vy, y1 = y0;
-			for (int k = 1; k < 3; k++) {
-				x0 = sxy[k].vx < x0 ? sxy[k].vx : x0;
-				x1 = sxy[k].vx > x1 ? sxy[k].vx : x1;
-				y0 = sxy[k].vy < y0 ? sxy[k].vy : y0;
-				y1 = sxy[k].vy > y1 ? sxy[k].vy : y1;
-			}
+			int x0 = s0.vx, x1 = x0, y0 = s0.vy, y1 = y0;
+			x0 = s1.vx < x0 ? s1.vx : x0;
+			x1 = s1.vx > x1 ? s1.vx : x1;
+			y0 = s1.vy < y0 ? s1.vy : y0;
+			y1 = s1.vy > y1 ? s1.vy : y1;
+			x0 = s2.vx < x0 ? s2.vx : x0;
+			x1 = s2.vx > x1 ? s2.vx : x1;
+			y0 = s2.vy < y0 ? s2.vy : y0;
+			y1 = s2.vy > y1 ? s2.vy : y1;
+			x0 = s3.vx < x0 ? s3.vx : x0;
+			x1 = s3.vx > x1 ? s3.vx : x1;
+			y0 = s3.vy < y0 ? s3.vy : y0;
+			y1 = s3.vy > y1 ? s3.vy : y1;
 			if (x1 < 0 || x0 >= SCR_W || y1 < 0 || y0 >= SCR_H) {
 				continue;
 			}
 			if (x1 - x0 > 1000 || y1 - y0 > 500) {
-				drawn += draw_tri_slow(c, va, vb, vc, tr);
+				drawn += draw_tri_slow(c, va, vb, vc, pr->uv, pr->tex);
+				if (vd) {
+					const uint8_t uv2[6] = { pr->uv[4], pr->uv[5], pr->uv[2], pr->uv[3], pr->uv[6], pr->uv[7] };
+					drawn += draw_tri_slow(c, vc, vb, vd, uv2, pr->tex);
+				}
 				continue;
 			}
 		}
-		const int32_t zsum = z0 + z1 + z2;
-		int idx = ((zsum * 1365) >> 14) >> ot_shift; /* average depth / 4 */
+		/* average depth / 4 */
+		const int32_t zsum = quad ? z0 + z1 + z2 + z3 : z0 + z1 + z2;
+		int idx = (quad ? zsum >> 4 : (zsum * 1365) >> 14) >> ot_shift;
 		if (idx >= OT_LEN) {
 			if (!c->nfog) {
 				continue;
@@ -1381,27 +1449,44 @@ static void draw_tris(DrawCtx *c, unsigned first, unsigned n)
 		if (idx < 1) {
 			idx = 1;
 		}
-		const unsigned tex = tr->tex;
+		const unsigned tex = pr->tex;
 		if (tex < (unsigned)g_tex_n && g_tex[tex].ready) {
 			const Tex *tx = &g_tex[tex];
-			const unsigned need = sizeof(POLY_GT3) + (tx->tiled ? 2 * sizeof(DR_TWIN) : 0);
+			const unsigned need = (quad ? sizeof(POLY_GT4) : sizeof(POLY_GT3)) + (tx->tiled ? 2 * sizeof(DR_TWIN) : 0);
 			if (g_pp + need > g_pend) {
 				break;
 			}
-			POLY_GT3 *p = (POLY_GT3 *)g_pp;
-			g_pp += sizeof(POLY_GT3);
-			setPolyGT3(p);
-			setXY3(p, sxy[0].vx, sxy[0].vy, sxy[1].vx, sxy[1].vy, sxy[2].vx, sxy[2].vy);
-			setRGB0(p, va->r, va->g, va->b);
-			setRGB1(p, vb->r, vb->g, vb->b);
-			setRGB2(p, vc->r, vc->g, vc->b);
-			const uint8_t *uv = tr->uv;
+			const uint8_t *uv = pr->uv;
 			const int u0 = tx->u0, v0 = tx->v0;
-			setUV3(p, uv[0] + u0, uv[1] + v0, uv[2] + u0, uv[3] + v0, uv[4] + u0, uv[5] + v0);
-			p->tpage = tx->tpage;
-			p->clut = tx->clut;
+			void *p;
+			if (quad) {
+				POLY_GT4 *q = (POLY_GT4 *)g_pp;
+				g_pp += sizeof(POLY_GT4);
+				setPolyGT4(q);
+				setXY4(q, s0.vx, s0.vy, s1.vx, s1.vy, s2.vx, s2.vy, s3.vx, s3.vy);
+				setRGB0(q, va->r, va->g, va->b);
+				setRGB1(q, vb->r, vb->g, vb->b);
+				setRGB2(q, vc->r, vc->g, vc->b);
+				setRGB3(q, vd->r, vd->g, vd->b);
+				setUV4(q, uv[0] + u0, uv[1] + v0, uv[2] + u0, uv[3] + v0, uv[4] + u0, uv[5] + v0, uv[6] + u0, uv[7] + v0);
+				q->tpage = tx->tpage;
+				q->clut = tx->clut;
+				p = q;
+			} else {
+				POLY_GT3 *t = (POLY_GT3 *)g_pp;
+				g_pp += sizeof(POLY_GT3);
+				setPolyGT3(t);
+				setXY3(t, s0.vx, s0.vy, s1.vx, s1.vy, s2.vx, s2.vy);
+				setRGB0(t, va->r, va->g, va->b);
+				setRGB1(t, vb->r, vb->g, vb->b);
+				setRGB2(t, vc->r, vc->g, vc->b);
+				setUV3(t, uv[0] + u0, uv[1] + v0, uv[2] + u0, uv[3] + v0, uv[4] + u0, uv[5] + v0);
+				t->tpage = tx->tpage;
+				t->clut = tx->clut;
+				p = t;
+			}
 			if (tx->tiled) {
-				/* window on, the triangle, window off */
+				/* window on, the primitive, window off */
 				DR_TWIN *on = (DR_TWIN *)g_pp;
 				DR_TWIN *off = on + 1;
 				g_pp += 2 * sizeof(DR_TWIN);
@@ -1415,6 +1500,32 @@ static void draw_tris(DrawCtx *c, unsigned first, unsigned n)
 			} else {
 				ot_append(idx, p, p);
 			}
+		} else if (quad) {
+			if (g_pp + sizeof(POLY_G4) > g_pend) {
+				break;
+			}
+			POLY_G4 *q = (POLY_G4 *)g_pp;
+			g_pp += sizeof(POLY_G4);
+			if (fog) {
+				/* towards the fog colour by the quad's average depth */
+				int32_t f = (int32_t)((((int64_t)(zsum >> 2) - c->fog_n) * c->fog_k) >> 16);
+				f = f < 0 ? 0 : (f > 4096 ? 4096 : f);
+				__asm__ volatile("mtc2 %0, $8" : : "r"(f));
+				gte_ldrgb3(&va->r, &vb->r, &vc->r);
+				gte_dpct();
+				gte_strgb3_g4(q);
+				gte_ldrgb(&vd->r);
+				gte_dpcs();
+				gte_strgb(&q->r3);
+			} else {
+				setRGB0(q, va->r, va->g, va->b);
+				setRGB1(q, vb->r, vb->g, vb->b);
+				setRGB2(q, vc->r, vc->g, vc->b);
+				setRGB3(q, vd->r, vd->g, vd->b);
+			}
+			setPolyG4(q);
+			setXY4(q, s0.vx, s0.vy, s1.vx, s1.vy, s2.vx, s2.vy, s3.vx, s3.vy);
+			ot_append(idx, q, q);
 		} else {
 			if (g_pp + sizeof(POLY_G3) > g_pend) {
 				break;
@@ -1436,7 +1547,7 @@ static void draw_tris(DrawCtx *c, unsigned first, unsigned n)
 				setRGB2(p, vc->r, vc->g, vc->b);
 			}
 			setPolyG3(p);
-			setXY3(p, sxy[0].vx, sxy[0].vy, sxy[1].vx, sxy[1].vy, sxy[2].vx, sxy[2].vy);
+			setXY3(p, s0.vx, s0.vy, s1.vx, s1.vy, s2.vx, s2.vy);
 			ot_append(idx, p, p);
 		}
 		drawn++;
@@ -1444,38 +1555,68 @@ static void draw_tris(DrawCtx *c, unsigned first, unsigned n)
 	c->tris += drawn;
 }
 
+static inline void draw_chunk(DrawCtx *c, unsigned ci)
+{
+	const uint8_t *ch = g_chunks + ci * CHUNK_SZ;
+	const unsigned first = rd32(ch), nq = rd16(ch + 4), nt = rd16(ch + 24);
+	if (nq) {
+		draw_prims<1>(c, first, nq);
+	}
+	if (nt) {
+		draw_prims<0>(c, first + nq, nt);
+	}
+}
+
+/* one group: its node's matrix in the GTE (loaded: the node whose matrix
+ * is there, -1 the view alone), then the group and its chunks culled */
+static void draw_group(DrawCtx *c, const FxM *vfx, unsigned gi, int *loaded)
+{
+	const ChunkG *g = &g_grp[gi];
+	const unsigned node = g->node;
+	const int moved = node < MAX_NODES && g_nodes_live && g_nm_on[node];
+	const int want = moved ? (int)node : -1;
+	if (want != *loaded) {
+		*loaded = want;
+		if (moved) {
+			FxM mv;
+			fx_mul(vfx, &g_nm[node], &mv);
+			fx_load(&mv);
+		} else {
+			fx_load(vfx);
+		}
+	}
+	c->nfog = node < MAX_NODES && g_nfog[node];
+	c->far_u = c->nfog ? 0x7fffffff : c->far_fog_u;
+	const int vis = sphere_visible(c, &g->c, g->r, 4096);
+	if (!vis) {
+		return;
+	}
+	for (unsigned ci = g->first; ci < (unsigned)g->first + g->n; ci++) {
+		/* a group wholly in view: so is each of its chunks */
+		if (vis == 2 ? g_cint[ci].r >= 0 : chunk_visible(c, ci, 4096)) {
+			draw_chunk(c, ci);
+		}
+	}
+}
+
+static inline int group_skipped(unsigned gi)
+{
+	const unsigned node = g_grp[gi].node;
+	return node < MAX_NODES && (g_isrc[node] || (g_nodes_live && g_nhide[node]));
+}
+
 static void draw_scene_mesh(DrawCtx *c, const float *view)
 {
+	/* the scratchpad was the scripts' stack until now: empty the cache */
+	for (int i = 0; i < VC_N; i++) {
+		g_vc[i].tag = 0xffffffffu;
+	}
 	FxM vfx;
 	fx_from_float(view, &vfx);
-	int last_node = -2;
+	int loaded = -2;
 	for (unsigned gi = 0; gi < g_grp_n; gi++) {
-		const ChunkG *g = &g_grp[gi];
-		const unsigned node = g->node;
-		if (node < MAX_NODES && (g_isrc[node] || (g_nodes_live && g_nhide[node]))) {
-			continue;
-		}
-		if ((int)node != last_node) {
-			last_node = (int)node;
-			c->nfog = node < MAX_NODES && g_nfog[node];
-			c->far_u = c->nfog ? 0x7fffffff : c->far_fog_u;
-			if (node < MAX_NODES && g_nodes_live && g_nm_on[node]) {
-				FxM mv;
-				fx_mul(&vfx, &g_nm[node], &mv);
-				fx_load(&mv);
-			} else {
-				fx_load(&vfx);
-			}
-		}
-		if (!sphere_visible(c, &g->c, g->r, 4096)) {
-			continue;
-		}
-		for (unsigned ci = g->first; ci < (unsigned)g->first + g->n; ci++) {
-			if (!chunk_visible(c, ci, 4096)) {
-				continue;
-			}
-			const uint8_t *ch = g_chunks + ci * 24;
-			draw_tris(c, rd32(ch), rd16(ch + 4));
+		if (!group_skipped(gi)) {
+			draw_group(c, &vfx, gi, &loaded);
 		}
 	}
 	/* MultiMesh instances: each one draws its source node's chunks. The
@@ -1526,9 +1667,8 @@ static void draw_scene_mesh(DrawCtx *c, const float *view)
 		fx_load(&mv);
 		const int32_t chunk_sc = ic->r > 0 ? (int32_t)(((int64_t)g_iscale[i] * (g_nm_on[nd] ? g_nscale[nd] : 4096)) >> 12) : 4096;
 		for (unsigned ci = g_isrc_c0[nd]; ci < g_isrc_c1[nd]; ci++) {
-			const uint8_t *ch = g_chunks + ci * 24;
 			if (chunk_visible(c, ci, chunk_sc)) {
-				draw_tris(c, rd32(ch), rd16(ch + 4));
+				draw_chunk(c, ci);
 			}
 		}
 	}
@@ -1743,9 +1883,14 @@ void gs_draw_scene(void)
 		}
 		gte_SetGeomScreen((int)c.h);
 		c.near_u = (int32_t)(NEAR_M * (float)g_scale);
+		/* the GTE's perspective divide saturates nearer than H/2 (H/SZ
+		 * tops out at 2): nothing nearer is projected by it */
+		if (c.near_u < (int32_t)c.h / 2 + 1) {
+			c.near_u = (int32_t)c.h / 2 + 1;
+		}
 		c.fog = 0;
 		if (g_fog_on && g_fog_far > g_fog_near) {
-			/* linear fog from the triangle's depth (draw_tris), the GTE's
+			/* linear fog from the triangle's depth (draw_prims), the GTE's
 			 * depth cue (DPCT) blending towards the far colour */
 			const float n = (g_fog_near > NEAR_M ? g_fog_near : NEAR_M) * (float)g_scale;
 			const float f = g_fog_far * (float)g_scale;

@@ -7,6 +7,7 @@
 
 #include "gdir_ops.h"
 #include "gs_draw.h"
+#include "iso_path.h"
 #include "pack_io.h"
 #include "pad_io.h"
 #include "sfx_io.h"
@@ -146,6 +147,9 @@ struct Pack {
 
 /* ---- program ---- */
 static int s_active;
+/* GDIR header flags (u16 at 6) */
+#define GDIR_FLAG_PNOD 1 /* each pack's node records are in PNODnn.BIN, not here */
+static unsigned s_gflags;
 static Val s_k[GDIR_MAX_CONSTS];
 static const unsigned char *s_karr[GDIR_MAX_KARR]; /* u16 n, u16 items[n] */
 static unsigned s_karr_n;
@@ -2572,8 +2576,39 @@ static void enter_pack(int pack)
 	const Pack *pk = &s_pack[pack];
 	s_node_n = pk->node_n < GDIR_MAX_NODES ? pk->node_n : GDIR_MAX_NODES;
 	const unsigned char *p = pk->nodes;
+	/* node records from PNODnn.BIN (a guest short of RAM keeps them on the
+	 * disc), a few at a time through a small buffer */
+	FILE *nf = 0;
+	unsigned char nbuf[88 * 8];
+	unsigned nbuf_n = 0, nbuf_i = 0;
+	if (s_gflags & GDIR_FLAG_PNOD) {
+		char host[32], iso[48];
+		snprintf(host, sizeof(host), "host:PNOD%02d.bin", pack);
+		snprintf(iso, sizeof(iso), "cdrom0:\\PNOD%02d.BIN;1", pack);
+		nf = iso_fopen(iso, "rb");
+		if (!nf) {
+			nf = fopen(host, "rb");
+		}
+		if (!nf) {
+			fail("pack node records (PNOD) missing");
+			s_node_n = 0;
+		}
+	}
 	for (unsigned n = 0; n < s_node_n; n++) {
 		PackNode *pn = &s_nodes[n];
+		if (nf) {
+			if (nbuf_i >= nbuf_n) {
+				const unsigned want = s_node_n - n < 8 ? s_node_n - n : 8;
+				if (fread(nbuf, 88, want, nf) != want) {
+					fail("pack node records (PNOD) cut short");
+					s_node_n = n;
+					break;
+				}
+				nbuf_n = want;
+				nbuf_i = 0;
+			}
+			p = nbuf + 88 * nbuf_i++;
+		}
 		pn->parent = (short)ru16(p);
 		pn->flags = p[2];
 		pn->hud = (signed char)p[3];
@@ -2589,6 +2624,9 @@ static void enter_pack(int pack)
 		if (pn->flags & 2) {
 			mat_inv34(pn->w0, s_w0inv[n]);
 		}
+	}
+	if (nf) {
+		fclose(nf);
 	}
 	/* child lists for get_child / get_child_count, in node order */
 	for (unsigned n = 0; n < s_node_n; n++) {
@@ -2714,6 +2752,7 @@ int gdir_vm_init(const unsigned char *b, unsigned sz)
 		fail("GDIR program is cut short");
 		return 0;
 	}
+	s_gflags = ru16(b + 6);
 	const unsigned char *p = b + 12;
 	const unsigned char *end = b + total;
 	s_k_n = ru32(p);
@@ -2824,7 +2863,9 @@ int gdir_vm_init(const unsigned char *b, unsigned sz)
 		tmp.path_k = (unsigned short)ru16(p + 13);
 		p += 15;
 		tmp.nodes = p;
-		p += tmp.node_n * 88u;
+		if (!(s_gflags & GDIR_FLAG_PNOD)) {
+			p += tmp.node_n * 88u;
+		}
 		tmp.inst_n = (unsigned short)ru16(p);
 		p += 2;
 		tmp.insts = p;

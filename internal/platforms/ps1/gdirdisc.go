@@ -88,6 +88,13 @@ func (t *Tool) gdirISO(ctx context.Context, opts platforms.ISOOptions) error {
 	if opts.Stdout != nil {
 		report.Linef(opts.Stdout, report.Note, "%d pack mesh(es) converted for the PS1", n)
 	}
+	moved, err := SplitPackNodes(data)
+	if err != nil {
+		return report.Fail("split pack nodes: "+err.Error(), "re-export the scenes with the PlayStation 2 cook")
+	}
+	if moved > 0 && opts.Stdout != nil {
+		report.Linef(opts.Stdout, report.Note, "%d bytes of scene node records moved from SCRP00 to PNOD files", moved)
+	}
 	cnf := filepath.Join(stage, "SYSTEM.CNF")
 	if err := os.WriteFile(cnf, []byte(systemCNF(boot)), 0o644); err != nil {
 		return err

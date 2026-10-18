@@ -48,8 +48,9 @@ func TestConvertMesh(t *testing.T) {
 		t.Fatal(err)
 	}
 	le := binary.LittleEndian
-	if string(out[:4]) != "P1MS" || le.Uint32(out[8:]) != 6 || le.Uint32(out[12:]) != 2 {
-		t.Fatalf("header %q verts %d tris %d", out[:4], le.Uint32(out[8:]), le.Uint32(out[12:]))
+	// two triangles of different nodes: nothing to join
+	if string(out[:4]) != "P1MS" || le.Uint16(out[4:]) != 3 || le.Uint32(out[8:]) != 6 || le.Uint32(out[12:]) != 2 {
+		t.Fatalf("header %q v%d verts %d prims %d", out[:4], le.Uint16(out[4:]), le.Uint32(out[8:]), le.Uint32(out[12:]))
 	}
 	scale := int(le.Uint16(out[6:]))
 	if scale != 1024 {
@@ -58,21 +59,53 @@ func TestConvertMesh(t *testing.T) {
 	if x := int16(le.Uint16(out[32+1*12:])); int(x) != scale {
 		t.Fatalf("vert 1 x = %d, want %d", x, scale)
 	}
-	tri := out[32+6*12:]
-	// first triangle: 0..1 in each axis, kept to the last texel
-	if tri[6] != 0 || tri[8] != 63 || tri[11] != 31 {
-		t.Fatalf("tri 0 uv %v", tri[6:12])
+	pr := out[32+6*12:]
+	if le.Uint16(pr[6:]) != 0xffff {
+		t.Fatal("prim 0 should be a triangle")
 	}
-	// second: u 3.25..4 tiles -> 16..64 after the shift (beyond one tile? no: 208..256 - 192)
-	t2 := tri[16:]
-	if t2[6] != 16 || t2[8] != 63 {
-		t.Fatalf("tri 1 uv %v", t2[6:12])
+	// first triangle: 0..1 in each axis, kept to the last texel
+	if pr[8] != 0 || pr[10] != 63 || pr[13] != 31 {
+		t.Fatalf("prim 0 uv %v", pr[8:16])
+	}
+	// second: u 3.25..4 -> 208..256 less one tile of 64 per repeat
+	p2 := pr[20:]
+	if p2[8] != 16 || p2[10] != 63 {
+		t.Fatalf("prim 1 uv %v", p2[8:16])
 	}
 	if texs[0].tiled {
 		t.Fatal("no triangle runs past one tile")
 	}
 	if n := le.Uint32(out[16:]); n != 2 {
 		t.Fatalf("chunks %d, want 2 (one per node)", n)
+	}
+	ch := pr[2*20:]
+	// chunk 0: prim 0, no quads, one triangle; chunk 1: prim 1
+	if le.Uint32(ch[0:]) != 0 || le.Uint16(ch[4:]) != 0 || le.Uint16(ch[24:]) != 1 || le.Uint32(ch[28:]) != 1 || le.Uint16(ch[28+24:]) != 1 {
+		t.Fatalf("chunks %d+%dq+%dt, %d+%dt", le.Uint32(ch[0:]), le.Uint16(ch[4:]), le.Uint16(ch[24:]), le.Uint32(ch[28:]), le.Uint16(ch[28+24:]))
+	}
+}
+
+// A quad written as two triangles comes back as one quad primitive; two
+// triangles at a fold (or not sharing an edge) stay triangles.
+func TestPairQuads(t *testing.T) {
+	a := ps2Vert{x: 0, z: 0, r: 200}
+	b := ps2Vert{x: 12, z: 0, r: 200}
+	c := ps2Vert{x: 12, z: -30, r: 200}
+	d := ps2Vert{x: 0, z: -30, r: 200}
+	ps := pairQuads([]tri{{v: [3]ps2Vert{a, b, c}}, {v: [3]ps2Vert{a, c, d}}})
+	if len(ps) != 1 || !ps[0].quad {
+		t.Fatalf("%d prims, quad %v", len(ps), len(ps) > 0 && ps[0].quad)
+	}
+	// the GPU draws v0,v1,v2 and v1,v2,v3: together the two triangles
+	q := ps[0].v
+	if posKey(q[0]) == posKey(q[3]) || posKey(q[1]) == posKey(q[2]) {
+		t.Fatalf("quad corners %v", q)
+	}
+	// a fold: the second triangle stood up at 90 degrees
+	e := ps2Vert{x: 0, y: 30, z: 0, r: 200}
+	ps = pairQuads([]tri{{v: [3]ps2Vert{a, b, c}}, {v: [3]ps2Vert{a, c, e}}})
+	if len(ps) != 2 || ps[0].quad || ps[1].quad {
+		t.Fatalf("fold joined: %d prims", len(ps))
 	}
 }
 

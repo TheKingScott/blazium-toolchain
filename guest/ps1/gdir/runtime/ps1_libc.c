@@ -860,3 +860,22 @@ unsigned p1_clock(void)
 	}
 	return *(volatile uint32_t *)0x1f801120 & 0xffff;
 }
+
+/* PSn00bSDK's calloc is malloc(n * size) without clearing it: this one
+ * clears (the linker takes it before libc's), and refuses an overflowing
+ * size */
+void *calloc(size_t num, size_t size)
+{
+	if (size && num > (size_t)-1 / size) {
+		return 0;
+	}
+	const size_t n = num * size;
+	void *p = malloc(n);
+	if (p) {
+		/* through a volatile pointer: GCC would turn malloc + memset back
+		 * into a call to calloc (this one) */
+		void *(*volatile clear)(void *, int, size_t) = memset;
+		clear(p, 0, n);
+	}
+	return p;
+}
