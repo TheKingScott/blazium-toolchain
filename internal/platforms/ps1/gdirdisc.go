@@ -95,6 +95,11 @@ func (t *Tool) gdirISO(ctx context.Context, opts platforms.ISOOptions) error {
 	if moved > 0 && opts.Stdout != nil {
 		report.Linef(opts.Stdout, report.Note, "%d bytes of scene node records moved from SCRP00 to PNOD files", moved)
 	}
+	if ns, err := ConvertSound(data); err != nil {
+		return report.Fail("convert sound: "+err.Error(), "re-export the scenes with the PlayStation 2 cook")
+	} else if ns > 0 && opts.Stdout != nil {
+		report.Linef(opts.Stdout, report.Note, "%d sound file(s) encoded as SPU ADPCM", ns)
+	}
 	if made, err := MakeMCPS1(data, boot); err != nil {
 		return report.Fail("memory card save header: "+err.Error(), "re-export the scenes with the PlayStation 2 cook")
 	} else if made && opts.Stdout != nil {
