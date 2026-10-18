@@ -24,6 +24,12 @@ func installGuestRuntime(prefix string) error {
 	return guest.Install(GuestDir(prefix))
 }
 
+// GDIRGuestDir is <prefix>/ps1/guest/gdir — the bundled GDIR runtime
+// (build --sample gdir), for scenes cooked by the PS2 exporter.
+func GDIRGuestDir(prefix string) string {
+	return filepath.Join(cache.PlatformDir(prefix, ID), "guest", "gdir")
+}
+
 const psxMagic = "PS-X EXE"
 
 type envRunner interface {
@@ -54,13 +60,31 @@ func (t *Tool) Build(ctx context.Context, opts platforms.BuildOptions) error {
 		}
 		src = ""
 	}
-	if src == "" && sample != "" {
+	if src == "" && sample == "gdir" {
+		src = GDIRGuestDir(opts.Prefix)
+		if err := os.RemoveAll(src); err != nil {
+			return err
+		}
+		if err := guest.InstallGDIR(src); err != nil {
+			return err
+		}
+		// the scripts' per-frame functions as C, from the export beside --out
+		if opts.Out != "" {
+			n, bytes, err := writeAOT(filepath.Dir(opts.Out), src)
+			if err != nil {
+				return report.Fail("compiling the scripts to C: "+err.Error(), "BLAZIUM_PS1_AOT_BYTES=0 builds without")
+			}
+			if n > 0 && opts.Stdout != nil {
+				fmt.Fprintf(opts.Stdout, "scripts: %d function(s), %d bytes of GDIR compiled to C\n", n, bytes)
+			}
+		}
+	} else if src == "" && sample != "" {
 		src, err = resolveSample(opts.Prefix, sample)
 		if err != nil {
 			return err
 		}
 	}
-	if overlay != "" && sample == "" {
+	if overlay != "" && (sample == "" || sample == "gdir") {
 		merge := filepath.Join(cache.PlatformDir(opts.Prefix, ID), "work", "guest-src")
 		if err := os.RemoveAll(merge); err != nil {
 			return err
@@ -145,7 +169,7 @@ func (t *Tool) Build(ctx context.Context, opts platforms.BuildOptions) error {
 		"-G", "Ninja",
 		"-DCMAKE_TOOLCHAIN_FILE=" + sdkFile,
 		"-DPSN00BSDK_TC=" + env["PSN00BSDK_TC"],
-		"-DCMAKE_BUILD_TYPE=Debug",
+		"-DCMAKE_BUILD_TYPE=" + buildType(sample),
 		"-DCMAKE_MAKE_PROGRAM=" + ninja,
 	}
 	if opts.Tim != "" {
@@ -300,6 +324,20 @@ func (t *Tool) findHostTool(prefix, id, command string) string {
 	return lookFile(command)
 }
 
+// buildType is the CMake configuration. PSn00bSDK's Debug adds -Og after a
+// project's own flags and links the debug libraries; the GDIR guest (a
+// script interpreter and a renderer on a 33 MHz CPU) builds as Release
+// (-O2). BLAZIUM_PS1_BUILD_TYPE overrides either.
+func buildType(sample string) string {
+	if v := strings.TrimSpace(os.Getenv("BLAZIUM_PS1_BUILD_TYPE")); v != "" {
+		return v
+	}
+	if sample == "gdir" {
+		return "Release"
+	}
+	return "Debug"
+}
+
 func resolveSample(prefix, sample string) (string, error) {
 	plat := cache.PlatformDir(prefix, ID)
 	var marker string
@@ -309,7 +347,7 @@ func resolveSample(prefix, sample string) (string, error) {
 	case "gte":
 		marker = filepath.Join("share", "psn00bsdk", "examples", "graphics", "gte", "CMakeLists.txt")
 	default:
-		return "", report.Usage("--sample must be template or gte")
+		return "", report.Usage("--sample must be template, gte or gdir")
 	}
 	if hit := findRelFile(plat, marker); hit != "" {
 		return filepath.Dir(hit), nil

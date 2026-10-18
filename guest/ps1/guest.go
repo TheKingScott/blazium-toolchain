@@ -32,24 +32,56 @@ var RuntimeNames = []string{
 //go:embed runtime
 var files embed.FS
 
+// The GDIR guest (guest/ps1/gdir/runtime): the PS2 GDIR runtime's VM, packs
+// and system natives over a GTE/GPU renderer, for scenes cooked by the PS2
+// exporter and converted by internal/platforms/ps1 (ConvertPacks).
+//
+//go:embed gdir
+var gdirFiles embed.FS
+
+// GDIRShared are the GDIR guest files kept byte-identical to
+// guest/ps2/runtime (guest_test checks): one VM for both consoles.
+var GDIRShared = []string{
+	"gdir_ops.h",
+	"gdir_vm.cpp",
+	"gdir_vm.h",
+	"iso_path.h",
+	"mc_io.h",
+	"pack_io.cpp",
+	"pack_io.h",
+	"pad_io.h",
+	"sfx_io.h",
+	"sys_io.cpp",
+	"sys_io.h",
+}
+
+// InstallGDIR writes the GDIR guest into destDir (prefix/ps1/guest/gdir).
+func InstallGDIR(destDir string) error {
+	return installFrom(gdirFiles, "gdir/runtime", destDir)
+}
+
 // Install writes the guest stub into destDir (prefix/ps1/guest/runtime).
 func Install(destDir string) error {
+	return installFrom(files, "runtime", destDir)
+}
+
+func installFrom(efs embed.FS, root, destDir string) error {
 	if err := os.MkdirAll(destDir, 0o755); err != nil {
 		return err
 	}
-	return fs.WalkDir(files, "runtime", func(path string, d fs.DirEntry, err error) error {
+	return fs.WalkDir(efs, root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		if path == "runtime" {
+		if path == root {
 			return nil
 		}
-		rel := strings.TrimPrefix(path, "runtime/")
+		rel := strings.TrimPrefix(path, root+"/")
 		target := filepath.Join(destDir, filepath.FromSlash(rel))
 		if d.IsDir() {
 			return os.MkdirAll(target, 0o755)
 		}
-		data, readErr := files.ReadFile(path)
+		data, readErr := efs.ReadFile(path)
 		if readErr != nil {
 			return readErr
 		}

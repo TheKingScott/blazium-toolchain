@@ -233,29 +233,40 @@ func (t *Tool) ISO(ctx context.Context, opts platforms.ISOOptions) error {
 	if err := requireHost(); err != nil {
 		return err
 	}
+	if opts.XML == "" && opts.Dir != "" {
+		return t.gdirISO(ctx, opts)
+	}
 	if opts.XML == "" {
-		return report.Usage("iso requires --xml")
+		return report.Usage("iso requires --xml (an mkpsxiso project) or --dir (a GDIR export folder)")
 	}
-	r := t.runner()
-	mk, err := execx.LookPrefersEnv(r, "MKPSXISO", "mkpsxiso")
+	mk, err := t.mkpsxiso(opts.Prefix)
 	if err != nil {
-		env, _ := t.discover(opts.Prefix)
-		if env["MKPSXISO"] != "" && fileExists(env["MKPSXISO"]) {
-			mk = env["MKPSXISO"]
-			err = nil
-		} else if p := walkNamed(cache.PlatformDir(opts.Prefix, ID), hostNames("mkpsxiso")...); p != "" {
-			mk = p
-			err = nil
-		}
-	}
-	if err != nil || mk == "" {
-		return report.Missing("mkpsxiso not found (GPL, spawn only, never fetched)", "install mkpsxiso and set MKPSXISO or put it on PATH")
+		return err
 	}
 	args := []string{opts.XML}
 	if opts.Out != "" {
 		args = append(args, "-o", opts.Out)
 	}
-	return r.Run(ctx, mk, args, writerOrDiscard(opts.Stdout), writerOrDiscard(opts.Stderr))
+	return t.runner().Run(ctx, mk, args, writerOrDiscard(opts.Stdout), writerOrDiscard(opts.Stderr))
+}
+
+func (t *Tool) mkpsxiso(prefix string) (string, error) {
+	r := t.runner()
+	mk, err := execx.LookPrefersEnv(r, "MKPSXISO", "mkpsxiso")
+	if err != nil {
+		env, _ := t.discover(prefix)
+		if env["MKPSXISO"] != "" && fileExists(env["MKPSXISO"]) {
+			mk = env["MKPSXISO"]
+			err = nil
+		} else if p := walkNamed(cache.PlatformDir(prefix, ID), hostNames("mkpsxiso")...); p != "" {
+			mk = p
+			err = nil
+		}
+	}
+	if err != nil || mk == "" {
+		return "", report.Missing("mkpsxiso not found (GPL, spawn only, never fetched)", "install mkpsxiso and set MKPSXISO or put it on PATH")
+	}
+	return mk, nil
 }
 
 func (t *Tool) discover(prefix string) (map[string]string, []string) {

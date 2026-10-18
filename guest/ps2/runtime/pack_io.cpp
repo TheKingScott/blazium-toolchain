@@ -11,12 +11,24 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef PACK_IO_HEAP_REPORT
+extern "C" void PACK_IO_HEAP_REPORT(void); /* the guest's heap, on "no memory" */
+#endif
+
 #define PS2_CATALOG 99
 #define PS2_LAYERS 16
+#ifndef PS2_EE_LIMIT
 #define PS2_EE_LIMIT (24u * 1024u * 1024u)
+#endif
+#ifndef PS2_GS_LIMIT
 #define PS2_GS_LIMIT (4u * 1024u * 1024u)
+#endif
+#ifndef PS2_EXTRA_EE_CAP
 #define PS2_EXTRA_EE_CAP (2u * 1024u * 1024u)
+#endif
+#ifndef PS2_POKE_N
 #define PS2_POKE_N (24u * 1024u)
+#endif
 
 static unsigned char s_poke[PS2_POKE_N];
 
@@ -170,10 +182,15 @@ static int read_named(const char *host, const char *iso_bs, const char *iso,
 	rewind(f);
 	unsigned char *buf = (unsigned char *)malloc((size_t)n);
 	if (!buf) {
+		printf("pack_io: no memory for %s (%ld bytes)\n", iso, n);
+#ifdef PACK_IO_HEAP_REPORT
+		PACK_IO_HEAP_REPORT();
+#endif
 		fclose(f);
 		return 0;
 	}
 	if (fread(buf, 1, (size_t)n, f) != (size_t)n) {
+		printf("pack_io: %s did not read\n", iso);
 		free(buf);
 		fclose(f);
 		return 0;
@@ -366,6 +383,41 @@ static int load_pack_n(int pack)
 	return 1;
 }
 
+#ifdef PACK_IO_RELOAD_PACK0
+/* A guest short of RAM (the PS1) lets pack 0 go while another pack is the
+ * scene, and reads it from the disc again when the game comes back. */
+static void drop_p0(void)
+{
+	free((void *)s_p0_mesh);
+	free((void *)s_p0_gtex);
+	free((void *)s_p0_node);
+	s_p0_mesh = 0;
+	s_p0_gtex = 0;
+	s_p0_node = 0;
+	s_p0_mesh_sz = s_p0_gtex_sz = s_p0_node_sz = 0;
+	s_p0_ee = 0;
+}
+
+static int reload_p0(void)
+{
+	unsigned char *mesh = 0, *gtex = 0, *node = 0;
+	unsigned msz = 0, gsz = 0, nsz = 0;
+	if (!read_pack_bins(0, &mesh, &msz, &gtex, &gsz, &node, &nsz)) {
+		printf("pack_io: pack 0 did not come back\n");
+		return 0;
+	}
+	s_p0_mesh = mesh;
+	s_p0_mesh_sz = msz;
+	s_p0_gtex = gtex;
+	s_p0_gtex_sz = gsz;
+	s_p0_node = node;
+	s_p0_node_sz = nsz;
+	s_p0_ee = msz + gsz + nsz;
+	s_p0_gs = gsz;
+	return 1;
+}
+#endif
+
 void pack_io_set_pack0(const unsigned char *mesh, unsigned mesh_sz,
 		const unsigned char *gtex, unsigned gtex_sz,
 		const unsigned char *node, unsigned node_sz)
@@ -385,12 +437,24 @@ int pack_io_swap(int pack)
 {
 	if (pack <= 0) {
 		free_px();
+#ifdef PACK_IO_RELOAD_PACK0
+		if (!s_p0_mesh && !reload_p0()) {
+			return 0;
+		}
+#endif
 		if (!s_p0_mesh) {
 			return 0;
 		}
 		if (!gs_draw_init(s_p0_mesh, s_p0_mesh_sz, s_p0_gtex, s_p0_gtex_sz, s_p0_node, s_p0_node_sz)) {
 			return 0;
 		}
+#ifdef PACK_IO_RELOAD_PACK0
+		/* the textures are in VRAM now */
+		free((void *)s_p0_gtex);
+		s_p0_gtex = 0;
+		s_p0_ee -= s_p0_gtex_sz;
+		s_p0_gtex_sz = 0;
+#endif
 		vu1_draw_init(s_p0_mesh, s_p0_mesh_sz);
 		s_current = 0;
 		sys_io_load_pack(0);
@@ -419,14 +483,31 @@ int pack_io_swap(int pack)
 			ee -= pack_cost_ee(s_current, s_px_mesh_sz, s_px_gtex_sz, s_px_node_sz);
 			gs -= pack_cost_gs(s_current, s_px_gtex_sz);
 		}
+#ifdef PACK_IO_RELOAD_PACK0
+		ee -= s_p0_ee; /* pack 0 goes */
+#endif
 		if (ee + pack_io_cost_ee(pack) > PS2_EE_LIMIT || gs + pack_io_cost_gs(pack) > PS2_GS_LIMIT) {
+			printf("pack_io: pack %d does not fit (RAM %u + %u of %u, VRAM %u + %u of %u)\n", pack, ee, pack_io_cost_ee(pack),
+					(unsigned)PS2_EE_LIMIT, gs, pack_io_cost_gs(pack), (unsigned)PS2_GS_LIMIT);
 			return 0;
 		}
 	}
+#ifdef PACK_IO_RELOAD_PACK0
+	drop_p0();
+#endif
 	if (!load_pack_n(pack)) {
+		printf("pack_io: pack %d did not load\n", pack);
+#ifdef PACK_IO_RELOAD_PACK0
+		pack_io_swap(0); /* back to where the game was */
+#endif
 		return 0;
 	}
 	if (!gs_draw_init(s_px_mesh, s_px_mesh_sz, s_px_gtex, s_px_gtex_sz, s_px_node, s_px_node_sz)) {
+		printf("pack_io: pack %d did not draw\n", pack);
+#ifdef PACK_IO_RELOAD_PACK0
+		free_px();
+		pack_io_swap(0);
+#endif
 		return 0;
 	}
 	vu1_draw_init(s_px_mesh, s_px_mesh_sz);
