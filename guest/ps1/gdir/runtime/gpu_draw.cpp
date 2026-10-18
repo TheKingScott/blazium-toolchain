@@ -41,7 +41,9 @@
 #else
 #define MAX_NODES 512
 #endif
+#ifndef NEAR_M
 #define NEAR_M 0.5f /* the GTE projects from here or from its own limit, H/2 view units, whichever is farther; nearer goes through the software path */
+#endif
 #ifndef NEAR_CLIP_M
 #define NEAR_CLIP_M 0.25f /* the clip plane (the software path projects what the GTE can't) */
 #endif
@@ -1003,9 +1005,15 @@ struct VCache {
 	DVECTOR sxy;
 	int32_t sz;
 };
-#ifndef VIEW_K
-#define VIEW_K 2 /* view space at twice the mesh's units (draw_scene_mesh); 4 runs the title's backdrop past the GTE's 16 bits */
+#ifndef VIEW_K_MAX
+#define VIEW_K_MAX 2 /* view space at up to twice the mesh's units (draw_scene_mesh); 4 runs the title's backdrop past the GTE's 16 bits */
 #endif
+/* The frame's view scale (gs_draw_scene): VIEW_K_MAX when the scene's draw
+ * distance still fits the GTE's 16-bit depth at it (a fogged race), else 1
+ * (the menu: 1024 units a metre and no fog would end at 29 m and cut the
+ * title flag's edges away) */
+static int g_vk = VIEW_K_MAX;
+#define VIEW_K g_vk
 
 #ifndef VC_N
 #define VC_N 32 /* 12 bytes each, 384 of the scratchpad's 1024 (the slow path's clip buffers have 432 after them) */
@@ -1414,10 +1422,14 @@ static void draw_prims(DrawCtx *c, unsigned first, unsigned n)
 		const P1Vert *vb = verts + ib;
 		const P1Vert *vc = verts + ic;
 		const P1Vert *vd = quad ? verts + id : 0;
-		const VCache *ca = vc_get(ia, va);
-		const VCache *cb = vc_get(ib, vb);
-		const VCache *cc = vc_get(ic, vc);
-		const VCache *cd = quad ? vc_get(id, vd) : cc;
+		/* each corner copied out of the cache as it is looked up: two
+		 * corners in the same slot (indices VC_N apart) would otherwise
+		 * leave the first pointing at the second's point */
+		const VCache ca_ = *vc_get(ia, va);
+		const VCache cb_ = *vc_get(ib, vb);
+		const VCache cc_ = *vc_get(ic, vc);
+		const VCache cd_ = quad ? *vc_get(id, vd) : cc_;
+		const VCache *const ca = &ca_, *const cb = &cb_, *const cc = &cc_, *const cd = &cd_;
 		const int32_t z0 = ca->sz, z1 = cb->sz, z2 = cc->sz, z3 = cd->sz;
 		if (z0 < near_z || z1 < near_z || z2 < near_z || z3 < near_z) {
 			/* nearer than the GTE projects (the road beside and under the
@@ -1683,8 +1695,9 @@ static void draw_scene_mesh(DrawCtx *c, const float *view)
 	FxM vfx, vfx1;
 	fx_from_float(view, &vfx);
 	vfx1 = vfx;
-	/* view space at VIEW_K times the mesh's units: the GTE projects no
-	 * nearer than H/2 of them, so that limit comes VIEW_K times nearer */
+	/* view space at VIEW_K (1 or 2) times the mesh's units: the GTE
+	 * projects no nearer than H/2 of them, so that limit comes VIEW_K
+	 * times nearer */
 	for (int k = 0; k < 9; k++) {
 		vfx.m[k] *= VIEW_K;
 	}
@@ -1950,6 +1963,7 @@ void gs_draw_scene(void)
 		c.tan_x = half * ((float)SCR_W * 0.5f) / half_px;
 		c.far_m = g_fog_on ? g_fog_far : 400.0f;
 		/* view-space units a metre (VIEW_K: draw_scene_mesh) */
+		g_vk = c.far_m * (float)g_scale * (float)VIEW_K_MAX <= 60000.0f ? VIEW_K_MAX : 1;
 		const float vs = (float)g_scale * (float)VIEW_K;
 		const float max_far = 60000.0f / vs;
 		if (c.far_m > max_far) {
