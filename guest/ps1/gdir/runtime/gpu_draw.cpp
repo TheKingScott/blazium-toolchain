@@ -41,7 +41,10 @@
 #else
 #define MAX_NODES 512
 #endif
-#define NEAR_M 2.0f /* clip plane: the race camera sees the road from ~4 m on; nearer splits it into many pieces */
+#define NEAR_M 2.0f /* the GTE's near limit at least: nearer goes through the software path */
+#ifndef NEAR_CLIP_M
+#define NEAR_CLIP_M 0.25f /* the clip plane (the software path projects what the GTE can't) */
+#endif
 
 struct Frame {
 	DISPENV disp;
@@ -897,6 +900,9 @@ struct DrawCtx {
 	unsigned tested;
 	/* integer culling, in mesh units with 12-bit tangents */
 	int32_t near_u, far_u, tanx_fx, tany_fx;
+	/* near_u: nearer than this a corner goes through the software path
+	 * (the GTE can't project it); near_clip_u: the clip plane */
+	int32_t near_clip_u;
 	int fog;  /* untextured triangles fade to the fog colour (GTE depth cue) */
 	int nfog; /* this chunk's node is NFOG (the backdrop): no fog, no far cut */
 	int32_t far_fog_u;
@@ -937,7 +943,7 @@ static int sphere_visible(const DrawCtx *c, const SVECTOR *centre, int32_t r0, i
 	gte_ldv0(centre);
 	gte_rt();
 	gte_stlvnl(&v);
-	if (v.vz + r < c->near_u || v.vz - r > c->far_u) {
+	if (v.vz + r < c->near_clip_u || v.vz - r > c->far_u) {
 		return 0;
 	}
 	/* 32-bit (a 64-bit multiply is a libgcc call): zr < 2^20 here (far_u
@@ -1054,18 +1060,21 @@ static uint32_t gte_divide(uint32_t h, uint32_t sz)
 		ready = 1;
 	}
 	if (h >= sz * 2) {
-		return 0x1ffff;
+		/* nearer than the GTE projects (it would saturate): the true
+		 * quotient (only the software path has such corners) */
+		return (h << 16) / sz;
 	}
 	int z = 0;
 	while (!(sz & (0x8000u >> z))) {
 		z++;
 	}
-	const uint64_t n = (uint64_t)h << z;
+	const uint32_t n = h << z; /* h < 2^10: < 2^25 */
 	uint32_t d = sz << z;
 	const uint32_t u = unr[(d - 0x7fc0) >> 7] + 0x101;
 	d = (0x2000080 - d * u) >> 8;
 	d = (0x0000080 + d * u) >> 8;
-	const uint64_t q = (n * d + 0x8000) >> 16;
+	/* 32x32 -> 64: one multu (a 64-bit operand would be a libgcc call) */
+	const uint64_t q = ((uint64_t)n * d + 0x8000) >> 16;
 	return q > 0x1ffff ? 0x1ffff : (uint32_t)q;
 }
 
@@ -1073,9 +1082,10 @@ static uint32_t gte_divide(uint32_t h, uint32_t sz)
 static inline int gte_screen(int32_t ir, uint32_t q, int32_t centre)
 {
 	ir = ir > 0x7fff ? 0x7fff : (ir < -0x8000 ? -0x8000 : ir);
-	const int32_t s = (int32_t)(((int64_t)ir * q + ((int64_t)centre << 16)) >> 16);
+	const int32_t s = (int32_t)(((int64_t)ir * (int32_t)q) >> 16) + centre;
 	return s > 1023 ? 1023 : (s < -1024 ? -1024 : s);
 }
+
 
 static int emit_poly(DrawCtx *c, const CV *v, int pn, unsigned tex)
 {
@@ -1093,10 +1103,10 @@ static int emit_poly(DrawCtx *c, const CV *v, int pn, unsigned tex)
 /* a convex polygon already projected (corners' z, colour and texel in v) */
 static int emit_fan(DrawCtx *c, const CV *v, const int *sx, const int *sy, int pn, unsigned tex)
 {
-	int32_t zs = 0;
+	int32_t zmax = 0;
 	int x0 = 1 << 30, x1 = -(1 << 30), y0 = 1 << 30, y1 = -(1 << 30);
 	for (int k = 0; k < pn; k++) {
-		zs += v[k].z;
+		zmax = v[k].z > zmax ? v[k].z : zmax;
 		x0 = sx[k] < x0 ? sx[k] : x0;
 		x1 = sx[k] > x1 ? sx[k] : x1;
 		y0 = sy[k] < y0 ? sy[k] : y0;
@@ -1114,7 +1124,10 @@ static int emit_fan(DrawCtx *c, const CV *v, const int *sx, const int *sy, int p
 	if (area <= 0) {
 		return 0;
 	}
-	int idx = (zs / (pn * 4)) >> c->ot_shift;
+	/* sorted by its farthest corner: these are the big pieces near the
+	 * camera (the road and the ground beside and under the kart), and by
+	 * their average depth they went in front of the karts standing on them */
+	int idx = (zmax / 4) >> c->ot_shift;
 	if (idx >= OT_LEN) {
 		return 0;
 	}
@@ -1192,6 +1205,16 @@ static int emit_fan(DrawCtx *c, const CV *v, const int *sx, const int *sy, int p
 			*(pword *)&p->r0 = *(const pword *)&rgb[a];
 			*(pword *)&p->r1 = *(const pword *)&rgb[b];
 			*(pword *)&p->r2 = *(const pword *)&rgb[d];
+#ifdef P1_DBG_NODE
+			{
+				/* the node's colour, lightened: the slow path's pieces */
+				const unsigned nd = c->dbg_node * 2654435761u;
+				const int r = ((nd >> 24) & 255) / 2 + 128, g = ((nd >> 16) & 255) / 2 + 128, bl = ((nd >> 8) & 255) / 2 + 128;
+				setRGB0(p, r, g, bl);
+				setRGB1(p, r, g, bl);
+				setRGB2(p, r, g, bl);
+			}
+#endif
 			setPolyG3(p);
 			setXY3(p, sx[a], sy[a], sx[b], sy[b], sx[d], sy[d]);
 			ot_append(idx, p, p);
@@ -1246,7 +1269,7 @@ static int draw_tri_slow(DrawCtx *c, const P1Vert *va, const P1Vert *vb, const P
 		for (int i = 0; i < pn; i++) {
 			const CV &a = in[i];
 			if (k == 4) {
-				d[i] = a.z - c->near_u;
+				d[i] = a.z - c->near_clip_u;
 			} else {
 				/* 32-bit: corners are inside +-2^20 (checked above), band
 				 * <= 500 and h < 512 */
@@ -1291,8 +1314,8 @@ static int draw_tri_slow(DrawCtx *c, const P1Vert *va, const P1Vert *vb, const P
 				m.b = a.b + (((b.b - a.b) * t) >> 12);
 				m.u = a.u + (((b.u - a.u) * t) >> 12);
 				m.v = a.v + (((b.v - a.v) * t) >> 12);
-				if (k == 4 && m.z < c->near_u) {
-					m.z = c->near_u;
+				if (k == 4 && m.z < c->near_clip_u) {
+					m.z = c->near_clip_u;
 				}
 				out[on++] = m;
 			}
@@ -1308,150 +1331,14 @@ static int draw_tri_slow(DrawCtx *c, const P1Vert *va, const P1Vert *vb, const P
 	return emit_poly(c, in, pn, tex);
 }
 
-/* A triangle through the near plane, the quick way: clipped there in
- * object space (32-bit sums: positions are int16), the pieces projected by
- * the GTE (RTPS: no divides in software). A corner the GTE can't place on
- * screen (its SX/SY saturate) or a piece too big for the GPU goes to the
- * exact routine (draw_tri_slow). */
-struct NV {
-	int32_t x, y, z;    /* object space, mesh units */
-	int32_t vx, vy, vz; /* view space */
-	int32_t r, g, b, u, v;
-};
-
-static int draw_tri_near(DrawCtx *c, const P1Vert *va, const P1Vert *vb, const P1Vert *vc, const uint8_t *uv, unsigned tex)
-{
-	const P1Vert *src[3] = { va, vb, vc };
-	NV in[3];
-	int behind = 0;
-	for (int k = 0; k < 3; k++) {
-		VECTOR o;
-		gte_ldv0(&src[k]->p);
-		gte_rt();
-		gte_stlvnl(&o);
-		if (o.vx > 0xfffff || o.vx < -0xfffff || o.vy > 0xfffff || o.vy < -0xfffff || o.vz > 0xfffff || o.vz < -0xfffff) {
-			return draw_tri_slow(c, va, vb, vc, uv, tex);
-		}
-		in[k].x = src[k]->p.vx;
-		in[k].y = src[k]->p.vy;
-		in[k].z = src[k]->p.vz;
-		in[k].vx = o.vx;
-		in[k].vy = o.vy;
-		in[k].vz = o.vz;
-		in[k].r = src[k]->r;
-		in[k].g = src[k]->g;
-		in[k].b = src[k]->b;
-		in[k].u = uv[k * 2];
-		in[k].v = uv[k * 2 + 1];
-		behind += o.vz < c->near_u;
-	}
-	if (behind == 3) {
-		return 0;
-	}
-	/* the near plane: a triangle becomes a triangle or a quad */
-	NV out[4];
-	int pn = 0;
-	const int32_t nz = c->near_u;
-	for (int i = 0; i < 3; i++) {
-		const NV &e0 = in[i], &e1 = in[i + 1 < 3 ? i + 1 : 0];
-		if (e0.vz - nz >= 0) {
-			out[pn++] = e0;
-		}
-		/* the point is worked out from the same end whichever way round
-		 * the edge is: the triangle on its other side cuts it at the very
-		 * same point (else a line of gaps shows between them) */
-		const int swap = e0.x != e1.x ? e0.x > e1.x : (e0.y != e1.y ? e0.y > e1.y : e0.z > e1.z);
-		const NV &a = swap ? e1 : e0, &b = swap ? e0 : e1;
-		const int32_t da = a.vz - nz, db = b.vz - nz;
-		if ((da >= 0) != (db >= 0)) {
-			int32_t na = da, nb = db;
-			while (na > 0x7ffff || na < -0x7ffff || nb > 0x7ffff || nb < -0x7ffff) {
-				na >>= 1;
-				nb >>= 1;
-			}
-			const int32_t t = (na << 12) / (na - nb); /* 0..4096 along a..b */
-			NV &m = out[pn++];
-			m.x = a.x + (((b.x - a.x) * t) >> 12);
-			m.y = a.y + (((b.y - a.y) * t) >> 12);
-			m.z = a.z + (((b.z - a.z) * t) >> 12);
-			m.vx = a.vx + (((b.vx - a.vx) >> 4) * t >> 8);
-			m.vy = a.vy + (((b.vy - a.vy) >> 4) * t >> 8);
-			m.vz = nz;
-			m.r = a.r + (((b.r - a.r) * t) >> 12);
-			m.g = a.g + (((b.g - a.g) * t) >> 12);
-			m.b = a.b + (((b.b - a.b) * t) >> 12);
-			m.u = a.u + (((b.u - a.u) * t) >> 12);
-			m.v = a.v + (((b.v - a.v) * t) >> 12);
-		}
-	}
-	if (pn < 3) {
-		return 0;
-	}
-	/* wholly outside a side of the view (beside or above the camera):
-	 * nothing to draw. 12-bit tangents, a corner or two of slack. */
-	{
-		int out_l = 0, out_r = 0, out_t = 0, out_b = 0;
-		for (int k = 0; k < pn; k++) {
-			/* 32-bit: |vz| < 2^20, tangents < 2^14 */
-			const int32_t lx = (((out[k].vz >> 4) * c->tanx_fx) >> 8) + 2;
-			const int32_t ly = (((out[k].vz >> 4) * c->tany_fx) >> 8) + 2;
-			out_r += out[k].vx > lx;
-			out_l += out[k].vx < -lx;
-			out_b += out[k].vy > ly;
-			out_t += out[k].vy < -ly;
-		}
-		if (out_r == pn || out_l == pn || out_b == pn || out_t == pn) {
-			return 0;
-		}
-	}
-	int sx[4], sy[4];
-	CV cv[4];
-	for (int k = 0; k < pn; k++) {
-		SVECTOR p;
-		p.vx = (int16_t)out[k].x;
-		p.vy = (int16_t)out[k].y;
-		p.vz = (int16_t)out[k].z;
-		p.pad = 0;
-		DVECTOR s;
-		int32_t flag;
-		gte_ldv0(&p);
-		gte_rtps();
-		gte_stsxy(&s);
-		gte_stflg(&flag);
-		if (flag & 0x6000) {
-			/* SX2/SY2 saturated: off the GTE's screen range */
-			return draw_tri_slow(c, va, vb, vc, uv, tex);
-		}
-		sx[k] = s.vx;
-		sy[k] = s.vy;
-		cv[k].z = out[k].vz;
-		cv[k].r = out[k].r << 8;
-		cv[k].g = out[k].g << 8;
-		cv[k].b = out[k].b << 8;
-		cv[k].u = out[k].u << 8;
-		cv[k].v = out[k].v << 8;
-	}
-	int x0 = sx[0], x1 = sx[0], y0 = sy[0], y1 = sy[0];
-	for (int k = 1; k < pn; k++) {
-		x0 = sx[k] < x0 ? sx[k] : x0;
-		x1 = sx[k] > x1 ? sx[k] : x1;
-		y0 = sy[k] < y0 ? sy[k] : y0;
-		y1 = sy[k] > y1 ? sy[k] : y1;
-	}
-	if (x1 - x0 > 1000 || y1 - y0 > 500) {
-		return draw_tri_slow(c, va, vb, vc, uv, tex);
-	}
-	return emit_fan(c, cv, sx, sy, pn, tex);
-}
-
 /* a primitive through the slow path: a triangle, or a quad as its two */
 static int prim_slow(DrawCtx *c, const P1Prim *pr, const P1Vert *va, const P1Vert *vb, const P1Vert *vc, const P1Vert *vd)
 {
-	int n = draw_tri_near(c, va, vb, vc, pr->uv, pr->tex);
+	int n = draw_tri_slow(c, va, vb, vc, pr->uv, pr->tex);
 	if (vd) {
 		/* the second triangle c,b,d (the source triangle's winding) */
 		const uint8_t uv2[6] = { pr->uv[4], pr->uv[5], pr->uv[2], pr->uv[3], pr->uv[6], pr->uv[7] };
-		n += draw_tri_near(c, vc, vb, vd, uv2, pr->tex);
+		n += draw_tri_slow(c, vc, vb, vd, uv2, pr->tex);
 	}
 	return n;
 }
@@ -1485,9 +1372,10 @@ static void draw_prims(DrawCtx *c, unsigned first, unsigned n)
 		const VCache *cd = quad ? vc_get(id, vd) : cc;
 		const int32_t z0 = ca->sz, z1 = cb->sz, z2 = cc->sz, z3 = cd->sz;
 		if (z0 < near_z || z1 < near_z || z2 < near_z || z3 < near_z) {
-			/* through the near plane (the road under the kart): cut it
-			 * there instead of losing it */
-			if (z0 >= near_z || z1 >= near_z || z2 >= near_z || z3 >= near_z) {
+			/* nearer than the GTE projects (the road beside and under the
+			 * kart): the software path cuts it at the clip plane */
+			const int32_t nc = c->near_clip_u;
+			if (z0 >= nc || z1 >= nc || z2 >= nc || z3 >= nc) {
 				drawn += prim_slow(c, pr, va, vb, vc, vd);
 			}
 			continue;
@@ -1774,7 +1662,7 @@ static void draw_scene_mesh(DrawCtx *c, const float *view)
 		const int32_t vy = (int32_t)(((int64_t)vfx.m[3] * ic->cx + (int64_t)vfx.m[4] * ic->cy + (int64_t)vfx.m[5] * ic->cz) >> 12) + vfx.t[1];
 		const int32_t vz = (int32_t)(((int64_t)vfx.m[6] * ic->cx + (int64_t)vfx.m[7] * ic->cy + (int64_t)vfx.m[8] * ic->cz) >> 12) + vfx.t[2];
 		const int32_t r = ic->r;
-		if (vz + r < c->near_u || vz - r > c->far_u) {
+		if (vz + r < c->near_clip_u || vz - r > c->far_u) {
 			continue;
 		}
 		const int32_t zr = vz + r;
@@ -2008,6 +1896,10 @@ void gs_draw_scene(void)
 		 * tops out at 2): nothing nearer is projected by it */
 		if (c.near_u < (int32_t)c.h / 2 + 1) {
 			c.near_u = (int32_t)c.h / 2 + 1;
+		}
+		c.near_clip_u = (int32_t)(NEAR_CLIP_M * (float)g_scale);
+		if (c.near_clip_u < 1) {
+			c.near_clip_u = 1;
 		}
 		c.fog = 0;
 		if (g_fog_on && g_fog_far > g_fog_near) {
