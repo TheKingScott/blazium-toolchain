@@ -41,7 +41,7 @@
 #else
 #define MAX_NODES 512
 #endif
-#define NEAR_M 2.0f /* the GTE's near limit at least: nearer goes through the software path */
+#define NEAR_M 0.5f /* the GTE projects from here or from its own limit, H/2 view units, whichever is farther; nearer goes through the software path */
 #ifndef NEAR_CLIP_M
 #define NEAR_CLIP_M 0.25f /* the clip plane (the software path projects what the GTE can't) */
 #endif
@@ -1003,7 +1003,13 @@ struct VCache {
 	DVECTOR sxy;
 	int32_t sz;
 };
-#define VC_N 64 /* 12 bytes each: 768 of the scratchpad's 1024 */
+#ifndef VIEW_K
+#define VIEW_K 2 /* view space at twice the mesh's units (draw_scene_mesh); 4 runs the title's backdrop past the GTE's 16 bits */
+#endif
+
+#ifndef VC_N
+#define VC_N 32 /* 12 bytes each, 384 of the scratchpad's 1024 (the slow path's clip buffers have 432 after them) */
+#endif
 #define g_vc ((VCache *)0x1f800000)
 static uint32_t g_vc_gen; /* bumped when the matrix changes: no clearing */
 
@@ -1036,9 +1042,14 @@ static inline const VCache *vc_get(unsigned i, const P1Vert *v)
 /* ---- the slow path: triangles through the near plane, or too big for the
  * GPU. Done in view space with the GTE matrix still loaded: clip at the near
  * plane, split until each piece fits the GPU's limits, project by hand. */
+/* the slow path's clip buffers: two polygons of 9 corners, after the
+ * vertex cache in the scratchpad */
+struct CV;
+#define g_clip_buf ((CV *)(0x1f800000 + VC_N * sizeof(VCache)))
 struct CV {
 	int32_t x, y, z;
-	int32_t r, g, b, u, v; /* colour and texel, 8.8 */
+	uint16_t r, g, b, u, v; /* colour and texel, 8.8 */
+	uint16_t pad;
 };
 
 /* a clipped polygon (inside the guard band, in front of the near plane):
@@ -1225,11 +1236,19 @@ static int emit_fan(DrawCtx *c, const CV *v, const int *sx, const int *sy, int p
 }
 
 /* uv: the three corners' texel UVs (u, v each) */
-static int draw_tri_slow(DrawCtx *c, const P1Vert *va, const P1Vert *vb, const P1Vert *vc, const uint8_t *uv, unsigned tex)
+/* a convex polygon of n (3 or 4) corners, in order round it, uv a corner's
+ * (u, v) each */
+#ifdef P1_SLOW_STATS
+extern "C" unsigned p1_clock(void);
+unsigned g_clip_t0, g_clip_ticks;
+#endif
+static int draw_poly_slow(DrawCtx *c, const P1Vert *const *src, const uint8_t (*uv)[2], int n, unsigned tex)
 {
-	const P1Vert *src[3] = { va, vb, vc };
-	CV v[3];
-	for (int k = 0; k < 3; k++) {
+#ifdef P1_SLOW_STATS
+	g_clip_t0 = p1_clock();
+#endif
+	CV v[4];
+	for (int k = 0; k < n; k++) {
 		VECTOR o;
 		gte_ldv0(&src[k]->p);
 		gte_rt();
@@ -1240,10 +1259,10 @@ static int draw_tri_slow(DrawCtx *c, const P1Vert *va, const P1Vert *vb, const P
 		v[k].r = src[k]->r << 8;
 		v[k].g = src[k]->g << 8;
 		v[k].b = src[k]->b << 8;
-		v[k].u = uv[k * 2] << 8;
-		v[k].v = uv[k * 2 + 1] << 8;
+		v[k].u = uv[k][0] << 8;
+		v[k].v = uv[k][1] << 8;
 	}
-	for (int k = 0; k < 3; k++) {
+	for (int k = 0; k < n; k++) {
 		if (v[k].x > 0xfffff || v[k].x < -0xfffff || v[k].y > 0xfffff || v[k].y < -0xfffff || v[k].z > 0xfffff) {
 			return 0; /* far outside anything drawn */
 		}
@@ -1251,11 +1270,14 @@ static int draw_tri_slow(DrawCtx *c, const P1Vert *va, const P1Vert *vb, const P
 	/* clip against the near plane and a guard band round the screen
 	 * (screen x -340..660, y -130..370: inside the GPU's 1023x511), so
 	 * every piece projects to a primitive the GPU draws */
-	CV pa[9], pb[9];
-	int pn = 3;
-	pa[0] = v[0];
-	pa[1] = v[1];
-	pa[2] = v[2];
+	/* 4 corners and one more for each of the 5 planes, in the scratchpad
+	 * after the vertex cache (main RAM has no data cache: in it, the copies
+	 * clipping makes were most of this routine's time) */
+	CV *const pa = g_clip_buf, *const pb = g_clip_buf + 9;
+	int pn = n;
+	for (int k = 0; k < n; k++) {
+		pa[k] = v[k];
+	}
 	const int32_t h = (int32_t)c->h;
 	/* plane k: d = a*z - s*coord >= 0 with a = band edge in pixels, s = h */
 	const int32_t band[4] = { SCR_W / 2 + 340, SCR_W / 2 + 340, SCR_H / 2 + 130, SCR_H / 2 + 130 };
@@ -1328,19 +1350,45 @@ static int draw_tri_slow(DrawCtx *c, const P1Vert *va, const P1Vert *vb, const P
 		in = out;
 		out = t;
 	}
+#ifdef P1_SLOW_STATS
+	extern unsigned g_clip_t0, g_clip_ticks;
+	g_clip_ticks += (p1_clock() - g_clip_t0) & 0xffff;
+#endif
 	return emit_poly(c, in, pn, tex);
 }
 
 /* a primitive through the slow path: a triangle, or a quad as its two */
+#ifdef P1_SLOW_STATS
+static unsigned g_slow_ticks, g_slow_n, g_slow_out;
+#endif
+static int prim_slow_(DrawCtx *c, const P1Prim *pr, const P1Vert *va, const P1Vert *vb, const P1Vert *vc, const P1Vert *vd);
 static int prim_slow(DrawCtx *c, const P1Prim *pr, const P1Vert *va, const P1Vert *vb, const P1Vert *vc, const P1Vert *vd)
 {
-	int n = draw_tri_slow(c, va, vb, vc, pr->uv, pr->tex);
-	if (vd) {
-		/* the second triangle c,b,d (the source triangle's winding) */
-		const uint8_t uv2[6] = { pr->uv[4], pr->uv[5], pr->uv[2], pr->uv[3], pr->uv[6], pr->uv[7] };
-		n += draw_tri_slow(c, vc, vb, vd, uv2, pr->tex);
-	}
+#ifdef P1_SLOW_STATS
+	const unsigned t0 = p1_clock();
+	const int n = prim_slow_(c, pr, va, vb, vc, vd);
+	g_slow_ticks += (p1_clock() - t0) & 0xffff;
+	g_slow_n++;
+	g_slow_out += n;
 	return n;
+#else
+	return prim_slow_(c, pr, va, vb, vc, vd);
+#endif
+}
+
+static int prim_slow_(DrawCtx *c, const P1Prim *pr, const P1Vert *va, const P1Vert *vb, const P1Vert *vc, const P1Vert *vd)
+{
+	/* a quad (a, b, c + c, b, d: the GPU's order) as the polygon round it,
+	 * a, b, d, c: clipped once, not as its two triangles */
+	const uint8_t *u = pr->uv;
+	if (vd) {
+		const P1Vert *src[4] = { va, vb, vd, vc };
+		const uint8_t uv[4][2] = { { u[0], u[1] }, { u[2], u[3] }, { u[6], u[7] }, { u[4], u[5] } };
+		return draw_poly_slow(c, src, uv, 4, pr->tex);
+	}
+	const P1Vert *src[3] = { va, vb, vc };
+	const uint8_t uv[3][2] = { { u[0], u[1] }, { u[2], u[3] }, { u[4], u[5] } };
+	return draw_poly_slow(c, src, uv, 3, pr->tex);
 }
 
 /* a run of quads (QUAD 1) or of triangles: one loop for each, no
@@ -1376,6 +1424,17 @@ static void draw_prims(DrawCtx *c, unsigned first, unsigned n)
 			 * kart): the software path cuts it at the clip plane */
 			const int32_t nc = c->near_clip_u;
 			if (z0 >= nc || z1 >= nc || z2 >= nc || z3 >= nc) {
+				/* with every corner in front of the camera, the GTE's screen
+				 * point is on the right side of the screen's edges even
+				 * where its divide saturated (it only falls short of the
+				 * true one): wholly off one edge, nothing to cut */
+				if (z0 > 0 && z1 > 0 && z2 > 0 && z3 > 0) {
+					const DVECTOR s0 = ca->sxy, s1 = cb->sxy, s2 = cc->sxy, s3 = cd->sxy;
+					if ((s0.vx < 0 && s1.vx < 0 && s2.vx < 0 && s3.vx < 0) || (s0.vx >= SCR_W && s1.vx >= SCR_W && s2.vx >= SCR_W && s3.vx >= SCR_W) ||
+							(s0.vy < 0 && s1.vy < 0 && s2.vy < 0 && s3.vy < 0) || (s0.vy >= SCR_H && s1.vy >= SCR_H && s2.vy >= SCR_H && s3.vy >= SCR_H)) {
+						continue;
+					}
+				}
 				drawn += prim_slow(c, pr, va, vb, vc, vd);
 			}
 			continue;
@@ -1418,11 +1477,7 @@ static void draw_prims(DrawCtx *c, unsigned first, unsigned n)
 				/* too big for the GPU, or a corner the GTE pinned to the
 				 * end of its range (SX/SY saturate at -1024 and 1023: the
 				 * shape would be wrong) */
-				drawn += draw_tri_slow(c, va, vb, vc, pr->uv, pr->tex);
-				if (vd) {
-					const uint8_t uv2[6] = { pr->uv[4], pr->uv[5], pr->uv[2], pr->uv[3], pr->uv[6], pr->uv[7] };
-					drawn += draw_tri_slow(c, vc, vb, vd, uv2, pr->tex);
-				}
+				drawn += prim_slow(c, pr, va, vb, vc, vd);
 				continue;
 			}
 		}
@@ -1578,31 +1633,36 @@ static inline void draw_chunk(DrawCtx *c, unsigned ci)
 
 /* one group: its node's matrix in the GTE (loaded: the node whose matrix
  * is there, -1 the view alone), then the group and its chunks culled */
-static void draw_group(DrawCtx *c, const FxM *vfx, unsigned gi, int *loaded)
+static void draw_group(DrawCtx *c, const FxM *vfx, const FxM *vfx1, unsigned gi, int *loaded)
 {
 	const ChunkG *g = &g_grp[gi];
 	const unsigned node = g->node;
 	const int moved = node < MAX_NODES && g_nodes_live && g_nm_on[node];
-	const int want = moved ? (int)node : -1;
+	c->nfog = node < MAX_NODES && g_nfog[node];
+	/* the backdrop (NFOG, far off) in the mesh's own units: at VIEW_K its
+	 * view coordinates would pass the GTE's 16 bits */
+	const int k1 = c->nfog;
+	const int want = (moved ? (int)node : -1) * 2 - k1;
 	if (want != *loaded) {
 		*loaded = want;
+		const FxM *base = k1 ? vfx1 : vfx;
 		if (moved) {
 			FxM mv;
-			fx_mul(vfx, &g_nm[node], &mv);
+			fx_mul(base, &g_nm[node], &mv);
 			fx_load(&mv);
 		} else {
-			fx_load(vfx);
+			fx_load(base);
 		}
 	}
-	c->nfog = node < MAX_NODES && g_nfog[node];
 	c->far_u = c->nfog ? 0x7fffffff : c->far_fog_u;
-	const int vis = sphere_visible(c, &g->c, g->r, 4096);
+	const int ksc = k1 ? 4096 : 4096 * VIEW_K;
+	const int vis = sphere_visible(c, &g->c, g->r, ksc);
 	if (!vis) {
 		return;
 	}
 	for (unsigned ci = g->first; ci < (unsigned)g->first + g->n; ci++) {
 		/* a group wholly in view: so is each of its chunks */
-		if (vis == 2 ? g_cint[ci].r >= 0 : chunk_visible(c, ci, 4096)) {
+		if (vis == 2 ? g_cint[ci].r >= 0 : chunk_visible(c, ci, ksc)) {
 			draw_chunk(c, ci);
 		}
 	}
@@ -1620,12 +1680,21 @@ static void draw_scene_mesh(DrawCtx *c, const float *view)
 	for (int i = 0; i < VC_N; i++) {
 		g_vc[i].tag = 0xffffffffu;
 	}
-	FxM vfx;
+	FxM vfx, vfx1;
 	fx_from_float(view, &vfx);
-	int loaded = -2;
+	vfx1 = vfx;
+	/* view space at VIEW_K times the mesh's units: the GTE projects no
+	 * nearer than H/2 of them, so that limit comes VIEW_K times nearer */
+	for (int k = 0; k < 9; k++) {
+		vfx.m[k] *= VIEW_K;
+	}
+	for (int k = 0; k < 3; k++) {
+		vfx.t[k] *= VIEW_K;
+	}
+	int loaded = -1000; /* nothing loaded yet (draw_group: node * 2 - backdrop) */
 	for (unsigned gi = 0; gi < g_grp_n; gi++) {
 		if (!group_skipped(gi)) {
-			draw_group(c, &vfx, gi, &loaded);
+			draw_group(c, &vfx, &vfx1, gi, &loaded);
 		}
 	}
 	/* MultiMesh instances: each one draws its source node's chunks. The
@@ -1661,7 +1730,7 @@ static void draw_scene_mesh(DrawCtx *c, const float *view)
 		const int32_t vx = (int32_t)(((int64_t)vfx.m[0] * ic->cx + (int64_t)vfx.m[1] * ic->cy + (int64_t)vfx.m[2] * ic->cz) >> 12) + vfx.t[0];
 		const int32_t vy = (int32_t)(((int64_t)vfx.m[3] * ic->cx + (int64_t)vfx.m[4] * ic->cy + (int64_t)vfx.m[5] * ic->cz) >> 12) + vfx.t[1];
 		const int32_t vz = (int32_t)(((int64_t)vfx.m[6] * ic->cx + (int64_t)vfx.m[7] * ic->cy + (int64_t)vfx.m[8] * ic->cz) >> 12) + vfx.t[2];
-		const int32_t r = ic->r;
+		const int32_t r = ic->r * VIEW_K;
 		if (vz + r < c->near_clip_u || vz - r > c->far_u) {
 			continue;
 		}
@@ -1674,7 +1743,7 @@ static void draw_scene_mesh(DrawCtx *c, const float *view)
 		FxM mv;
 		fx_mul(&vfx, &ic->w, &mv);
 		fx_load(&mv);
-		const int32_t chunk_sc = ic->r > 0 ? (int32_t)(((int64_t)g_iscale[i] * (g_nm_on[nd] ? g_nscale[nd] : 4096)) >> 12) : 4096;
+		const int32_t chunk_sc = VIEW_K * (ic->r > 0 ? (int32_t)(((int64_t)g_iscale[i] * (g_nm_on[nd] ? g_nscale[nd] : 4096)) >> 12) : 4096);
 		for (unsigned ci = g_isrc_c0[nd]; ci < g_isrc_c1[nd]; ci++) {
 			if (chunk_visible(c, ci, chunk_sc)) {
 				draw_chunk(c, ci);
@@ -1880,24 +1949,26 @@ void gs_draw_scene(void)
 		c.tan_y = half * ((float)SCR_H * 0.5f) / half_px;
 		c.tan_x = half * ((float)SCR_W * 0.5f) / half_px;
 		c.far_m = g_fog_on ? g_fog_far : 400.0f;
-		const float max_far = 60000.0f / (float)g_scale;
+		/* view-space units a metre (VIEW_K: draw_scene_mesh) */
+		const float vs = (float)g_scale * (float)VIEW_K;
+		const float max_far = 60000.0f / vs;
 		if (c.far_m > max_far) {
 			c.far_m = max_far;
 		}
 		/* average-depth OT index: otz = sz / 4, spread over OT_LEN */
-		const int otz_max = (int)(c.far_m * (float)g_scale) / 4;
+		const int otz_max = (int)(c.far_m * vs) / 4;
 		c.ot_shift = 0;
 		while ((otz_max >> c.ot_shift) >= OT_LEN && c.ot_shift < 16) {
 			c.ot_shift++;
 		}
 		gte_SetGeomScreen((int)c.h);
-		c.near_u = (int32_t)(NEAR_M * (float)g_scale);
+		c.near_u = (int32_t)(NEAR_M * vs);
 		/* the GTE's perspective divide saturates nearer than H/2 (H/SZ
 		 * tops out at 2): nothing nearer is projected by it */
 		if (c.near_u < (int32_t)c.h / 2 + 1) {
 			c.near_u = (int32_t)c.h / 2 + 1;
 		}
-		c.near_clip_u = (int32_t)(NEAR_CLIP_M * (float)g_scale);
+		c.near_clip_u = (int32_t)(NEAR_CLIP_M * vs);
 		if (c.near_clip_u < 1) {
 			c.near_clip_u = 1;
 		}
@@ -1905,14 +1976,14 @@ void gs_draw_scene(void)
 		if (g_fog_on && g_fog_far > g_fog_near) {
 			/* linear fog from the triangle's depth (draw_prims), the GTE's
 			 * depth cue (DPCT) blending towards the far colour */
-			const float n = (g_fog_near > NEAR_M ? g_fog_near : NEAR_M) * (float)g_scale;
-			const float f = g_fog_far * (float)g_scale;
+			const float n = (g_fog_near > NEAR_M ? g_fog_near : NEAR_M) * vs;
+			const float f = g_fog_far * vs;
 			c.fog_n = (int32_t)n;
 			c.fog_k = (int32_t)(4096.0f * 65536.0f / (f - n));
 			gte_SetFarColor(g_fog_r, g_fog_g, g_fog_b);
 			c.fog = 1;
 		}
-		c.far_u = (int32_t)(c.far_m * (float)g_scale);
+		c.far_u = (int32_t)(c.far_m * vs);
 		c.far_fog_u = c.far_u;
 		c.tanx_fx = (int32_t)(c.tan_x * 4096.0f);
 		c.tany_fx = (int32_t)(c.tan_y * 4096.0f);
@@ -1946,6 +2017,10 @@ void gs_draw_scene(void)
 	s_hg += (uint16_t)(h3 - h2);
 	if (++s_hn == 120) {
 		printf("P1 hblanks/frame: scene %u hud %u gpu wait %u\n", s_hs / 120, s_hh / 120, s_hg / 120);
+#ifdef P1_SLOW_STATS
+		printf("P1 slow: %u prims %u pieces %u ticks a frame (clipping %u)\n", g_slow_n / 120, g_slow_out / 120, g_slow_ticks / 120, g_clip_ticks / 120);
+		g_slow_n = g_slow_out = g_slow_ticks = g_clip_ticks = 0;
+#endif
 		s_hs = s_hh = s_hg = s_hn = 0;
 	}
 #else
