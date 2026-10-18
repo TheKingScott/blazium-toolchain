@@ -169,11 +169,18 @@ static float s_world[GDIR_MAX_NODES][12];
 static float s_w0inv[GDIR_MAX_NODES][12];
 static unsigned char s_vis[GDIR_MAX_NODES];
 static unsigned char s_dirty;
-/* which nodes' own transforms changed since the last recompute_nodes (their
- * subtrees are redone, the rest kept); s_all_dirty redoes everything */
+/* Node worlds are worked out lazily. s_ndirty: the node's own transform
+ * changed. s_wver counts each recompute of a node's world, and s_pver holds
+ * the parent's count that world was built on, so a node is stale when it
+ * moved or its parent's world changed since. A script that reads a node
+ * (global_position, look_at) brings just that node and its parents up to
+ * date; recompute_nodes, once a frame, does the rest and hands the
+ * renderer only the matrices that changed (s_sent). */
 static unsigned char s_ndirty[GDIR_MAX_NODES];
-static unsigned char s_wchanged[GDIR_MAX_NODES];
 static unsigned char s_lstale[GDIR_MAX_NODES]; /* s_local needs mat_from_trs */
+static unsigned s_wver[GDIR_MAX_NODES];
+static unsigned s_pver[GDIR_MAX_NODES];
+static unsigned s_sent[GDIR_MAX_NODES];
 static float s_local[GDIR_MAX_NODES][12];
 static unsigned char s_all_dirty = 1;
 
@@ -182,6 +189,7 @@ static void mark_node(int n)
 	s_dirty = 1;
 	if (n >= 0 && n < GDIR_MAX_NODES) {
 		s_ndirty[n] = 1;
+		s_lstale[n] = 1;
 	} else {
 		s_all_dirty = 1;
 	}
@@ -206,7 +214,10 @@ static unsigned s_ops;
 static char s_ring[GDIR_RING][GDIR_STR];
 static unsigned s_ring_i;
 static Val s_arr[GDIR_ARRAYS][GDIR_ARR_LEN];
-static char s_arrstr[GDIR_ARRAYS][GDIR_ARR_LEN][40];
+#ifndef GDIR_ARR_STR
+#define GDIR_ARR_STR 40 /* a string kept in an array: bytes, with the 0 */
+#endif
+static char s_arrstr[GDIR_ARRAYS][GDIR_ARR_LEN][GDIR_ARR_STR];
 static unsigned char s_arr_n[GDIR_ARRAYS];
 static unsigned char s_arr_used[GDIR_ARRAYS];
 static char s_err[96];
@@ -548,7 +559,9 @@ static int arr_new(void)
 		}
 		arr_gc();
 	}
-	fail("out of arrays (96 live)");
+	char m[48];
+	snprintf(m, sizeof(m), "out of arrays (%d live)", GDIR_ARRAYS);
+	fail(m);
 	return -1;
 }
 
@@ -666,34 +679,83 @@ static void mark_keep(int n)
 	}
 }
 
-/* n or an ancestor has a change still waiting (it was hidden) */
-static int chain_pending(int n)
+static int node_parent(int n)
 {
-	while (node_ok(n)) {
-		if (s_ndirty[n]) {
-			return 1;
+	const int p = s_nodes[n].parent;
+	return (p >= 0 && p < n) ? p : -1;
+}
+
+static int node_stale(int n)
+{
+	const int p = node_parent(n);
+	return s_ndirty[n] || (p >= 0 && s_pver[n] != s_wver[p]);
+}
+
+/* n's world from its parent's (already current) and its own transform */
+static void compute_one(int n)
+{
+	PackNode *pn = &s_nodes[n];
+	const int p = node_parent(n);
+	if (!(pn->flags & 2)) {
+		/* Non-3D nodes pass the parent's transform through. */
+		if (p >= 0) {
+			memcpy(s_world[n], s_world[p], sizeof(s_world[n]));
+		} else {
+			const float id[12] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0 };
+			memcpy(s_world[n], id, sizeof(id));
 		}
-		const int p = s_nodes[n].parent;
-		if (p < 0 || p >= n) {
-			break;
+	} else {
+		/* the local matrix only when the node's own TRS changed */
+		if (s_lstale[n]) {
+			mat_from_trs(pn->lpos, pn->lrot, pn->lscale, s_local[n]);
+			s_lstale[n] = 0;
 		}
-		n = p;
+		if (p >= 0) {
+			mat_mul34(s_world[p], s_local[n], s_world[n]);
+		} else {
+			memcpy(s_world[n], s_local[n], sizeof(s_local[n]));
+		}
 	}
-	return 0;
+	s_pver[n] = p >= 0 ? s_wver[p] : 0;
+	s_wver[n]++;
+	s_ndirty[n] = 0;
 }
 
 static void recompute_nodes(void);
 
-/* n's world up to date for a script that reads it, hidden or not */
+/* n's world up to date for a script that reads it: n and its parents only */
 static void world_fresh(int n)
 {
-	if (s_dirty) {
-		recompute_nodes();
+	if (!node_ok(n)) {
+		return;
 	}
-	if (node_ok(n) && !s_vis[n] && chain_pending(n)) {
-		s_all_dirty = 1;
+	if (s_all_dirty) {
 		recompute_nodes();
+		return;
 	}
+	int chain[64];
+	int k = 0;
+	for (int c = n; c >= 0 && k < 64; c = node_parent(c)) {
+		chain[k++] = c;
+	}
+	/* from the top down, redo each stale one (a redone parent makes the
+	 * rest stale) */
+	for (int i = k - 1; i >= 0; i--) {
+		if (node_stale(chain[i])) {
+			compute_one(chain[i]);
+		}
+	}
+}
+
+/* visible: the node and all its parents */
+static int node_visible(int n)
+{
+	for (int c = n; c >= 0; c = node_parent(c)) {
+		if (!(s_nodes[c].flags & 1)) {
+			return 0;
+		}
+	}
+	return 1;
 }
 
 static void recompute_nodes(void)
@@ -710,45 +772,18 @@ static void recompute_nodes(void)
 	}
 	for (unsigned n = 0; n < s_node_n; n++) {
 		PackNode *pn = &s_nodes[n];
-		const int p = pn->parent;
-		const int has_p = p >= 0 && (unsigned)p < n;
-		const int pvis = has_p ? s_vis[p] : 1;
+		const int p = node_parent((int)n);
+		const int pvis = p >= 0 ? s_vis[p] : 1;
 		s_vis[n] = (unsigned char)(((pn->flags & 1) && pvis) ? 1 : 0);
-		int redo = all || s_ndirty[n] || (has_p && s_wchanged[p]);
-		if (all || s_ndirty[n]) {
+		if (all) {
 			s_lstale[n] = 1;
+			compute_one((int)n);
+			continue;
 		}
 		/* a hidden node's world waits until it is shown (its children are
-		 * hidden too, and are redone with it) */
-		if (redo && !s_vis[n] && !all && !s_keep[n]) {
-			s_ndirty[n] = 1;
-			redo = 0;
-		} else {
-			s_ndirty[n] = 0;
-		}
-		s_wchanged[n] = (unsigned char)redo;
-		if (!redo) {
-			continue;
-		}
-		if (!(pn->flags & 2)) {
-			/* Non-3D nodes pass the parent's transform through. */
-			if (has_p) {
-				memcpy(s_world[n], s_world[p], sizeof(s_world[n]));
-			} else {
-				const float id[12] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0 };
-				memcpy(s_world[n], id, sizeof(id));
-			}
-			continue;
-		}
-		/* the local matrix only when the node's own TRS changed */
-		if (s_lstale[n]) {
-			mat_from_trs(pn->lpos, pn->lrot, pn->lscale, s_local[n]);
-			s_lstale[n] = 0;
-		}
-		if (has_p) {
-			mat_mul34(s_world[p], s_local[n], s_world[n]);
-		} else {
-			memcpy(s_world[n], s_local[n], sizeof(s_local[n]));
+		 * hidden too, and wait with it); the cameras never wait */
+		if (node_stale((int)n) && (s_vis[n] || s_keep[n])) {
+			compute_one((int)n);
 		}
 	}
 	s_all_dirty = 0;
@@ -758,9 +793,10 @@ static void recompute_nodes(void)
 		if (pn->hud >= 0) {
 			sys_io_hud_set_hidden(pn->hud, !s_vis[n]);
 		}
-		if (!s_wchanged[n]) {
+		if (s_sent[n] == s_wver[n] && !all) {
 			continue; /* the renderer keeps the matrix it has */
 		}
+		s_sent[n] = s_wver[n];
 		if (!(pn->flags & 2)) {
 			gs_draw_node_matrix((int)n, 0);
 			continue;
@@ -1124,6 +1160,12 @@ static int compare(int op, const Val &a, const Val &b)
 static Val call(unsigned inst, unsigned func, const Val *args, int argc);
 #ifdef GDIR_STATS
 static unsigned s_fn_ops[GDIR_MAX_FUNCS]; /* inclusive, since the last report */
+#ifdef GDIR_CLOCK
+extern "C" unsigned GDIR_CLOCK(void);
+/* GDIR_CLOCK(): a 16-bit tick counter the guest provides; time in natives */
+static unsigned s_nat_time[GN_COUNT], s_nat_calls[GN_COUNT];
+static unsigned s_recompute_ticks; /* the frame-end node pass */
+#endif
 #endif
 static unsigned s_ops_last; /* interpreter ops of the last frame (GS_FRAMELOG) */
 unsigned gdir_vm_last_ops(void);
@@ -1606,10 +1648,7 @@ static Val native(unsigned inst, int id, Val *a, int n)
 			return vnil();
 		case GN_NODE_IS_VISIBLE:
 			if (a[0].t == T_NODE && node_ok(a[0].i)) {
-				if (s_dirty) {
-					recompute_nodes();
-				}
-				return vbool(s_vis[a[0].i]);
+				return vbool(node_visible(a[0].i));
 			}
 			return vbool(0);
 		case GN_NODE_GRAB_FOCUS:
@@ -1953,7 +1992,16 @@ static Val call(unsigned inst, unsigned func, const Val *args, int argc)
 				for (int i = argc2 - 1; i >= 0; i--) {
 					a[i] = s_stack[--s_sp];
 				}
+#if defined(GDIR_STATS) && defined(GDIR_CLOCK)
+				const unsigned t0 = GDIR_CLOCK();
 				s_stack[s_sp++] = native(inst, id, a, argc2);
+				if (id >= 0 && id < GN_COUNT) {
+					s_nat_time[id] += (GDIR_CLOCK() - t0) & 0xffff;
+					s_nat_calls[id]++;
+				}
+#else
+				s_stack[s_sp++] = native(inst, id, a, argc2);
+#endif
 			} break;
 			case GOP_RET:
 				ret = s_stack[--s_sp];
@@ -2355,9 +2403,15 @@ void gdir_vm_process(float delta)
 			}
 		}
 	}
+#if defined(GDIR_STATS) && defined(GDIR_CLOCK)
+	const unsigned tr0 = GDIR_CLOCK();
+#endif
 	if (s_dirty) {
 		recompute_nodes();
 	}
+#if defined(GDIR_STATS) && defined(GDIR_CLOCK)
+	s_recompute_ticks += (GDIR_CLOCK() - tr0) & 0xffff;
+#endif
 	s_ops_last = s_ops;
 #ifdef GDIR_STATS
 	{
@@ -2385,6 +2439,27 @@ void gdir_vm_process(float delta)
 				s_fn_ops[bi] = 0;
 			}
 			memset(s_fn_ops, 0, sizeof(s_fn_ops));
+#ifdef GDIR_CLOCK
+			printf("  node pass          %u ticks/frame\n", s_recompute_ticks / 300);
+			s_recompute_ticks = 0;
+			/* the six natives that took the most time, ticks per frame */
+			for (int top = 0; top < 6; top++) {
+				unsigned best = 0, bi = 0;
+				for (unsigned k = 0; k < GN_COUNT; k++) {
+					if (s_nat_time[k] > best) {
+						best = s_nat_time[k];
+						bi = k;
+					}
+				}
+				if (!best) {
+					break;
+				}
+				printf("  native %3u        %u ticks/frame, %u calls/frame\n", bi, best / 300, s_nat_calls[bi] / 300);
+				s_nat_time[bi] = 0;
+			}
+			memset(s_nat_time, 0, sizeof(s_nat_time));
+			memset(s_nat_calls, 0, sizeof(s_nat_calls));
+#endif
 		}
 	}
 #endif

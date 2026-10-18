@@ -805,3 +805,27 @@ float powf(float x, float y)
 	}
 	return expf(y * logf(x));
 }
+
+/* the heap as PSn00bSDK sees it, for "no memory" reports */
+struct P1HeapUsage { /* PSn00bSDK's HeapUsage */
+	size_t total, heap, stack, alloc, alloc_max;
+};
+void GetHeapUsage(struct P1HeapUsage *usage);
+void p1_heap_report(void)
+{
+	struct P1HeapUsage hu;
+	GetHeapUsage(&hu);
+	printf("heap: %u in use (peak %u), heap %u, total %u\n", (unsigned)hu.alloc, (unsigned)hu.alloc_max, (unsigned)hu.heap,
+			(unsigned)hu.total);
+}
+
+/* root counter 2 at the system clock / 8 (4.23 MHz), for GDIR_STATS */
+unsigned p1_clock(void)
+{
+	static int on;
+	if (!on) {
+		*(volatile uint32_t *)0x1f801124 = 0x0200;
+		on = 1;
+	}
+	return *(volatile uint32_t *)0x1f801120 & 0xffff;
+}

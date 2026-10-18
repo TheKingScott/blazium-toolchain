@@ -55,14 +55,10 @@ static uint8_t *load_file(const char *name, unsigned *size)
 	return b;
 }
 
-static const unsigned char *s_mesh0;
-
 static unsigned char *reload_gtex0(const unsigned char *mesh, unsigned *size)
 {
+	(void)mesh; /* only pack 0 is set up without its GTEX */
 	*size = 0;
-	if (!mesh || mesh != s_mesh0) {
-		return 0;
-	}
 	return load_file("GTEX00.BIN", size);
 }
 
@@ -103,14 +99,15 @@ int main(int argc, const char **argv)
 	pad_io_init();
 
 	unsigned mesh_sz = 0, gtex_sz = 0, node_sz = 0, scrp_sz = 0;
+	/* the scripts stay for good: load them first, low in the heap, so pack 0
+	 * (let go during other scenes) leaves its room next to the free top */
+	uint8_t *scrp = load_file("SCRP00.BIN", &scrp_sz);
 	uint8_t *mesh = load_file("MESH00.BIN", &mesh_sz);
 	uint8_t *gtex = load_file("GTEX00.BIN", &gtex_sz);
 	uint8_t *node = load_file("NODE00.BIN", &node_sz);
-	uint8_t *scrp = load_file("SCRP00.BIN", &scrp_sz);
 	if (!mesh || !gs_draw_init(mesh, mesh_sz, gtex, gtex_sz, node, node_sz)) {
 		halt("No scene on the disc (MESH00).");
 	}
-	s_mesh0 = mesh;
 	gs_draw_set_gtex_reload(reload_gtex0);
 	/* VRAM has the textures now; pack 0 coming back reads them again */
 	free(gtex);
@@ -165,7 +162,10 @@ int main(int argc, const char **argv)
 		t_vm += t1 - t0;
 		t_draw += t2 - t1;
 		if (++t_n == 60) {
-			printf("P1 time: vm %d draw %d fields per 60 frames\n", t_vm, t_draw);
+			HeapUsage hu;
+			GetHeapUsage(&hu);
+			printf("P1 time: vm %d draw %d fields per 60 frames; heap %u of %u bytes in use (peak %u)\n", t_vm, t_draw,
+					(unsigned)hu.alloc, (unsigned)hu.heap, (unsigned)hu.alloc_max);
 			t_vm = t_draw = t_n = 0;
 		}
 	}
