@@ -2030,17 +2030,35 @@ void gs_draw_scene(void)
 	(void)h3;
 #endif
 	/* Even pacing: each frame is shown the same number of fields after the
-	 * last. A frame that would take more raises the count at once; it comes
-	 * down one when 90 frames in a row would have made the lower one. (A
+	 * last. Frames that would take more raise the count (as below); it comes
+	 * down one when 30 frames in a row would have made the lower one. (A
 	 * race whose frames take 2 or 3 fields by turns runs at a steady 20 FPS
-	 * instead of a jerky 24.) */
-	static int s_flip_at, s_pace = 1, s_calm;
+	 * instead of a jerky 24.) A frame that took more than 6 fields was a
+	 * stall (a scene loading, a save), not drawing: it starts the count
+	 * again from 1, and the few frames after it (a scene's first frames do
+	 * its setup) do not raise it, or every scene would open at 20 FPS for
+	 * a second. One frame over on its own is shown a field late and the
+	 * count stays; a second within 16 frames raises it. */
+	static int s_flip_at, s_pace = 1, s_calm, s_settle, s_since_over = 1000;
 	const int need = VSync(-1) - s_flip_at + 1; /* shown at the next vblank */
-	if (need > s_pace) {
-		s_pace = need > 3 ? 3 : need;
+	if (s_since_over < 1000) {
+		s_since_over++;
+	}
+	if (need > 6) {
+		s_pace = 1;
+		s_calm = 0;
+		s_settle = 8;
+		s_since_over = 1000;
+	} else if (s_settle > 0) {
+		s_settle--;
+	} else if (need > s_pace) {
+		if (s_since_over <= 16) {
+			s_pace = need > 3 ? 3 : need;
+		}
+		s_since_over = 0;
 		s_calm = 0;
 	} else if (need < s_pace) {
-		if (++s_calm >= 90) {
+		if (++s_calm >= 30) {
 			s_pace--;
 			s_calm = 0;
 		}
