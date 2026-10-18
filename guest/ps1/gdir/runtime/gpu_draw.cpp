@@ -1321,6 +1321,24 @@ static int draw_poly_slow(DrawCtx *c, const P1Vert *const *src, const uint8_t (*
 	const int32_t h = (int32_t)c->h;
 	/* plane k: d = a*z - s*coord >= 0 with a = band edge in pixels, s = h */
 	const int32_t band[4] = { SCR_W / 2 + 340, SCR_W / 2 + 340, SCR_H / 2 + 130, SCR_H / 2 + 130 };
+	{
+		/* wholly outside one of the screen's own edges (in view space, so
+		 * corners behind the camera count too): nothing to clip. The
+		 * hub's floor is a fan of long slivers from the middle to the rim,
+		 * most of them reaching behind the camera and off to one side */
+		const int32_t ex = SCR_W / 2, ey = SCR_H / 2;
+		int l = 0, r = 0, t = 0, b = 0;
+		for (int k = 0; k < n; k++) {
+			const int32_t z = v[k].z;
+			l += ex * z + h * v[k].x < 0;
+			r += ex * z - h * v[k].x < 0;
+			t += ey * z + h * v[k].y < 0;
+			b += ey * z - h * v[k].y < 0;
+		}
+		if (l == n || r == n || t == n || b == n) {
+			return 0;
+		}
+	}
 	CV *in = pa, *out = pb;
 	static const int order[5] = { 4, 0, 1, 2, 3 }; /* near first: then z > 0 */
 	for (int oi = 0; oi < 5; oi++) {
@@ -2109,6 +2127,10 @@ void gs_draw_scene(void)
 		s_settle--;
 	} else if (need > s_pace) {
 		if (s_since_over <= 16) {
+#ifdef P1_PACE_LOG
+			extern void p1_pace_raised(int need, int prev);
+			p1_pace_raised(need, s_since_over);
+#endif
 			s_pace = need > 3 ? 3 : need;
 		}
 		s_since_over = 0;
@@ -2140,6 +2162,8 @@ void gs_draw_scene(void)
 		s_pc[s_pace > 3 ? 3 : s_pace]++;
 		if (++s_pcn == 1200) {
 			printf("P1 pace: 1 field %u, 2 %u, 3 %u of 1200 frames\n", s_pc[1], s_pc[2], s_pc[3]);
+			extern void p1_pace_print(void);
+			p1_pace_print();
 			memset(s_pc, 0, sizeof(s_pc));
 			s_pcn = 0;
 		}
@@ -2159,6 +2183,28 @@ void gs_draw_scene(void)
 	DrawOTag(f->ot + OT_LEN - 1);
 	g_cur ^= 1;
 }
+
+#ifdef P1_PACE_LOG
+/* dev: when the pace went up (the field count, that frame's need and how
+ * many frames since the last one over), printed with the pace line */
+static unsigned s_pr[24][3], s_prn;
+void p1_pace_raised(int need, int prev)
+{
+	if (s_prn < 24) {
+		s_pr[s_prn][0] = (unsigned)VSync(-1);
+		s_pr[s_prn][1] = (unsigned)need;
+		s_pr[s_prn][2] = (unsigned)prev;
+		s_prn++;
+	}
+}
+void p1_pace_print(void)
+{
+	for (unsigned i = 0; i < s_prn; i++) {
+		printf("P1 raised: field %u need %u (%u frames after the last over)\n", s_pr[i][0], s_pr[i][1], s_pr[i][2]);
+	}
+	s_prn = 0;
+}
+#endif
 
 /* ------------------------------------------------------------ API */
 static unsigned char *(*g_gtex_reload)(const unsigned char *, unsigned *);
