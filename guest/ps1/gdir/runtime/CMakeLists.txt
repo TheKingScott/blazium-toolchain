@@ -22,7 +22,7 @@ target_compile_options(runtime PRIVATE -O2 $<$<COMPILE_LANGUAGE:CXX>:-fno-except
 # and fabsf is a call, even for four bytes. Source options come after the
 # SDK's, so -fbuiltin here puts the compiler's inline forms back.
 get_target_property(runtime_sources runtime SOURCES)
-set_source_files_properties(${runtime_sources} PROPERTIES COMPILE_OPTIONS "-fbuiltin")
+set_source_files_properties(${runtime_sources} PROPERTIES COMPILE_OPTIONS "-fbuiltin;-Wno-builtin-declaration-mismatch")
 # the GDIR VM's tables sized for 2 MiB, and the PS2 budgets as the PS1's
 target_compile_definitions(runtime PRIVATE
 	BLAZIUM_PS1_GDIR=1

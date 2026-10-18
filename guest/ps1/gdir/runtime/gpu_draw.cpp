@@ -1762,6 +1762,7 @@ void gs_draw_scene(void)
 		view_matrix(view);
 		draw_scene_mesh(&c, view);
 		tris = c.tris;
+#ifdef P1_STATS
 		static unsigned frames;
 		if ((frames++ % 120) == 0) {
 			float ex, ey, ez;
@@ -1770,6 +1771,7 @@ void gs_draw_scene(void)
 					(unsigned)(g_pp - f->pri), (int)(ex * 100), (int)(ey * 100), (int)(ez * 100), (int)(g_look_x * 100),
 					(int)(g_look_y * 100), (int)(g_look_z * 100), (int)g_fov, g_scale, g_chunk_n);
 		}
+#endif
 	}
 	(void)tris;
 	const uint16_t h1 = (uint16_t)TIMER_VALUE(1);
@@ -1778,6 +1780,8 @@ void gs_draw_scene(void)
 	/* the last frame's drawing done and shown: start this one's */
 	DrawSync(0);
 	const uint16_t h3 = (uint16_t)TIMER_VALUE(1);
+#ifdef P1_STATS
+	/* a printf to the TTY takes a field or more: only in stats builds */
 	static unsigned s_hs, s_hh, s_hg, s_hn;
 	s_hs += (uint16_t)(h1 - h0);
 	s_hh += (uint16_t)(h2 - h1);
@@ -1786,7 +1790,34 @@ void gs_draw_scene(void)
 		printf("P1 hblanks/frame: scene %u hud %u gpu wait %u\n", s_hs / 120, s_hh / 120, s_hg / 120);
 		s_hs = s_hh = s_hg = s_hn = 0;
 	}
-	VSync(0);
+#else
+	(void)h0;
+	(void)h1;
+	(void)h2;
+	(void)h3;
+#endif
+	/* Even pacing: each frame is shown the same number of fields after the
+	 * last. A frame that would take more raises the count at once; it comes
+	 * down one when 90 frames in a row would have made the lower one. (A
+	 * race whose frames take 2 or 3 fields by turns runs at a steady 20 FPS
+	 * instead of a jerky 24.) */
+	static int s_flip_at, s_pace = 1, s_calm;
+	const int need = VSync(-1) - s_flip_at + 1; /* shown at the next vblank */
+	if (need > s_pace) {
+		s_pace = need > 3 ? 3 : need;
+		s_calm = 0;
+	} else if (need < s_pace) {
+		if (++s_calm >= 90) {
+			s_pace--;
+			s_calm = 0;
+		}
+	} else {
+		s_calm = 0;
+	}
+	do {
+		VSync(0);
+	} while (VSync(-1) - s_flip_at < s_pace);
+	s_flip_at = VSync(-1);
 	PutDispEnv(&f->disp);
 	setRGB0(&f->draw, g_clear_r, g_clear_g, g_clear_b);
 	PutDrawEnv(&f->draw);

@@ -147,8 +147,9 @@ int main(int argc, const char **argv)
 			fields = 6;
 		}
 		const float hz = gs_draw_ready() ? 60.0f : 60.0f;
-		static int t_vm, t_draw, t_n;
+#ifdef P1_STATS
 		const int t0 = VSync(-1);
+#endif
 		if (gdir) {
 			gdir_vm_process((float)fields / hz);
 			const char *err = gdir_vm_error();
@@ -156,18 +157,28 @@ int main(int argc, const char **argv)
 				halt(err);
 			}
 		}
+#ifdef P1_STATS
 		const int t1 = VSync(-1);
+#endif
 		gs_draw_scene();
+#ifdef P1_STATS
+		/* a printf to the TTY takes a field or more: only in stats builds */
+		static int t_vm, t_draw, t_n;
+		static char seq[61];
 		const int t2 = VSync(-1);
 		t_vm += t1 - t0;
 		t_draw += t2 - t1;
+		seq[t_n] = (char)('0' + (fields < 9 ? fields : 9));
 		if (++t_n == 60) {
 			HeapUsage hu;
 			GetHeapUsage(&hu);
+			seq[60] = 0;
 			printf("P1 time: vm %d draw %d fields per 60 frames; heap %u of %u bytes in use (peak %u)\n", t_vm, t_draw,
 					(unsigned)hu.alloc, (unsigned)hu.heap, (unsigned)hu.alloc_max);
+			printf("P1 fields: %s\n", seq);
 			t_vm = t_draw = t_n = 0;
 		}
+#endif
 	}
 	return 0;
 }
