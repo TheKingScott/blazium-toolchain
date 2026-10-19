@@ -1192,6 +1192,8 @@ struct DrawCtx {
 	float tan_x, tan_y, sec_x, sec_y;
 	float far_m;
 	int far_pass;    /* drawing the backdrop: NFOG groups past the main far plane */
+	int layer_pass;  /* drawing the LAYR ground layers of this priority (-8..-1), or 0 */
+	int nodepth;     /* this pass draws without the depth buffer */
 	int nfog;        /* the group being drawn is NFOG (no fog, no far cut) */
 	float far_main;  /* the main pass's far plane (m) */
 	int cur_tex;     /* -2 nothing set; 255 untextured */
@@ -1227,7 +1229,7 @@ static void set_tex(DrawCtx *c, int tex, int tile)
 		return;
 	}
 	if (tex == 255) {
-		t3d_state_set_drawflags((enum T3DDrawFlags)(T3D_FLAG_SHADED | (c->far_pass ? 0 : T3D_FLAG_DEPTH)));
+		t3d_state_set_drawflags((enum T3DDrawFlags)(T3D_FLAG_SHADED | (c->nodepth ? 0 : T3D_FLAG_DEPTH)));
 		rdpq_mode_begin();
 		rdpq_mode_combiner(RDPQ_COMBINER1((0, 0, 0, SHADE), (0, 0, 0, 1)));
 		rdpq_mode_tlut(TLUT_NONE);
@@ -1235,7 +1237,7 @@ static void set_tex(DrawCtx *c, int tex, int tile)
 		rdpq_mode_end();
 	} else {
 		const Tex *t = &g_tex[tex];
-		t3d_state_set_drawflags((enum T3DDrawFlags)(T3D_FLAG_SHADED | T3D_FLAG_TEXTURED | (c->far_pass ? 0 : T3D_FLAG_DEPTH)));
+		t3d_state_set_drawflags((enum T3DDrawFlags)(T3D_FLAG_SHADED | T3D_FLAG_TEXTURED | (c->nodepth ? 0 : T3D_FLAG_DEPTH)));
 		rdpq_mode_begin();
 		rdpq_mode_combiner(RDPQ_COMBINER1((TEX0, 0, SHADE, 0), (0, 0, 0, TEX0)));
 		rdpq_mode_tlut(t->tlut ? TLUT_RGBA16 : TLUT_NONE);
@@ -1296,8 +1298,8 @@ static void draw_chunk(DrawCtx *c, unsigned ci)
 static void set_depth(DrawCtx *c, int node)
 {
 	const int pri = node < MAX_NODES ? g_nlayer[node] : 0;
-	/* a ground layer: lower ones first and farther; a decal nearer a step */
-	const int ofs = pri < 0 ? -(pri + 9) * DECAL_DEPTH : -pri * DECAL_DEPTH;
+	/* a decal nearer a step (ground layers draw in passes of their own) */
+	const int ofs = pri > 0 ? -pri * DECAL_DEPTH : 0;
 	if (ofs != c->cur_depth) {
 		t3d_state_set_depth_offset((int16_t)ofs);
 		c->cur_depth = ofs;
@@ -1318,6 +1320,11 @@ static void draw_groups(DrawCtx *c)
 		}
 		const int nfog = node < MAX_NODES && g_nfog[node];
 		if (c->far_pass && !nfog) {
+			continue;
+		}
+		/* ground layers (LAYR < 0) in their own passes, under everything */
+		const int pri = node < MAX_NODES ? g_nlayer[node] : 0;
+		if (c->layer_pass ? pri != c->layer_pass : (!c->far_pass && pri < 0)) {
 			continue;
 		}
 		c->nfog = nfog;
@@ -1615,6 +1622,7 @@ static unsigned draw_view(T3DViewport *vp, T3DViewport *vp_far, int w, int h, in
 	c.cur_tex = -2;
 	c.cur_fog = 0;
 	c.far_pass = 1;
+	c.nodepth = 1;
 	rdpq_mode_fog(0);
 	rdpq_mode_zbuf(false, false);
 	draw_groups(&c);
@@ -1632,8 +1640,22 @@ static unsigned draw_view(T3DViewport *vp, T3DViewport *vp_far, int w, int h, in
 		t3d_fog_set_enabled(true);
 	}
 	t3d_matrix_push_pos(1);
-	c.cur_tex = -2;
 	c.far_pass = 0;
+	/* the ground layers, lowest priority first, without the depth buffer:
+	 * as on the PS1, a floor and the paths on it never cover what stands on
+	 * them (a kart rides a few cm into its floor) */
+	rdpq_mode_zbuf(false, false);
+	c.nodepth = 1;
+	for (int pri = -8; pri <= -1; pri++) {
+		c.cur_tex = -2;
+		c.layer_pass = pri;
+		draw_groups(&c);
+	}
+	c.layer_pass = 0;
+	c.nodepth = 0;
+	t3d_tri_sync();
+	rdpq_mode_zbuf(true, true);
+	c.cur_tex = -2;
 	draw_groups(&c);
 	draw_instances(&c);
 	t3d_matrix_pop(1);
