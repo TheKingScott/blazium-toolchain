@@ -57,13 +57,22 @@ func (t *Tool) Build(ctx context.Context, opts platforms.BuildOptions) error {
 		}
 		src = ""
 	}
-	if src == "" && sample != "" {
+	if src == "" && sample == "gdir" {
+		export, err := gdirExportDir(opts.PackDir, opts.Out)
+		if err != nil {
+			return err
+		}
+		src = GDIRGuestDir(opts.Prefix)
+		if _, err := stageGDIR(src, export, opts.Stdout); err != nil {
+			return err
+		}
+	} else if src == "" && sample != "" {
 		src, err = resolveSample(opts.Prefix, sample)
 		if err != nil {
 			return err
 		}
 	}
-	needWork := (overlay != "" && sample == "") || hasCookSlices(opts)
+	needWork := (overlay != "" && sample == "") || (sample != "gdir" && hasCookSlices(opts))
 	if needWork && sample == "" {
 		merge := filepath.Join(cache.PlatformDir(opts.Prefix, ID), "work", "guest-src")
 		if err := os.RemoveAll(merge); err != nil {
@@ -126,7 +135,7 @@ func (t *Tool) Build(ctx context.Context, opts platforms.BuildOptions) error {
 		"N64_INST":          env["N64_INST"],
 		"LIBDRAGON_PREVIEW": "2",
 	}
-	if isT3dSample(sample) {
+	if isT3dSample(sample) || sample == "gdir" {
 		t3d := or(env["T3D_INST"], tiny3dRoot(opts.Prefix))
 		if t3d == "" {
 			return report.Missing("Tiny3D source missing", "blazium-toolchain n64 setup --profile compile")
@@ -303,7 +312,7 @@ func resolveSample(prefix, sample string) (string, error) {
 	}
 	name, ok := allowed[sample]
 	if !ok {
-		return "", report.Usage("--sample must be helloworld, rdpqdemo, t3dquad, or ovldemo")
+		return "", report.Usage("--sample must be helloworld, rdpqdemo, t3dquad, ovldemo, or gdir")
 	}
 	lib := libdragonRoot(prefix)
 	if lib == "" {
