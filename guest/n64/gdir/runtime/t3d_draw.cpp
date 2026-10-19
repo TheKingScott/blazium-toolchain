@@ -155,6 +155,10 @@ struct Tex {
 	int w, h, psm; /* as the pack has it (psm 0 T4, 1 T8, 2 CT16) */
 	int tiled;
 	int sx, sy; /* the N64 copy is w >> sx by h >> sy */
+	/* too big for TMEM and not wrapped: kept whole and drawn a tile at a
+	 * time (tw x th texels, neighbours sharing a row and column so filtering
+	 * meets across the seam); the primitives are cut along the tiles */
+	int split, tw, th, ntx, nty;
 	surface_t surf;
 	uint16_t *tlut; /* CI: RGBA16 palette (16 or 256), uncached */
 	int tlut_n;
@@ -217,11 +221,23 @@ static void parse_textures(const uint8_t *b, unsigned sz)
 		if (data_n < (unsigned)(t->w * t->h * bits / 8)) {
 			continue;
 		}
-		/* halve the longer side until it fits TMEM */
+		/* a wrapped texture too big for TMEM is halved (the longer side) until
+		 * it fits; any other is split into tiles */
 		const int budget = bits == 4 ? TMEM_TEXELS_4 : (bits == 8 ? TMEM_TEXELS_8 : TMEM_TEXELS_16);
 		int w = t->w, h = t->h;
 		t->sx = t->sy = 0;
-		while (w * h > budget) {
+		t->split = 0;
+		if (w * h > budget && !t->tiled) {
+			int tw = w < 64 ? w : 64;
+			int th = budget / tw;
+			th = th > h ? h : th;
+			t->split = 1;
+			t->tw = tw;
+			t->th = th;
+			t->ntx = tw < w ? (w - 1 + tw - 2) / (tw - 1) : 1;
+			t->nty = th < h ? (h - 1 + th - 2) / (th - 1) : 1;
+		}
+		while (!t->split && w * h > budget) {
 			if (w >= h) {
 				w >>= 1;
 				t->sx++;
@@ -334,6 +350,8 @@ struct Batch {
 	uint16_t ntri;
 	uint8_t nv;
 	uint8_t tex;   /* 0xff: untextured */
+	uint16_t tile; /* a split texture's tile */
+	uint16_t pad;
 };
 static T3DVertPacked *g_vbuf;
 static uint8_t *g_ibuf;
@@ -636,23 +654,265 @@ static void put_vertex(T3DVertPacked *pair, int slot, unsigned vi, unsigned u, u
 	}
 }
 
+/* a corner cut out of a primitive along a split texture's tiles */
+struct CutV {
+	float x, y, z, r, g, b, u, v;
+};
+
+static void put_cut(T3DVertPacked *pair, int slot, const CutV *c)
+{
+	const unsigned r = c->r * 2.0f > 255.0f ? 255u : (unsigned)(c->r * 2.0f + 0.5f);
+	const unsigned g = c->g * 2.0f > 255.0f ? 255u : (unsigned)(c->g * 2.0f + 0.5f);
+	const unsigned b = c->b * 2.0f > 255.0f ? 255u : (unsigned)(c->b * 2.0f + 0.5f);
+	const uint32_t rgba = (r << 24) | (g << 16) | (b << 8) | 0xff;
+	const int16_t x = (int16_t)lroundf(c->x), y = (int16_t)lroundf(c->y), z = (int16_t)lroundf(c->z);
+	const int16_t s = (int16_t)lroundf(c->u * 32.0f), t = (int16_t)lroundf(c->v * 32.0f);
+	if (slot & 1) {
+		pair->posB[0] = x;
+		pair->posB[1] = y;
+		pair->posB[2] = z;
+		pair->normB = 0;
+		pair->rgbaB = rgba;
+		pair->stB[0] = s;
+		pair->stB[1] = t;
+	} else {
+		pair->posA[0] = x;
+		pair->posA[1] = y;
+		pair->posA[2] = z;
+		pair->normA = 0;
+		pair->rgbaA = rgba;
+		pair->stA[0] = s;
+		pair->stA[1] = t;
+	}
+}
+
+/* Sutherland-Hodgman: the part of in[n] with sign * (u or v) >= sign * k */
+static int cut_poly(const CutV *in, int n, CutV *out, int axis_v, float k, float sign)
+{
+	int m = 0;
+	for (int i = 0; i < n; i++) {
+		const CutV *a = &in[i], *b = &in[(i + 1) % n];
+		const float da = sign * ((axis_v ? a->v : a->u) - k), db = sign * ((axis_v ? b->v : b->u) - k);
+		if (da >= 0.0f) {
+			out[m++] = *a;
+		}
+		if ((da >= 0.0f) != (db >= 0.0f)) {
+			const float t = da / (da - db);
+			CutV c;
+			c.x = a->x + (b->x - a->x) * t;
+			c.y = a->y + (b->y - a->y) * t;
+			c.z = a->z + (b->z - a->z) * t;
+			c.r = a->r + (b->r - a->r) * t;
+			c.g = a->g + (b->g - a->g) * t;
+			c.b = a->b + (b->b - a->b) * t;
+			c.u = a->u + (b->u - a->u) * t;
+			c.v = a->v + (b->v - a->v) * t;
+			if (axis_v) {
+				c.v = k;
+			} else {
+				c.u = k;
+			}
+			out[m++] = c;
+		}
+	}
+	return m;
+}
+
+/* the batch builder's state */
+struct BuildS {
+	unsigned vp, ip; /* vertex pairs, indices used */
+	Batch *bt;
+	int key;         /* tex << 16 | tile of bt */
+	Chunk *c;
+	BuildB bb;
+};
+
+/* the current batch, or a new one, for key with room for nv more corners */
+static void need_batch(BuildS *st, int key, int nv)
+{
+	if (st->bt && st->key == key && st->bt->nv + nv <= BATCH_V && st->bt->ntri < 60000) {
+		return;
+	}
+	if (st->bt) {
+		st->vp = st->bt->v0 + ((unsigned)st->bt->nv + 1) / 2;
+	}
+	Batch *bt = &g_batch[g_batch_n++];
+	bt->v0 = st->vp;
+	bt->i0 = st->ip;
+	bt->ntri = 0;
+	bt->nv = 0;
+	bt->tex = (uint8_t)(key >> 16);
+	bt->tile = (uint16_t)(key & 0xffff);
+	bt->pad = 0;
+	st->c->bn++;
+	st->bt = bt;
+	st->key = key;
+	st->bb.nv = 0;
+	memset(st->bb.hash, 0xff, sizeof(st->bb.hash));
+}
+
+/* one primitive of a texture that fits TMEM (or none), its corners shared */
+static void emit_prim(BuildS *st, const uint8_t *pr, int ptex)
+{
+	const unsigned d = rd16(pr + 6);
+	const int quad = d != 0xffff;
+	const int nc = quad ? 4 : 3;
+	unsigned vi[4];
+	for (int k = 0; k < nc; k++) {
+		vi[k] = rd16(pr + k * 2);
+		if (vi[k] >= g_vert_n) {
+			vi[k] = 0;
+		}
+	}
+	need_batch(st, ptex << 16, nc);
+	Batch *bt = st->bt;
+	BuildB *bb = &st->bb;
+	int slot[4];
+	for (int k = 0; k < nc; k++) {
+		const unsigned u = ptex != 255 ? pr[8 + k * 2] : 0, v = ptex != 255 ? pr[9 + k * 2] : 0;
+		const uint32_t key = corner_key(vi[k], u, v);
+		unsigned h = (key * 2654435761u) >> 24;
+		int sl = -1;
+		while (bb->hash[h] >= 0) {
+			if (bb->key[bb->hash[h]] == key) {
+				sl = bb->hash[h];
+				break;
+			}
+			h = (h + 1) & 255;
+		}
+		if (sl < 0) {
+			sl = bb->nv++;
+			bb->key[sl] = key;
+			bb->hash[h] = (int16_t)sl;
+			put_vertex(&g_vbuf[bt->v0 + (sl >> 1)], sl, vi[k], u, v, ptex != 255 ? ptex : -1);
+		}
+		slot[k] = sl;
+	}
+	bt->nv = (uint8_t)bb->nv;
+	/* a, b, c; a quad's second half d, c, b (the PS1 GPU's b, c, d) */
+	g_ibuf[st->ip++] = (uint8_t)slot[0];
+	g_ibuf[st->ip++] = (uint8_t)slot[1];
+	g_ibuf[st->ip++] = (uint8_t)slot[2];
+	bt->ntri++;
+	if (quad) {
+		g_ibuf[st->ip++] = (uint8_t)slot[3];
+		g_ibuf[st->ip++] = (uint8_t)slot[2];
+		g_ibuf[st->ip++] = (uint8_t)slot[1];
+		bt->ntri++;
+	}
+}
+
+/* the tiles a primitive of split texture t touches: [tx0, tx1] x [ty0, ty1] */
+static void prim_tiles(const Tex *t, const uint8_t *pr, int *tx0, int *tx1, int *ty0, int *ty1)
+{
+	const int nc = rd16(pr + 6) != 0xffff ? 4 : 3;
+	int u0 = 255, u1 = 0, v0 = 255, v1 = 0;
+	for (int k = 0; k < nc; k++) {
+		const int u = pr[8 + k * 2], v = pr[9 + k * 2];
+		u0 = u < u0 ? u : u0;
+		u1 = u > u1 ? u : u1;
+		v0 = v < v0 ? v : v0;
+		v1 = v > v1 ? v : v1;
+	}
+	const int sx = t->tw - 1 > 0 ? t->tw - 1 : 1, sy = t->th - 1 > 0 ? t->th - 1 : 1;
+	*tx0 = u0 / sx;
+	*tx1 = u1 / sx;
+	*ty0 = v0 / sy;
+	*ty1 = v1 / sy;
+	/* a corner right on a seam belongs to the tile before it too */
+	*tx1 = *tx1 >= t->ntx ? t->ntx - 1 : *tx1;
+	*ty1 = *ty1 >= t->nty ? t->nty - 1 : *ty1;
+	if (*tx0 > 0 && u0 == *tx0 * sx) {
+		(*tx0)--;
+	}
+	if (*ty0 > 0 && v0 == *ty0 * sy) {
+		(*ty0)--;
+	}
+}
+
+/* the part of a primitive of split texture tex in one tile */
+static void emit_cut(BuildS *st, const uint8_t *pr, int tex, int tx, int ty)
+{
+	const Tex *t = &g_tex[tex];
+	const int quad = rd16(pr + 6) != 0xffff;
+	const int nc = quad ? 4 : 3;
+	/* a quad a, b, c, d is the triangles a, b, c and b, c, d: as a polygon a, b, d, c */
+	static const int ord4[4] = { 0, 1, 3, 2 };
+	CutV p[12], q[12];
+	for (int k = 0; k < nc; k++) {
+		const int ck = quad ? ord4[k] : k;
+		unsigned vi = rd16(pr + ck * 2);
+		vi = vi >= g_vert_n ? 0 : vi;
+		const uint8_t *vp = g_verts + vi * VERT_SZ;
+		p[k].x = (float)(int16_t)rd16(vp);
+		p[k].y = (float)(int16_t)rd16(vp + 2);
+		p[k].z = (float)(int16_t)rd16(vp + 4);
+		p[k].r = vp[8];
+		p[k].g = vp[9];
+		p[k].b = vp[10];
+		p[k].u = pr[8 + ck * 2];
+		p[k].v = pr[9 + ck * 2];
+	}
+	const float sx = (float)(t->tw - 1), sy = (float)(t->th - 1);
+	int n = nc;
+	n = cut_poly(p, n, q, 0, tx * sx, 1.0f);
+	n = cut_poly(q, n, p, 0, (tx + 1) * sx, -1.0f);
+	n = cut_poly(p, n, q, 1, ty * sy, 1.0f);
+	n = cut_poly(q, n, p, 1, (ty + 1) * sy, -1.0f);
+	if (n < 3) {
+		return;
+	}
+	need_batch(st, (tex << 16) | (ty * t->ntx + tx), n);
+	Batch *bt = st->bt;
+	const int s0 = bt->nv;
+	for (int k = 0; k < n; k++) {
+		put_cut(&g_vbuf[bt->v0 + ((s0 + k) >> 1)], s0 + k, &p[k]);
+	}
+	bt->nv = (uint8_t)(s0 + n);
+	st->bb.nv = s0 + n;
+	for (int k = 1; k + 1 < n; k++) {
+		g_ibuf[st->ip++] = (uint8_t)s0;
+		g_ibuf[st->ip++] = (uint8_t)(s0 + k);
+		g_ibuf[st->ip++] = (uint8_t)(s0 + k + 1);
+		bt->ntri++;
+	}
+}
+
+static inline int prim_tex(const uint8_t *pr)
+{
+	return pr[16] < g_tex_n && g_tex[pr[16]].ready ? pr[16] : 255;
+}
+
 static int build_batches(void)
 {
 	free_batches();
 	g_ch = (Chunk *)malloc(sizeof(Chunk) * (g_chunk_n ? g_chunk_n : 1));
-	/* worst cases: four corners and two triangles a primitive, a batch each */
-	const unsigned vmax = g_prim_n * 4 + 2 * g_chunk_n + 2;
+	/* worst cases: four corners and two triangles a primitive, a batch each;
+	 * a primitive cut along tiles, eight corners and six triangles a tile */
+	unsigned vmax = g_prim_n * 4 + 2 * g_chunk_n + 2, imax = g_prim_n * 6 + 4, bmax = g_prim_n + g_chunk_n + 1;
+	for (unsigned i = 0; i < g_prim_n; i++) {
+		const uint8_t *pr = g_prims + i * PRIM_SZ;
+		const int tx = prim_tex(pr);
+		if (tx != 255 && g_tex[tx].split) {
+			int x0, x1, y0, y1;
+			prim_tiles(&g_tex[tx], pr, &x0, &x1, &y0, &y1);
+			const unsigned nt = (unsigned)((x1 - x0 + 1) * (y1 - y0 + 1));
+			vmax += nt * 9;
+			imax += nt * 18;
+			bmax += nt;
+		}
+	}
 	g_vbuf = (T3DVertPacked *)memalign(16, sizeof(T3DVertPacked) * (vmax / 2 + 1));
-	g_ibuf = (uint8_t *)malloc(g_prim_n * 6 + 4);
-	g_batch = (Batch *)malloc(sizeof(Batch) * (g_prim_n + g_chunk_n + 1));
-	static BuildB bb;
+	g_ibuf = (uint8_t *)malloc(imax);
+	g_batch = (Batch *)malloc(sizeof(Batch) * bmax);
+	static BuildS st;
 	static uint16_t order[1024];
 	if (!g_ch || !g_vbuf || !g_ibuf || !g_batch) {
 		printf("N64: no memory for the mesh's batches (%u primitives)\n", g_prim_n);
 		free_batches();
 		return 0;
 	}
-	unsigned vp = 0, ip = 0; /* vertex pairs, indices */
+	st.vp = st.ip = 0;
 	for (unsigned ci = 0; ci < g_chunk_n; ci++) {
 		const uint8_t *ch = g_chunks + ci * CHUNK_SZ;
 		Chunk *c = &g_ch[ci];
@@ -663,6 +923,8 @@ static int build_batches(void)
 		c->node = rd16(ch + 6);
 		c->b0 = g_batch_n;
 		c->bn = 0;
+		st.c = c;
+		st.bt = 0;
 		const unsigned first = rd32(ch);
 		unsigned np = rd16(ch + 4) + rd16(ch + 24);
 		if (first >= g_prim_n) {
@@ -673,87 +935,44 @@ static int build_batches(void)
 		if (np > 1024) {
 			np = 1024;
 		}
-		/* the chunk's primitives by texture (in mesh order within one) */
-		unsigned on = 0;
-		for (int pass = 0; pass < 2; pass++) {
-			/* pass 0 the textured ones in texture order, pass 1 the rest */
-			for (int tx = (pass ? 255 : 0); tx <= (pass ? 255 : g_tex_n - 1); tx++) {
-				for (unsigned k = 0; k < np; k++) {
-					const uint8_t *pr = g_prims + (first + k) * PRIM_SZ;
-					const int ptex = pr[16] < g_tex_n && g_tex[pr[16]].ready ? pr[16] : 255;
-					if (ptex == tx) {
-						order[on++] = (uint16_t)k;
+		/* the chunk's primitives by texture (in mesh order within one), the
+		 * untextured ones last; a split texture's a tile at a time */
+		for (int tx = 0; tx <= g_tex_n; tx++) {
+			const int want = tx < g_tex_n ? tx : 255;
+			unsigned on = 0;
+			for (unsigned k = 0; k < np; k++) {
+				if (prim_tex(g_prims + (first + k) * PRIM_SZ) == want) {
+					order[on++] = (uint16_t)k;
+				}
+			}
+			if (!on) {
+				continue;
+			}
+			if (want != 255 && g_tex[want].split) {
+				const Tex *t = &g_tex[want];
+				for (int ty = 0; ty < t->nty; ty++) {
+					for (int tt = 0; tt < t->ntx; tt++) {
+						for (unsigned oi = 0; oi < on; oi++) {
+							const uint8_t *pr = g_prims + (first + order[oi]) * PRIM_SZ;
+							int x0, x1, y0, y1;
+							prim_tiles(t, pr, &x0, &x1, &y0, &y1);
+							if (tt >= x0 && tt <= x1 && ty >= y0 && ty <= y1) {
+								emit_cut(&st, pr, want, tt, ty);
+							}
+						}
 					}
+				}
+			} else {
+				for (unsigned oi = 0; oi < on; oi++) {
+					emit_prim(&st, g_prims + (first + order[oi]) * PRIM_SZ, want);
 				}
 			}
 		}
-		int cur_tex = -1;
-		Batch *bt = 0;
-		for (unsigned oi = 0; oi < on; oi++) {
-			const uint8_t *pr = g_prims + (first + order[oi]) * PRIM_SZ;
-			const int ptex = pr[16] < g_tex_n && g_tex[pr[16]].ready ? pr[16] : 255;
-			const unsigned d = rd16(pr + 6);
-			const int quad = d != 0xffff;
-			const int nc = quad ? 4 : 3;
-			unsigned vi[4];
-			for (int k = 0; k < nc; k++) {
-				vi[k] = rd16(pr + k * 2);
-				if (vi[k] >= g_vert_n) {
-					vi[k] = 0;
-				}
-			}
-			if (!bt || ptex != cur_tex || bt->nv + nc > BATCH_V || bt->ntri > 60000) {
-				/* a new batch, on a pair boundary (vp is rounded up) */
-				bt = &g_batch[g_batch_n++];
-				bt->v0 = vp;
-				bt->i0 = ip;
-				bt->ntri = 0;
-				bt->nv = 0;
-				bt->tex = (uint8_t)ptex;
-				c->bn++;
-				cur_tex = ptex;
-				bb.nv = 0;
-				memset(bb.hash, 0xff, sizeof(bb.hash));
-			}
-			int slot[4];
-			for (int k = 0; k < nc; k++) {
-				const unsigned u = ptex != 255 ? pr[8 + k * 2] : 0, v = ptex != 255 ? pr[9 + k * 2] : 0;
-				const uint32_t key = corner_key(vi[k], u, v);
-				unsigned h = (key * 2654435761u) >> 24;
-				int s = -1;
-				while (bb.hash[h] >= 0) {
-					if (bb.key[bb.hash[h]] == key) {
-						s = bb.hash[h];
-						break;
-					}
-					h = (h + 1) & 255;
-				}
-				if (s < 0) {
-					s = bb.nv++;
-					bb.key[s] = key;
-					bb.hash[h] = (int16_t)s;
-					put_vertex(&g_vbuf[bt->v0 + (s >> 1)], s, vi[k], u, v, ptex != 255 ? ptex : -1);
-				}
-				slot[k] = s;
-			}
-			bt->nv = (uint8_t)bb.nv;
-			/* a, b, c; a quad's second half d, c, b (the PS1 GPU's b, c, d) */
-			g_ibuf[ip++] = (uint8_t)slot[0];
-			g_ibuf[ip++] = (uint8_t)slot[1];
-			g_ibuf[ip++] = (uint8_t)slot[2];
-			bt->ntri++;
-			if (quad) {
-				g_ibuf[ip++] = (uint8_t)slot[3];
-				g_ibuf[ip++] = (uint8_t)slot[2];
-				g_ibuf[ip++] = (uint8_t)slot[1];
-				bt->ntri++;
-			}
-			vp = bt->v0 + ((unsigned)bt->nv + 1) / 2;
-		}
-		if (bt) {
-			vp = bt->v0 + ((unsigned)bt->nv + 1) / 2;
+		if (st.bt) {
+			st.vp = st.bt->v0 + ((unsigned)st.bt->nv + 1) / 2;
 		}
 	}
+	const unsigned vp = st.vp, ip = st.ip;
 	/* give back what the worst case did not use */
 	{
 		/* (realloc would not keep the alignment the RSP's DMA needs) */
@@ -997,9 +1216,10 @@ static int sphere_visible(const DrawCtx *c, const float *ctr, float r)
 	return 1;
 }
 
-static void set_tex(DrawCtx *c, int tex)
+static void set_tex(DrawCtx *c, int tex, int tile)
 {
-	if (tex == c->cur_tex) {
+	const int key = (tex << 16) | tile;
+	if (key == c->cur_tex) {
 		return;
 	}
 	if (tex == 255) {
@@ -1026,9 +1246,17 @@ static void set_tex(DrawCtx *c, int tex)
 			parms.s.repeats = REPEAT_INFINITE;
 			parms.t.repeats = REPEAT_INFINITE;
 		}
-		rdpq_tex_upload(TILE0, &t->surf, &parms);
+		if (t->split) {
+			/* one tile of it (its texel coordinates stay the whole texture's) */
+			const int tx = tile % t->ntx, ty = tile / t->ntx;
+			const int s0 = tx * (t->tw - 1), t0 = ty * (t->th - 1);
+			const int s1 = s0 + t->tw > t->w ? t->w : s0 + t->tw, t1 = t0 + t->th > t->h ? t->h : t0 + t->th;
+			rdpq_tex_upload_sub(TILE0, &t->surf, &parms, s0, t0, s1, t1);
+		} else {
+			rdpq_tex_upload(TILE0, &t->surf, &parms);
+		}
 	}
-	c->cur_tex = tex;
+	c->cur_tex = key;
 }
 
 static void set_fog(DrawCtx *c)
@@ -1049,7 +1277,7 @@ static void draw_chunk(DrawCtx *c, unsigned ci)
 		if (!b->ntri) {
 			continue;
 		}
-		set_tex(c, b->tex);
+		set_tex(c, b->tex, b->tile);
 		t3d_vert_load(&g_vbuf[b->v0], 0, b->nv);
 		const uint8_t *ix = g_ibuf + b->i0;
 		for (unsigned t = 0; t < b->ntri; t++, ix += 3) {
