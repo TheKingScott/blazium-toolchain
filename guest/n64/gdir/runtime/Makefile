@@ -11,12 +11,10 @@ src = main.cpp t3d_draw.cpp pad_io.cpp sfx_io.cpp mc_io.cpp gdir_vm.cpp sys_io.c
 
 # the shared runtime is warning-clean on its own compilers, not every GCC
 N64_CXXFLAGS += -O2 -fno-exceptions -fno-rtti -Wno-error
-# the GDIR VM's tables sized for the N64 (4 MiB, 8 with the Expansion Pak)
+# the GDIR VM's tables at the PS2's sizes (more arrays: four-player races
+# keep more alive), the PS2 budgets as the N64's RAM
 N64_CXXFLAGS += -DBLAZIUM_N64_GDIR=1 -DPACK_IO_RELOAD_PACK0=1 '-DGDIR_FEATURE="n64"' -DPACK_IO_HEAP_REPORT=n64_heap_report \
-	-DPS2_POKE_N=2048u -DGDIR_POKE_BYTES=2048 -DBLAZIUM_PS2_COOK_ABI=1 \
-	-DGDIR_MAX_NODES=512 -DGDIR_MAX_CONSTS=4096 -DGDIR_MAX_KARR=256 -DGDIR_MAX_FUNCS=512 \
-	-DGDIR_MAX_MEMBERS=512 -DGDIR_STACK=1024 -DGDIR_RING=64 -DGDIR_ARRAYS=64 -DGDIR_ARR_STR=16 \
-	-DGDIR_MAX_PACKS=32 -DGDIR_MAX_INST=64 -DGDIR_OPS_PER_FRAME=400000 \
+	-DPS2_POKE_N=2048u -DGDIR_POKE_BYTES=2048 -DBLAZIUM_PS2_COOK_ABI=1 -DGDIR_ARRAYS=128 \
 	-DPS2_EE_LIMIT=5242880u -DPS2_GS_LIMIT=4194304u -DPS2_EXTRA_EE_CAP=2097152u $(GDIR_EXTRA_FLAGS)
 
 N64_ROM_TITLE = "Blazium GDIR"

@@ -166,6 +166,9 @@ int main(void)
 	}
 	if (!gdir) {
 		printf("N64: no GDIR program (%s)\n", gdir_vm_error());
+#ifdef N64_STATS
+		halt(gdir_vm_error());
+#endif
 	}
 
 	uint64_t last = get_ticks();

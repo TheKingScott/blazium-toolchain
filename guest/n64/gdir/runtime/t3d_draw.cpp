@@ -1553,6 +1553,96 @@ static void draw_hud(void)
 }
 
 /* ------------------------------------------------------------ frame */
+/* Split screen (gs_draw_set_views): up to four views of the one scene, each
+ * with its own camera, in its own part of the frame (2: top and bottom
+ * halves; 3-4: quarters), as the PS2 guest has it. The HUD goes on top once. */
+#define MAX_VIEWS 4
+struct ViewCam {
+	float ex, ey, ez, tx, ty, tz, fov;
+};
+static ViewCam g_views[MAX_VIEWS];
+static int g_view_n;
+static T3DViewport g_vpv[MAX_VIEWS], g_vpv_far[MAX_VIEWS];
+static int g_vpv_made;
+
+static void view_rect(int i, int n, int *x, int *y, int *w, int *h)
+{
+	if (n == 2) {
+		*x = 0;
+		*y = i * (SCR_H / 2);
+		*w = SCR_W;
+		*h = SCR_H / 2;
+		return;
+	}
+	*x = (i & 1) * (SCR_W / 2);
+	*y = (i >> 1) * (SCR_H / 2);
+	*w = SCR_W / 2;
+	*h = SCR_H / 2;
+}
+
+/* the scene from the camera as it stands, into vp (and vp_far for the
+ * backdrop) covering w x h pixels; split: one of several views (no safe
+ * area: the FOV spans the view) */
+static unsigned draw_view(T3DViewport *vp, T3DViewport *vp_far, int w, int h, int split)
+{
+	DrawCtx c;
+	memset(&c, 0, sizeof(c));
+	const float half = tanf(g_fov * 0.5f * 3.14159265f / 180.0f);
+	/* the PS1's framing for one view: the FOV spans the middle 224 lines */
+	c.tan_y = split ? half : half * ((float)SCR_H * 0.5f) / ((float)SCR_H * 0.5f - (float)SAFE_Y);
+	c.tan_x = c.tan_y * (float)w / (float)h;
+	c.sec_x = sqrtf(1.0f + c.tan_x * c.tan_x);
+	c.sec_y = sqrtf(1.0f + c.tan_y * c.tan_y);
+	const float fov_v = 2.0f * atanf(c.tan_y);
+	c.far_m = g_fog_on ? g_fog_far : 400.0f;
+	c.far_main = c.far_m + 20.0f;
+	view_matrix(c.view);
+	T3DMat4 vm;
+	to_t3d(c.view, &vm);
+	const uint8_t white[4] = { 255, 255, 255, 255 };
+	/* the backdrop (NFOG): first, without the depth buffer, far plane far away */
+	t3d_viewport_set_projection(vp_far, fov_v, 1.0f, 4000.0f);
+	t3d_viewport_set_view_matrix(vp_far, &vm);
+	t3d_viewport_attach(vp_far);
+	t3d_light_set_ambient(white);
+	t3d_light_set_count(0);
+	t3d_fog_set_enabled(false);
+	t3d_matrix_push_pos(1);
+	c.cur_tex = -2;
+	c.cur_fog = 0;
+	c.far_pass = 1;
+	rdpq_mode_fog(0);
+	rdpq_mode_zbuf(false, false);
+	draw_groups(&c);
+	t3d_matrix_pop(1);
+	/* the rest with the depth buffer, and the fog */
+	t3d_tri_sync();
+	rdpq_mode_zbuf(true, true);
+	t3d_viewport_set_projection(vp, fov_v, NEAR_M, c.far_main);
+	t3d_viewport_set_view_matrix(vp, &vm);
+	t3d_viewport_attach(vp);
+	c.fog = g_fog_on && g_fog_far > g_fog_near;
+	if (c.fog) {
+		rdpq_set_fog_color(col(g_fog_r, g_fog_g, g_fog_b, 255));
+		t3d_fog_set_range(g_fog_near, g_fog_far);
+		t3d_fog_set_enabled(true);
+	}
+	t3d_matrix_push_pos(1);
+	c.cur_tex = -2;
+	c.far_pass = 0;
+	draw_groups(&c);
+	draw_instances(&c);
+	t3d_matrix_pop(1);
+	if (c.cur_depth) {
+		t3d_state_set_depth_offset(0);
+	}
+	if (c.fog) {
+		t3d_fog_set_enabled(false);
+	}
+	t3d_tri_sync();
+	return c.tris;
+}
+
 void gs_draw_scene(void)
 {
 	surface_t *fb = display_get();
@@ -1563,70 +1653,50 @@ void gs_draw_scene(void)
 	g_frame++;
 	g_mat_used = 0;
 	unsigned tris = 0;
-	if (g_ready) {
-		DrawCtx c;
-		memset(&c, 0, sizeof(c));
-		/* the PS1's framing: the FOV spans the middle 224 lines */
-		const float half = tanf(g_fov * 0.5f * 3.14159265f / 180.0f);
-		c.tan_y = half * ((float)SCR_H * 0.5f) / ((float)SCR_H * 0.5f - (float)SAFE_Y);
-		c.tan_x = c.tan_y * (float)SCR_W / (float)SCR_H;
-		c.sec_x = sqrtf(1.0f + c.tan_x * c.tan_x);
-		c.sec_y = sqrtf(1.0f + c.tan_y * c.tan_y);
-		const float fov_v = 2.0f * atanf(c.tan_y);
-		c.far_m = g_fog_on ? g_fog_far : 400.0f;
-		c.far_main = c.far_m + 20.0f;
-		view_matrix(c.view);
-		T3DMat4 vm;
-		to_t3d(c.view, &vm);
-		const uint8_t white[4] = { 255, 255, 255, 255 };
-		/* the backdrop (NFOG): first, without the depth buffer, far plane far away */
-		t3d_viewport_set_projection(&g_vp_far, fov_v, 1.0f, 4000.0f);
-		t3d_viewport_set_view_matrix(&g_vp_far, &vm);
-		t3d_viewport_attach(&g_vp_far);
-		t3d_light_set_ambient(white);
-		t3d_light_set_count(0);
-		t3d_fog_set_enabled(false);
-		t3d_matrix_push_pos(1);
-		c.cur_tex = -2;
-		c.cur_fog = 0;
-		c.far_pass = 1;
-		rdpq_mode_zbuf(false, false);
-		draw_groups(&c);
-		t3d_matrix_pop(1);
-		/* the rest with the depth buffer, and the fog */
-		rdpq_mode_zbuf(true, true);
-		t3d_viewport_set_projection(&g_vp, fov_v, NEAR_M, c.far_main);
-		t3d_viewport_set_view_matrix(&g_vp, &vm);
-		t3d_viewport_attach(&g_vp);
-		c.fog = g_fog_on && g_fog_far > g_fog_near;
-		if (c.fog) {
-			rdpq_set_fog_color(col(g_fog_r, g_fog_g, g_fog_b, 255));
-			t3d_fog_set_range(g_fog_near, g_fog_far);
-			t3d_fog_set_enabled(true);
+	if (g_ready && g_view_n < 2) {
+		tris = draw_view(&g_vp, &g_vp_far, SCR_W, SCR_H, 0);
+	} else if (g_ready) {
+		if (!g_vpv_made) {
+			for (int v = 0; v < MAX_VIEWS; v++) {
+				g_vpv[v] = t3d_viewport_create();
+				g_vpv_far[v] = t3d_viewport_create();
+			}
+			g_vpv_made = 1;
 		}
-		t3d_matrix_push_pos(1);
-		c.cur_tex = -2;
-		c.far_pass = 0;
-		draw_groups(&c);
-		draw_instances(&c);
-		t3d_matrix_pop(1);
-		if (c.cur_depth) {
-			t3d_state_set_depth_offset(0);
+		/* each view with its own camera; the scripted one comes back after */
+		const float kx = g_cam_x, ky = g_cam_y, kz = g_cam_z;
+		const float lx = g_look_x, ly = g_look_y, lz = g_look_z, kf = g_fov;
+		const float ax = g_attach_x, ay = g_attach_y, az = g_attach_z, eh = g_eye_h;
+		g_attach_x = g_attach_y = g_attach_z = 0.0f;
+		g_eye_h = 0.0f;
+		for (int v = 0; v < g_view_n; v++) {
+			int vx, vy, vw, vh;
+			view_rect(v, g_view_n, &vx, &vy, &vw, &vh);
+			const ViewCam *vc = &g_views[v];
+			g_cam_x = vc->ex;
+			g_cam_y = vc->ey;
+			g_cam_z = vc->ez;
+			g_look_x = vc->tx;
+			g_look_y = vc->ty;
+			g_look_z = vc->tz;
+			g_fov = vc->fov;
+			t3d_viewport_set_area(&g_vpv[v], vx, vy, vw, vh);
+			t3d_viewport_set_area(&g_vpv_far[v], vx, vy, vw, vh);
+			tris += draw_view(&g_vpv[v], &g_vpv_far[v], vw, vh, 1);
 		}
-		if (c.fog) {
-			t3d_fog_set_enabled(false);
-		}
-		tris = c.tris;
-#ifdef N64_STATS
-		static unsigned frames;
-		if ((frames++ % 120) == 0) {
-			float ex, ey, ez;
-			eye_now(&ex, &ey, &ez);
-			printf("N64 frame: %u tris in %u batches, %u matrices, eye %d %d %d look %d %d %d (cm), fov %d\n", tris, c.batches, g_mat_used,
-					(int)(ex * 100), (int)(ey * 100), (int)(ez * 100), (int)(g_look_x * 100), (int)(g_look_y * 100), (int)(g_look_z * 100),
-					(int)g_fov);
-		}
-#endif
+		g_cam_x = kx;
+		g_cam_y = ky;
+		g_cam_z = kz;
+		g_look_x = lx;
+		g_look_y = ly;
+		g_look_z = lz;
+		g_fov = kf;
+		g_attach_x = ax;
+		g_attach_y = ay;
+		g_attach_z = az;
+		g_eye_h = eh;
+		/* the HUD over the whole frame */
+		rdpq_set_scissor(0, 0, SCR_W, SCR_H);
 	}
 	(void)tris;
 	t3d_tri_sync();
@@ -2067,27 +2137,29 @@ void gs_draw_set_fog(int on, int r, int g, int b, float near_d, float far_d)
 	g_fog_far = far_d;
 }
 
-/* split screen is not on the PS1 runtime yet: always one view */
 void gs_draw_set_views(int n)
 {
-	(void)n;
+	g_view_n = n >= 2 && n <= MAX_VIEWS ? n : 0;
 }
 
 void gs_draw_view_look(int i, float ex, float ey, float ez, float tx, float ty, float tz, float fov_deg)
 {
-	(void)i;
-	(void)ex;
-	(void)ey;
-	(void)ez;
-	(void)tx;
-	(void)ty;
-	(void)tz;
-	(void)fov_deg;
+	if (i < 0 || i >= MAX_VIEWS) {
+		return;
+	}
+	ViewCam *v = &g_views[i];
+	v->ex = ex;
+	v->ey = ey;
+	v->ez = ez;
+	v->tx = tx;
+	v->ty = ty;
+	v->tz = tz;
+	v->fov = fov_deg > 1.0f && fov_deg < 170.0f ? fov_deg : 55.0f;
 }
 
 int gs_draw_view_count(void)
 {
-	return 0;
+	return g_view_n;
 }
 
 void gs_draw_use_vu1(int on)

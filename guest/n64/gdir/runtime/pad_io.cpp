@@ -137,8 +137,17 @@ void pad_io_poll(float *yaw, float *dolly, int *cross_down)
 		read_pad(i);
 	}
 #ifdef N64_AUTOPAD
-	s_btns[0] |= auto_buttons(s_auto_frame++);
-	s_conn[0] = 1;
+	{
+		/* N64_AUTOPADS pads (1 if unset) all get the script */
+#ifndef N64_AUTOPADS
+#define N64_AUTOPADS 1
+#endif
+		const unsigned short ab = auto_buttons(s_auto_frame++);
+		for (int i = 0; i < N64_AUTOPADS && i < PAD_MAX; i++) {
+			s_btns[i] |= ab;
+			s_conn[i] = 1;
+		}
+	}
 #endif
 	const int cross = (s_btns[0] & B_CROSS) ? 1 : 0;
 	if (cross_down) {
