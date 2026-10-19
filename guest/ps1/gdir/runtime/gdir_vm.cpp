@@ -2085,10 +2085,13 @@ static inline void vcopy(Val *d, const Val *s)
 {
 	const vword *sw = (const vword *)s;
 	vword *dw = (vword *)d;
+	/* the type byte as a byte: in word 0 it is the low byte only on a
+	 * little-endian CPU (the N64 is big-endian) */
+	const unsigned t = s->t;
 	const unsigned w0 = sw[0], w1 = sw[1];
 	dw[0] = w0;
 	dw[1] = w1;
-	if ((unsigned)((w0 & 0xff) - T_VEC2) <= (unsigned)(T_VEC3 - T_VEC2)) {
+	if ((unsigned)(t - T_VEC2) <= (unsigned)(T_VEC3 - T_VEC2)) {
 		const unsigned w2 = sw[2], w3 = sw[3];
 		dw[2] = w2;
 		dw[3] = w3;
