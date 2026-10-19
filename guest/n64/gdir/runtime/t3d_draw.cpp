@@ -228,8 +228,12 @@ static void parse_textures(const uint8_t *b, unsigned sz)
 		t->sx = t->sy = 0;
 		t->split = 0;
 		if (w * h > budget && !t->tiled) {
+			/* a tile's load starts on an 8-byte TMEM line, so it can be
+			 * that many texels wider than asked (16 CI4, 8 CI8, 4 RGBA16):
+			 * room is left for them */
+			const int slack = 64 / bits;
 			int tw = w < 64 ? w : 64;
-			int th = budget / tw;
+			int th = budget / (tw + slack);
 			th = th > h ? h : th;
 			t->split = 1;
 			t->tw = tw;
