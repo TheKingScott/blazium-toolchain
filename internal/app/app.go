@@ -21,6 +21,7 @@ import (
 	"github.com/blazium-games/blazium-toolchain/internal/platforms/future"
 	"github.com/blazium-games/blazium-toolchain/internal/platforms/interdvd"
 	n64plat "github.com/blazium-games/blazium-toolchain/internal/platforms/n64"
+	"github.com/blazium-games/blazium-toolchain/internal/platforms/nds"
 	"github.com/blazium-games/blazium-toolchain/internal/platforms/ps1"
 	"github.com/blazium-games/blazium-toolchain/internal/platforms/ps2"
 	"github.com/blazium-games/blazium-toolchain/internal/platforms/steam"
@@ -47,6 +48,8 @@ func init() {
 	platforms.Register(ps1.New())
 	platforms.Register(ps2.New())
 	platforms.Register(n64plat.New())
+	platforms.Register(nds.New())
+	platforms.Register(nds.NewDSi())
 	platforms.Register(interdvd.New())
 	platforms.Register(steam.New())
 	future.Register()
@@ -139,7 +142,7 @@ func cmdList(jsonOut bool, w io.Writer) int {
 	for _, info := range list {
 		note := ""
 		switch info.ID {
-		case "ps1", "ps2", "n64":
+		case "ps1", "ps2", "n64", "nds", "dsi":
 			if ps2.HostSupported() {
 				note = "  Windows/Linux; guest bundled in this CLI"
 			} else {
