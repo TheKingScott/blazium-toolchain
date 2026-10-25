@@ -240,6 +240,9 @@ func findSrcRoot(dir, marker string) string {
 }
 
 func libdragonRoot(prefix string) string {
+	if v := os.Getenv("LIBDRAGON_SRC"); v != "" && fileExists(filepath.Join(v, "n64.mk")) {
+		return absOr(v)
+	}
 	if p := findSrcRoot(cachedSrcDir(prefix, "libdragon"), "n64.mk"); p != "" {
 		return p
 	}
@@ -247,6 +250,9 @@ func libdragonRoot(prefix string) string {
 }
 
 func tiny3dRoot(prefix string) string {
+	if v := os.Getenv("T3D_INST"); v != "" && fileExists(filepath.Join(v, "t3d.mk")) {
+		return absOr(v)
+	}
 	if p := findSrcRoot(cachedSrcDir(prefix, "tiny3d"), "t3d.mk"); p != "" {
 		return p
 	}

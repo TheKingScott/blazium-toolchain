@@ -3,6 +3,7 @@ package guest
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -350,5 +351,38 @@ func TestOverlayReplacesAndAdds(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "extra", "hooks.cpp")); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestGDIRSharedMatchesPS2(t *testing.T) {
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Skip("no caller info")
+	}
+	ps2 := filepath.Join(filepath.Dir(thisFile), "..", "ps2", "runtime")
+	for _, name := range GDIRShared {
+		n64, err := gdirFiles.ReadFile("gdir/runtime/" + name)
+		if err != nil {
+			t.Fatalf("embed missing %s: %v", name, err)
+		}
+		want, err := os.ReadFile(filepath.Join(ps2, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(n64) != string(want) {
+			t.Errorf("guest/n64/gdir/runtime/%s differs from guest/ps2/runtime/%s (copy it across)", name, name)
+		}
+	}
+}
+
+func TestInstallGDIRWritesMakefile(t *testing.T) {
+	dir := t.TempDir()
+	if err := InstallGDIR(dir); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"Makefile", "main.cpp", "t3d_draw.cpp", "gdir_vm.cpp", "iso_path.h"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Fatalf("missing %s: %v", name, err)
+		}
 	}
 }
