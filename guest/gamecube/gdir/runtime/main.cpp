@@ -1,0 +1,193 @@
+// Blazium GameCube GDIR guest - MIT. The PS2 guest's scene runtime (GDIR VM,
+// sys_io, pack_io) on the Nintendo GameCube: the cooked packs are files on
+// the game's disc (DATA/), pack 0 loads at boot, the scripts run every frame
+// and gx_draw.cpp draws with the GX.
+
+#include "disc_io.h"
+#include "gdir_vm.h"
+#include "gs_draw.h"
+#include "iso_path.h"
+#include "pack_io.h"
+#include "pad_io.h"
+#include "sfx_io.h"
+#include "sys_io.h"
+
+#include <gccore.h>
+#include <malloc.h>
+#include <ogc/lwp_watchdog.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static unsigned ru16(const unsigned char *p)
+{
+	return (unsigned)p[0] | ((unsigned)p[1] << 8);
+}
+
+static uint32_t ru32(const unsigned char *p)
+{
+	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static uint64_t us_now(void)
+{
+	return ticks_to_microsecs(gettime());
+}
+
+/* A whole file from the disc's DATA folder. */
+static unsigned char *load_file(const char *name, unsigned *size)
+{
+	char path[64];
+	snprintf(path, sizeof(path), "cdrom0:\\%s;1", name);
+	FILE *f = iso_fopen(path, "rb");
+	*size = 0;
+	if (!f) {
+		printf("GC: %s not on the disc\n", name);
+		return 0;
+	}
+	fseek(f, 0, SEEK_END);
+	const long n = ftell(f);
+	fseek(f, 0, SEEK_SET);
+	unsigned char *b = (unsigned char *)memalign(32, (size_t)n + 4);
+	if (b && fread(b, 1, (size_t)n, f) == (size_t)n) {
+		*size = (unsigned)n;
+	} else {
+		printf("GC: %s (%ld bytes) did not load\n", name, n);
+		free(b);
+		b = 0;
+	}
+	fclose(f);
+	return b;
+}
+
+/* the HUD's space: DISP.BIN as the PS2 export wrote it */
+static void load_disp(int *w, int *h)
+{
+	*w = 640;
+	*h = 448;
+	unsigned n = 0;
+	unsigned char *b = load_file("DISP.BIN", &n);
+	if (b && n >= 12 && memcmp(b, "DISP", 4) == 0 && ru16(b + 4) == 1) {
+		const int dw = (int)ru16(b + 8), dh = (int)ru16(b + 10);
+		if (dw >= 256 && dw <= 1024) {
+			*w = dw;
+		}
+		if (dh >= 192 && dh <= 1024) {
+			*h = dh;
+		}
+	}
+	free(b);
+}
+
+static void halt(const char *why)
+{
+	printf("GC: %s\n", why);
+	for (;;) {
+		gs_draw_set_clear(96, 16, 16);
+		gs_draw_hud_quad(0, 40, 200, 560, 40, 0, 0, 0);
+		gs_draw_hud_style(0, 3, 2, 1, 0, 255, 255, 255);
+		gs_draw_hud_text(0, 40, 200, 0, 0, 0, why);
+		gs_draw_scene();
+	}
+}
+
+/* the heap, when pack_io finds no room for a pack */
+extern "C" void gc_heap_report(void)
+{
+	const struct mallinfo mi = mallinfo();
+	printf("GC heap: %d bytes in use, %d free of the arena, %u in MEM1 left\n", (int)mi.uordblks, (int)mi.fordblks,
+			(unsigned)((u8 *)SYS_GetArena1Hi() - (u8 *)SYS_GetArena1Lo()));
+}
+
+int main(int argc, char **argv)
+{
+	(void)argc;
+	(void)argv;
+	/* printf to the debug UART: Dolphin's log (OSReport), nothing on a retail
+	 * console */
+	SYS_STDIO_Report(true);
+	printf("Blazium GameCube GDIR guest\n");
+	const int disc = disc_init();
+	int hud_w = 640, hud_h = 448;
+	if (disc) {
+		load_disp(&hud_w, &hud_h);
+	}
+	gs_draw_boot(hud_w, hud_h);
+	if (!disc) {
+		halt("No game disc.");
+	}
+	pad_io_init();
+
+	unsigned mesh_sz = 0, gtex_sz = 0, node_sz = 0, scrp_sz = 0;
+	unsigned char *scrp = load_file("SCRP00.BIN", &scrp_sz);
+	unsigned char *mesh = load_file("MESH00.BIN", &mesh_sz);
+	unsigned char *gtex = load_file("GTEX00.BIN", &gtex_sz);
+	unsigned char *node = load_file("NODE00.BIN", &node_sz);
+	if (!mesh || !gs_draw_init(mesh, mesh_sz, gtex, gtex_sz, node, node_sz)) {
+		halt("No scene on the disc (DATA/MESH00.BIN).");
+	}
+	const uint64_t t0 = us_now();
+	pack_io_set_pack0(mesh, mesh_sz, gtex, gtex_sz, node, node_sz);
+	sfx_io_init();
+	pack_io_init();
+	sys_io_init();
+	printf("GC boot: ready in %u ms\n", (unsigned)((us_now() - t0) / 1000));
+	gc_heap_report();
+
+	/* SCRP: "SCRP", u16 abi, u16 flags (bit 0: GDIR), u32 tape bytes, tape, GDIR */
+	int gdir = 0;
+	if (scrp && scrp_sz >= 12 && memcmp(scrp, "SCRP", 4) == 0 && (ru16(scrp + 6) & 1)) {
+		const uint32_t tape = ru32(scrp + 8);
+		if (12 + tape <= scrp_sz) {
+			gdir = gdir_vm_init(scrp + 12 + tape, scrp_sz - 12 - tape);
+		}
+	}
+	if (!gdir) {
+		printf("GC: no GDIR program (%s)\n", gdir_vm_error());
+	}
+
+	uint64_t last = us_now();
+	for (;;) {
+		pad_io_poll(0, 0, 0);
+		/* the frame's time from the clock, so a slow frame keeps time */
+		const uint64_t now = us_now();
+		float dt = (float)(now - last) * 1.0e-6f;
+		last = now;
+		if (dt < 1.0f / 60.0f) {
+			dt = 1.0f / 60.0f;
+		}
+		if (dt > 0.1f) {
+			dt = 0.1f;
+		}
+		if (gdir) {
+#ifdef GC_FIXED_DELTA
+			gdir_vm_process(GC_FIXED_DELTA);
+#else
+			gdir_vm_process(dt);
+#endif
+			const char *err = gdir_vm_error();
+			if (err && err[0]) {
+				halt(err);
+			}
+		}
+		gs_draw_scene();
+#ifdef GC_FRAME_STATS
+		/* dev: the frame rate the console would see (the emulated clock) */
+		{
+			static unsigned frames;
+			static uint64_t t_stat;
+			if (!t_stat) {
+				t_stat = now;
+			}
+			if (++frames == 300) {
+				const uint64_t us = us_now() - t_stat;
+				printf("GC frames: %u.%u fps over %u frames\n", (unsigned)(300000000ull / us), (unsigned)(3000000000ull / us % 10), frames);
+				frames = 0;
+				t_stat = us_now();
+			}
+		}
+#endif
+	}
+	return 0;
+}

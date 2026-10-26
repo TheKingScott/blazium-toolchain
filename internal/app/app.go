@@ -19,6 +19,7 @@ import (
 	"github.com/blazium-games/blazium-toolchain/internal/iso"
 	"github.com/blazium-games/blazium-toolchain/internal/platforms"
 	"github.com/blazium-games/blazium-toolchain/internal/platforms/future"
+	gcplat "github.com/blazium-games/blazium-toolchain/internal/platforms/gamecube"
 	"github.com/blazium-games/blazium-toolchain/internal/platforms/interdvd"
 	n64plat "github.com/blazium-games/blazium-toolchain/internal/platforms/n64"
 	"github.com/blazium-games/blazium-toolchain/internal/platforms/nds"
@@ -52,6 +53,7 @@ func init() {
 	platforms.Register(nds.New())
 	platforms.Register(nds.NewDSi())
 	platforms.Register(ps3plat.New())
+	platforms.Register(gcplat.New())
 	platforms.Register(interdvd.New())
 	platforms.Register(steam.New())
 	future.Register()
@@ -144,7 +146,7 @@ func cmdList(jsonOut bool, w io.Writer) int {
 	for _, info := range list {
 		note := ""
 		switch info.ID {
-		case "ps1", "ps2", "n64", "nds", "dsi", "ps3":
+		case "ps1", "ps2", "n64", "nds", "dsi", "ps3", "gamecube":
 			if ps2.HostSupported() {
 				note = "  Windows/Linux; guest bundled in this CLI"
 			} else {
@@ -300,9 +302,9 @@ func runBuild(ctx context.Context, p platforms.Platform, args []string, base pla
 	display := fs.String("display", settings.Current().N64.Display, "N64 framebuffer: 320 or 640")
 	rumble := fs.Bool("rumble", settings.Current().N64.Rumble, "N64 Rumble Pak (P8 optional)")
 	rdram := fs.String("rdram", settings.Current().N64.Rdram, "N64 RDRAM: 8 or 4")
-	title := fs.String("title", "", "ps3: the game's name on the XMB (default: --out's name)")
-	titleID := fs.String("title-id", "", "ps3: title ID, four letters and five digits (default BLAZ00001)")
-	icon := fs.String("icon", "", "ps3: ICON0.PNG (320x176) for the XMB")
+	title := fs.String("title", "", "ps3/gamecube: the game's name on the XMB or the disc (default: --out's name)")
+	titleID := fs.String("title-id", "", "ps3: title ID, four letters and five digits (default BLAZ00001); gamecube: game ID, six letters or digits (default GBZEBZ)")
+	icon := fs.String("icon", "", "ps3: ICON0.PNG (320x176) for the XMB; gamecube: the banner picture (96x32 PNG)")
 	if err := fs.Parse(args); err != nil {
 		return report.Usage(err.Error())
 	}
@@ -649,6 +651,7 @@ Platforms:
   interdvd  supported (Interactive DVD ISO9660+UDF)
   steam     supported (Valve steamcmd cache for blazium-cli deploy)
   ps3       supported (PlayStation 3 homebrew; any host, no SDK; guest bundled; product .pkg)
+  gamecube  supported (Nintendo GameCube homebrew; any host, no SDK; guest bundled; product .iso)
   ps4       planned
 
 PS1/PS2/N64 host tools: Windows and Linux only. setup/build/run/iso/rom exit 2 on other OSes.
@@ -708,6 +711,13 @@ PS3 commands:
   status
   build --sample gdir --out GAME.pkg|DIR [--pack-dir EXPORT] [--title NAME] [--title-id BLAZ00001] [--icon ICON0.PNG] [--overlay DIR]
   run [--timeout 120s] GAME_FOLDER|EBOOT.BIN|GAME.pkg
+
+GameCube commands:
+  setup [--profile prebuilt|compile]   (compile: devkitPPC and libogc for --overlay)
+  env
+  status
+  build --sample gdir --out GAME.iso|DIR [--pack-dir EXPORT] [--title NAME] [--title-id GBZEBZ] [--icon BANNER.PNG] [--overlay DIR]
+  run [--timeout 120s] [--iso] GAME.iso
 
 Cache: <prefix>/<plat>/ (inst, src, guest, work). Portable copy: <exeDir>/<plat>/.
 License: GPL-3.0-or-later (this repo may contain GCC, PSn00bSDK, mkpsxiso, pcsx-redux, ps2dev, libdragon, Ares).

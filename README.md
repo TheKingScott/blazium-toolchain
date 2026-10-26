@@ -1,6 +1,6 @@
 # blazium-toolchain
 
-A CLI that fetches console compilers into a cache and builds PS1, PS2, PS3, N64, and Interactive DVD products. GPL-3.0-or-later; the MIT Blazium editor only spawns the binary. `ps4` is reserved and exits `2`.
+A CLI that fetches console compilers into a cache and builds PS1, PS2, PS3, GameCube, N64, and Interactive DVD products. GPL-3.0-or-later; the MIT Blazium editor only spawns the binary. `ps4` is reserved and exits `2`.
 
 ## Blazium Engine
 
@@ -25,7 +25,7 @@ A CLI that fetches console compilers into a cache and builds PS1, PS2, PS3, N64,
 | [CLI](https://github.com/blazium-games/blazium-cli) | Install editors, projects, remote control, Steam and itch.io deploy. Not the Games uploader. | Linux and Windows, x86_64 and x86_32. Catalog: [cli.json](https://cdn.blazium.app/cli/cli.json) |
 | [Hub](https://github.com/blazium-games/blazium-hub) | Desktop companion; installers bundle the CLI. Engine builds track `blazium_4.8`. | Linux and Windows, x86_64 and x86_32. |
 | [Crash reporter](https://github.com/blazium-games/blazium_crash_reporter) | Sidecar UI for engine and Hub crash reports. Engine builds track `blazium_4.8`. | Linux and Windows, x86_64 and x86_32. Catalog: [crash_reporter.json](https://cdn.blazium.app/crash_reporter/crash_reporter.json) |
-| [Toolchain](https://github.com/blazium-games/blazium-toolchain) | PS1, PS2, PS3, N64, and Interactive DVD. `ps4` is reserved and does not ship. | Linux and Windows, x86_64 and x86_32. Catalog: [toolchain.json](https://cdn.blazium.app/toolchain/toolchain.json) |
+| [Toolchain](https://github.com/blazium-games/blazium-toolchain) | PS1, PS2, PS3, GameCube, N64, and Interactive DVD. `ps4` is reserved and does not ship. | Linux and Windows, x86_64 and x86_32. Catalog: [toolchain.json](https://cdn.blazium.app/toolchain/toolchain.json) |
 | [Skills](https://github.com/blazium-games/blazium-skills) | Agent skill packs for Claude, Cursor, Codex, and Grok. Own semver, separate from the 0.8.x API baseline. | Catalog: [skills.json](https://cdn.blazium.app/skills/skills.json) |
 | [Subagents](https://github.com/blazium-games/blazium-subagents) | Studio roster that loads those skills. Own semver. | Catalog: [subagents.json](https://cdn.blazium.app/subagents/subagents.json) |
 | [Blazium Games](https://blazium.games) | Separate store. Upload with chauffeur, not with these tools. | Site [blazium.games](https://blazium.games), docs [docs.blazium.games](https://docs.blazium.games). |
@@ -248,9 +248,26 @@ Only a guest with code of your own (`--overlay`, or `GDIR_EXTRA_FLAGS`) is compi
 
 Saves go to `BLAZIUM.SAV` in the game's `USRDIR`. Install the `.pkg` on a PS3 that runs homebrew (HEN or CFW), or in RPCS3 (File > Install Packages, with the PS3 system software installed). `ps3 run` starts `RPCS3_EXE` on the game folder or its `EBOOT.BIN`.
 
+## GameCube
+
+`gamecube build --sample gdir` needs no GameCube SDK, on Windows, Linux or macOS. The GDIR guest comes compiled with the CLI (`guest/gamecube/prebuilt`: `gdir.dol` and the disc's apploader, built with devkitPPC and libogc), and the CLI itself writes the GameCube disc image (GCM: disc header, apploader, DOL, file system table) and its `opening.bnr` banner. It takes a PS2 GDIR export (`--pack-dir`, else the folder `--out` is in); the cooked files go into the disc's `DATA/` folder as they are. The GX draws the PS2 packs at 640x480, with the HUD in the PS2's 640x448 space. It writes:
+
+- `--out GAME.iso`: the disc image, with `GAME.THIRD-PARTY-NOTICES.txt` beside it.
+- `--out DIR`: `DIR/GAMEID.iso`.
+
+| Flag | Effect |
+|------|--------|
+| `--title NAME` | The disc's and the banner's name; default `--out`'s name |
+| `--title-id GBZEBZ` | The game ID: a four-character game code (its fourth letter is the region: E America, P Europe, J Japan) and a two-character maker; also the Memory Card file's owner |
+| `--icon BANNER.PNG` | The banner picture, scaled to 96x32; default the export's `BANNER.PNG`, else a plain one |
+
+Saves go to the file `BLAZIUM` on the Memory Card in slot A (one block). Pads 1 to 4 are GameCube controllers: A cross, B circle, X square, Y triangle, L/R L1/R1 (and the analogue triggers), Z select, Start start; the control stick steers and, pushed well over, also works the d-pad in menus (Dolphin puts the arrow keys on it). Play the `.iso` in Dolphin, or on a console with Swiss or another disc loader. `gamecube run` starts `DOLPHIN_EXE` on it.
+
+Only a guest with code of your own (`--overlay`, or `GDIR_EXTRA_FLAGS`) is compiled, with devkitPPC and libogc (devkitPro's `gamecube-dev`; set `DEVKITPRO`). After changing `guest/gamecube`, rebuild the bundled guest with `scripts/gamecube-guest-prebuilt.sh` (`go test ./guest/gamecube` checks that it matches the sources).
+
 ## Hosts
 
-PS1/PS2/N64 setup, build, run, iso, and rom are Windows and Linux. PS3 builds anywhere (a custom PS3 guest compiles on Linux only). Other hosts exit `2`. `env`, `status`, and `export-guest` still work. Building the CLI locally on macOS can still master Interactive DVD. Published release binaries are Linux and Windows only.
+PS1/PS2/N64 setup, build, run, iso, and rom are Windows and Linux. PS3 and GameCube build anywhere (a custom PS3 guest compiles on Linux only). Other hosts exit `2`. `env`, `status`, and `export-guest` still work. Building the CLI locally on macOS can still master Interactive DVD. Published release binaries are Linux and Windows only.
 
 CI runs `go test ./...`, `go vet ./...`, `ps2 build --out hello.elf`, and `n64 build --out hello.z64` on Ubuntu and Windows.
 

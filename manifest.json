@@ -26,6 +26,11 @@
       "status": "supported",
       "commands": ["setup", "env", "status", "build", "run"]
     },
+    {
+      "id": "gamecube",
+      "status": "supported",
+      "commands": ["setup", "env", "status", "build", "run"]
+    },
     { "id": "ps4", "status": "planned", "commands": [] },
     {
       "id": "n64",
