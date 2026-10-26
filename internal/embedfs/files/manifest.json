@@ -21,7 +21,11 @@
       "status": "supported",
       "commands": ["setup", "env", "status", "build", "export-guest", "run", "iso", "elf-info", "chd"]
     },
-    { "id": "ps3", "status": "planned", "commands": [] },
+    {
+      "id": "ps3",
+      "status": "supported",
+      "commands": ["setup", "env", "status", "build", "run"]
+    },
     { "id": "ps4", "status": "planned", "commands": [] },
     {
       "id": "n64",

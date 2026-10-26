@@ -26,7 +26,7 @@ type Info struct {
 // EnvMap is toolchain paths the editor or a parent installer can consume.
 type EnvMap map[string]string
 
-// Platform is one console family. PS1, PS2, and N64 are implemented; others return ErrPlanned.
+// Platform is one console family. PS1, PS2, PS3, N64 and the DS are implemented; others return ErrPlanned.
 type Platform interface {
 	Info() Info
 	Setup(ctx context.Context, opts SetupOptions) error
@@ -89,6 +89,9 @@ type BuildOptions struct {
 	Display   string // N64 framebuffer: 320 (default) or 640
 	Rumble    bool   // N64 Rumble Pak (P8 optional)
 	Rdram     string // N64 RDRAM: 8 (default Expansion Pak) or 4 (no-pak)
+	Title     string // PS3: the game's name on the XMB (default: --out's name)
+	TitleID   string // PS3: the title ID, four letters and five digits (BLAZ00001)
+	Icon      string // PS3: ICON0.PNG, 320x176 (default: the export's, else PSL1GHT's)
 }
 
 // RunOptions boot the emulator.

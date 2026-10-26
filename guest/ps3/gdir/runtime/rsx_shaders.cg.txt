@@ -1,0 +1,23 @@
+// The vertex program (cgcomp -v):
+// The scene and HUD vertices come already transformed (clip space) from the
+// PPU, as the PS2 guest's EE sends them to the GS: this only passes them on.
+void main(float4 inPos : POSITION, float4 inCol : COLOR0, float4 inFog : COLOR1, float2 inUv : TEXCOORD0,
+	out float4 oPos : POSITION, out float4 oCol : COLOR0, out float4 oFog : COLOR1, out float2 oUv : TEXCOORD0)
+{
+	oPos = inPos;
+	oCol = inCol;
+	oFog = inFog;
+	oUv = inUv;
+}
+
+// The fragment program (cgcomp -f):
+// The GS's MODULATE (texture times vertex colour, RGB only) and its FOG:
+// fog.rgb is the fog colour, fog.a how much of the surface is left (1: none).
+// Alpha is the vertex's (the fade's blend).
+void main(float4 col : COLOR0, float4 fog : COLOR1, float2 uv : TEXCOORD0, uniform sampler2D tex : TEXUNIT0,
+	out float4 oCol : COLOR)
+{
+	float3 c = tex2D(tex, uv).rgb * col.rgb;
+	oCol.rgb = lerp(fog.rgb, c, fog.a);
+	oCol.a = col.a;
+}

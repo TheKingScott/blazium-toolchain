@@ -2083,6 +2083,12 @@ static const Val k_vtrue = { T_BOOL, { 1 } };
 typedef unsigned __attribute__((may_alias)) vword;
 static inline void vcopy(Val *d, const Val *s)
 {
+	if (sizeof(Val) != 4 * sizeof(vword)) {
+		/* a 64-bit CPU (the PS3's PPU): the string pointer makes a Val
+		 * 24 bytes, past the four words below */
+		*d = *s;
+		return;
+	}
 	const vword *sw = (const vword *)s;
 	vword *dw = (vword *)d;
 	/* the type byte as a byte: in word 0 it is the low byte only on a
@@ -2441,6 +2447,10 @@ static const Val k_vnil = { T_NIL, { 0 } };
 #define A_ZERO(v) \
 	do { \
 		vword *w_ = (vword *)&(v); \
+		if (sizeof(Val) != 4 * sizeof(vword)) { \
+			memset(w_, 0, sizeof(Val)); \
+			break; \
+		} \
 		w_[0] = 0; \
 		w_[1] = 0; \
 		w_[2] = 0; \

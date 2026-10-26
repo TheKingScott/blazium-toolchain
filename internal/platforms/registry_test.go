@@ -35,7 +35,7 @@ func TestListIncludesPS1AndPlanned(t *testing.T) {
 	if ids["steam"] != platforms.StatusSupported {
 		t.Fatalf("steam status %q", ids["steam"])
 	}
-	for _, id := range []string{"ps3", "ps4"} {
+	for _, id := range []string{"ps4"} {
 		if ids[id] != platforms.StatusPlanned {
 			t.Fatalf("%s want planned, got %q", id, ids[id])
 		}
@@ -44,7 +44,7 @@ func TestListIncludesPS1AndPlanned(t *testing.T) {
 
 func TestLookupPlanned(t *testing.T) {
 	future.Register()
-	_, err := platforms.Lookup("ps3")
+	_, err := platforms.Lookup("ps4")
 	if !errors.Is(err, platforms.ErrPlanned) {
 		t.Fatalf("got %v", err)
 	}

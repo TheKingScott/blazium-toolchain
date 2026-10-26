@@ -22,6 +22,10 @@ Each tree keeps its upstream license. This CLI spawns compilers, packers, and em
 | Project64 | GPLv2 | user `PROJECT64_EXE` | Spawned by `n64 run` (Parallel-RDP or Angrylion) |
 | FFmpeg | GPL/LGPL (pinned build) | `<prefix>/interdvd/ffmpeg/` | Spawned by `interdvd ffmpeg` / `ffprobe` |
 | chdman | MAME / BSD | user PATH | Spawned by `ps2 chd` when present |
+| PSL1GHT (libraries, start-up code) and newlib | MIT; BSD-style | `guest/ps3/prebuilt/gdir.elf` (compiled in); `<prefix>/ps3/inst/ps3dev/` for `ps3 setup --profile compile` | Linked into the PS3 guest only; notices written beside each `.pkg` |
+| ps3dev (PPU GCC, PSL1GHT) | GPLv3 / MIT (unmodified ps3toolchain release) | `<prefix>/ps3/inst/ps3dev/` | Spawned only to compile a PS3 guest with `--overlay` (Linux) |
+| make_self_npdrm, sfo, pkg (PSL1GHT tools/geohot, tools/sfo_pkg) | GPLv3 / MIT | ported into `internal/platforms/ps3` (self.go, pkg.go) | Sign EBOOT.BIN, write PARAM.SFO and the .pkg |
+| RPCS3 | GPLv2 | user `RPCS3_EXE` | Spawned by `ps3 run`; PS3 system software never fetched |
 
 Do not copy these trees into `blazium/` or link them into the editor.
 

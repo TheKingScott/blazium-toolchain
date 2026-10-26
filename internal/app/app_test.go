@@ -136,7 +136,7 @@ func TestListJSONHasPS1(t *testing.T) {
 			t.Fatalf("ps2 description must say guest is bundled: %s", info.Description)
 		}
 	}
-	for _, want := range []string{"ps3", "ps4"} {
+	for _, want := range []string{"ps4"} {
 		var found bool
 		for _, info := range list {
 			if info.ID == want && info.Status == platforms.StatusPlanned {

@@ -45,9 +45,14 @@
 //	blazium-toolchain [--prefix DIR] n64 export-guest [--out DIR]
 //	blazium-toolchain [--prefix DIR] n64 run [--emu ares|project64|both] [--timeout 120s] [--rdram 8|4] GAME.z64
 //	blazium-toolchain [--prefix DIR] n64 rom --dir TREE --out FILE.z64 [--elf FILE.elf]
+//	blazium-toolchain [--prefix DIR] ps3 setup [--profile prebuilt|compile] [--offline]
+//	blazium-toolchain [--prefix DIR] ps3 build --sample gdir --out GAME.pkg|DIR [--pack-dir EXPORT]
+//	  [--title NAME] [--title-id BLAZ00001] [--icon ICON0.PNG] [--overlay DIR]
+//	blazium-toolchain [--prefix DIR] ps3 run [--timeout 120s] GAME_FOLDER|EBOOT.BIN|GAME.pkg
 //
-// ps1, ps2, n64, and interdvd are implemented. Guests are bundled. N64 writes
+// ps1, ps2, ps3, n64, and interdvd are implemented. Guests are bundled. N64 writes
 // a big-endian .z64. Cache is <prefix>/<plat>/{inst,src,guest,work}. Settings
 // come from blazium-toolchain.yml. Setup/build/run/iso/rom need Windows or
-// Linux (exit 2 elsewhere). ps3 and ps4 are reserved (exit 2).
+// Linux (exit 2 elsewhere); ps3 builds on any host with its bundled guest. ps4
+// is reserved (exit 2).
 package main

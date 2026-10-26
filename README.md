@@ -1,6 +1,6 @@
 # blazium-toolchain
 
-A CLI that fetches console compilers into a cache and builds PS1, PS2, N64, and Interactive DVD products. GPL-3.0-or-later; the MIT Blazium editor only spawns the binary. `ps3` and `ps4` are reserved and exit `2`.
+A CLI that fetches console compilers into a cache and builds PS1, PS2, PS3, N64, and Interactive DVD products. GPL-3.0-or-later; the MIT Blazium editor only spawns the binary. `ps4` is reserved and exits `2`.
 
 ## Blazium Engine
 
@@ -25,7 +25,7 @@ A CLI that fetches console compilers into a cache and builds PS1, PS2, N64, and 
 | [CLI](https://github.com/blazium-games/blazium-cli) | Install editors, projects, remote control, Steam and itch.io deploy. Not the Games uploader. | Linux and Windows, x86_64 and x86_32. Catalog: [cli.json](https://cdn.blazium.app/cli/cli.json) |
 | [Hub](https://github.com/blazium-games/blazium-hub) | Desktop companion; installers bundle the CLI. Engine builds track `blazium_4.8`. | Linux and Windows, x86_64 and x86_32. |
 | [Crash reporter](https://github.com/blazium-games/blazium_crash_reporter) | Sidecar UI for engine and Hub crash reports. Engine builds track `blazium_4.8`. | Linux and Windows, x86_64 and x86_32. Catalog: [crash_reporter.json](https://cdn.blazium.app/crash_reporter/crash_reporter.json) |
-| [Toolchain](https://github.com/blazium-games/blazium-toolchain) | PS1, PS2, N64, and Interactive DVD. `ps3` and `ps4` are reserved and do not ship. | Linux and Windows, x86_64 and x86_32. Catalog: [toolchain.json](https://cdn.blazium.app/toolchain/toolchain.json) |
+| [Toolchain](https://github.com/blazium-games/blazium-toolchain) | PS1, PS2, PS3, N64, and Interactive DVD. `ps4` is reserved and does not ship. | Linux and Windows, x86_64 and x86_32. Catalog: [toolchain.json](https://cdn.blazium.app/toolchain/toolchain.json) |
 | [Skills](https://github.com/blazium-games/blazium-skills) | Agent skill packs for Claude, Cursor, Codex, and Grok. Own semver, separate from the 0.8.x API baseline. | Catalog: [skills.json](https://cdn.blazium.app/skills/skills.json) |
 | [Subagents](https://github.com/blazium-games/blazium-subagents) | Studio roster that loads those skills. Own semver. | Catalog: [subagents.json](https://cdn.blazium.app/subagents/subagents.json) |
 | [Blazium Games](https://blazium.games) | Separate store. Upload with chauffeur, not with these tools. | Site [blazium.games](https://blazium.games), docs [docs.blazium.games](https://docs.blazium.games). |
@@ -231,9 +231,26 @@ Set `PCSX2_EXE` (and `PS2_BIOS_DIR` if you have a legal BIOS). `ps2 run` smokes 
 
 `n64 rom --dir TREE` packs a DragonFS tree with `mkdfs` and wraps an ELF with `n64tool`.
 
+## PS3
+
+`ps3 build --sample gdir` needs no PS3 SDK, on Windows, Linux or macOS. The GDIR guest comes compiled with the CLI (`guest/ps3/prebuilt`, built with PSL1GHT), and the CLI itself signs it as an NPDRM SELF (`EBOOT.BIN`) and writes `PARAM.SFO` and the `.pkg`, as PSL1GHT's `make_self_npdrm`, `sfo` and `pkg` do. It takes a PS2 GDIR export (`--pack-dir`, else the folder `--out` is in). The RSX draws the PS2 packs as they are, at the TV's resolution (720p, else 480p/576p), with the HUD in the PS2's 640x448 space at 4:3 in the middle. It writes:
+
+- `--out GAME.pkg`: the installable package, with the game folder `TITLEID/` beside it (`PARAM.SFO`, `ICON0.PNG`, `USRDIR/EBOOT.BIN`, `USRDIR/DATA/`).
+- `--out DIR`: `DIR/TITLEID.pkg` and `DIR/TITLEID/`.
+
+| Flag | Effect |
+|------|--------|
+| `--title NAME` | The name on the XMB; default `--out`'s name |
+| `--title-id BLAZ00001` | Four letters, five digits; also the save folder |
+| `--icon ICON0.PNG` | 320x176 icon; default the export's `ICON0.PNG`, else a Blazium one |
+
+Only a guest with code of your own (`--overlay`, or `GDIR_EXTRA_FLAGS`) is compiled, with ps3dev, which is built for Linux: `ps3 setup --profile compile` fetches ps3toolchain's ps3dev release into `<prefix>/ps3/inst/ps3dev/`, or set `PS3DEV`. After changing `guest/ps3/gdir/runtime`, rebuild the bundled guest with `scripts/ps3-guest-prebuilt.sh` (`go test ./guest/ps3` checks that it matches the sources).
+
+Saves go to `BLAZIUM.SAV` in the game's `USRDIR`. Install the `.pkg` on a PS3 that runs homebrew (HEN or CFW), or in RPCS3 (File > Install Packages, with the PS3 system software installed). `ps3 run` starts `RPCS3_EXE` on the game folder or its `EBOOT.BIN`.
+
 ## Hosts
 
-PS1/PS2/N64 setup, build, run, iso, and rom are Windows and Linux. Other hosts exit `2`. `env`, `status`, and `export-guest` still work. Building the CLI locally on macOS can still master Interactive DVD. Published release binaries are Linux and Windows only.
+PS1/PS2/N64 setup, build, run, iso, and rom are Windows and Linux. PS3 builds anywhere (a custom PS3 guest compiles on Linux only). Other hosts exit `2`. `env`, `status`, and `export-guest` still work. Building the CLI locally on macOS can still master Interactive DVD. Published release binaries are Linux and Windows only.
 
 CI runs `go test ./...`, `go vet ./...`, `ps2 build --out hello.elf`, and `n64 build --out hello.z64` on Ubuntu and Windows.
 
