@@ -53,10 +53,14 @@
 //	blazium-toolchain [--prefix DIR] gamecube build --sample gdir --out GAME.iso|DIR [--pack-dir EXPORT]
 //	  [--title NAME] [--title-id GBZEBZ] [--icon BANNER.PNG] [--overlay DIR]
 //	blazium-toolchain [--prefix DIR] gamecube run [--timeout 120s] GAME.iso
+//	blazium-toolchain [--prefix DIR] wii setup [--profile prebuilt|compile]
+//	blazium-toolchain [--prefix DIR] wii build --sample gdir --out GAME.zip|DIR [--pack-dir EXPORT]
+//	  [--title NAME] [--title-id APPFOLDER] [--icon ICON.PNG] [--overlay DIR]
+//	blazium-toolchain [--prefix DIR] wii run [--timeout 120s] apps/NAME|boot.dol|SD_ROOT
 //
-// ps1, ps2, ps3, gamecube, n64, and interdvd are implemented. Guests are bundled. N64 writes
+// ps1, ps2, ps3, gamecube, wii, n64, and interdvd are implemented. Guests are bundled. N64 writes
 // a big-endian .z64. Cache is <prefix>/<plat>/{inst,src,guest,work}. Settings
 // come from blazium-toolchain.yml. Setup/build/run/iso/rom need Windows or
-// Linux (exit 2 elsewhere); ps3 and gamecube build on any host with their bundled guests. ps4
+// Linux (exit 2 elsewhere); ps3, gamecube and wii build on any host with their bundled guests. ps4
 // is reserved (exit 2).
 package main

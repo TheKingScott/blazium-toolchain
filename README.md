@@ -1,6 +1,6 @@
 # blazium-toolchain
 
-A CLI that fetches console compilers into a cache and builds PS1, PS2, PS3, GameCube, N64, and Interactive DVD products. GPL-3.0-or-later; the MIT Blazium editor only spawns the binary. `ps4` is reserved and exits `2`.
+A CLI that fetches console compilers into a cache and builds PS1, PS2, PS3, GameCube, Wii, N64, and Interactive DVD products. GPL-3.0-or-later; the MIT Blazium editor only spawns the binary. `ps4` is reserved and exits `2`.
 
 ## Blazium Engine
 
@@ -25,7 +25,7 @@ A CLI that fetches console compilers into a cache and builds PS1, PS2, PS3, Game
 | [CLI](https://github.com/blazium-games/blazium-cli) | Install editors, projects, remote control, Steam and itch.io deploy. Not the Games uploader. | Linux and Windows, x86_64 and x86_32. Catalog: [cli.json](https://cdn.blazium.app/cli/cli.json) |
 | [Hub](https://github.com/blazium-games/blazium-hub) | Desktop companion; installers bundle the CLI. Engine builds track `blazium_4.8`. | Linux and Windows, x86_64 and x86_32. |
 | [Crash reporter](https://github.com/blazium-games/blazium_crash_reporter) | Sidecar UI for engine and Hub crash reports. Engine builds track `blazium_4.8`. | Linux and Windows, x86_64 and x86_32. Catalog: [crash_reporter.json](https://cdn.blazium.app/crash_reporter/crash_reporter.json) |
-| [Toolchain](https://github.com/blazium-games/blazium-toolchain) | PS1, PS2, PS3, GameCube, N64, and Interactive DVD. `ps4` is reserved and does not ship. | Linux and Windows, x86_64 and x86_32. Catalog: [toolchain.json](https://cdn.blazium.app/toolchain/toolchain.json) |
+| [Toolchain](https://github.com/blazium-games/blazium-toolchain) | PS1, PS2, PS3, GameCube, Wii, N64, and Interactive DVD. `ps4` is reserved and does not ship. | Linux and Windows, x86_64 and x86_32. Catalog: [toolchain.json](https://cdn.blazium.app/toolchain/toolchain.json) |
 | [Skills](https://github.com/blazium-games/blazium-skills) | Agent skill packs for Claude, Cursor, Codex, and Grok. Own semver, separate from the 0.8.x API baseline. | Catalog: [skills.json](https://cdn.blazium.app/skills/skills.json) |
 | [Subagents](https://github.com/blazium-games/blazium-subagents) | Studio roster that loads those skills. Own semver. | Catalog: [subagents.json](https://cdn.blazium.app/subagents/subagents.json) |
 | [Blazium Games](https://blazium.games) | Separate store. Upload with chauffeur, not with these tools. | Site [blazium.games](https://blazium.games), docs [docs.blazium.games](https://docs.blazium.games). |
@@ -265,9 +265,28 @@ Saves go to the file `BLAZIUM` on the Memory Card in slot A (one block). Pads 1 
 
 Only a guest with code of your own (`--overlay`, or `GDIR_EXTRA_FLAGS`) is compiled, with devkitPPC and libogc (devkitPro's `gamecube-dev`; set `DEVKITPRO`). After changing `guest/gamecube`, rebuild the bundled guest with `scripts/gamecube-guest-prebuilt.sh` (`go test ./guest/gamecube` checks that it matches the sources).
 
+## Wii
+
+`wii build --sample gdir` needs no Wii SDK, on Windows, Linux or macOS. The GDIR guest comes compiled with the CLI (`guest/wii/prebuilt/boot.dol`, built with devkitPPC, libogc and libfat), and the CLI writes the Homebrew Channel app itself. It takes a PS2 GDIR export (`--pack-dir`, else the folder `--out` is in); the cooked files go into the app's `DATA/` folder as they are. The GX draws the PS2 packs at 640x480; with the Wii set to 16:9 the 3D fills the wide picture and the HUD keeps the PS2's 640x448 layout at 4:3 in the middle. It writes:
+
+- `--out GAME.zip`: the app zipped as `apps/NAME/` (unzip it onto the SD card's root), with the same folder `apps/NAME/` and `GAME.THIRD-PARTY-NOTICES.txt` beside it.
+- `--out DIR`: `DIR/apps/NAME/` and `DIR/NAME.zip`.
+
+The app folder holds `boot.dol`, `meta.xml` (the name and text the Homebrew Channel shows), `icon.png`, `THIRD-PARTY-NOTICES.txt` and `DATA/`. The CLI writes the folder's name into `boot.dol` too, so the game finds its data when started without arguments (Dolphin, some loaders); the Homebrew Channel passes the path itself.
+
+| Flag | Effect |
+|------|--------|
+| `--title NAME` | The name in the Homebrew Channel; default `--out`'s name |
+| `--title-id APPFOLDER` | The app's folder, `apps/APPFOLDER` (lower-case letters, digits, `-`, `_`); default from `--out`'s name |
+| `--icon ICON.PNG` | The channel's icon, scaled and cropped to 128x48; default the export's `ICON.PNG`, else a plain one |
+
+Each player is a Wii Remote (on its own held sideways, or with a Nunchuk or a Classic Controller) or the GameCube controller in the same port: cross is 2 / A / a / A, circle 1 / B / b / B, square A / C / y / X, R1 B / Z / R or ZR / R, start +, select - (GameCube Z); the Nunchuk's, Classic's and GameCube's sticks steer and, pushed well over, work the menus. HOME (or the console's RESET) returns to the Homebrew Channel, POWER turns the Wii off. Saves go to `BLAZIUM.SAV` in the app folder; a build over the folder keeps it, and the `.zip` never holds one. `wii run` starts `DOLPHIN_EXE` with the folder holding `apps/` as its virtual SD card.
+
+Only a guest with code of your own (`--overlay`, or `GDIR_EXTRA_FLAGS`) is compiled, with devkitPPC, libogc and libfat (devkitPro's `wii-dev`; set `DEVKITPRO`). After changing `guest/wii`, rebuild the bundled guest with `scripts/wii-guest-prebuilt.sh` (`go test ./guest/wii` checks that it matches the sources).
+
 ## Hosts
 
-PS1/PS2/N64 setup, build, run, iso, and rom are Windows and Linux. PS3 and GameCube build anywhere (a custom PS3 guest compiles on Linux only). Other hosts exit `2`. `env`, `status`, and `export-guest` still work. Building the CLI locally on macOS can still master Interactive DVD. Published release binaries are Linux and Windows only.
+PS1/PS2/N64 setup, build, run, iso, and rom are Windows and Linux. PS3, GameCube and Wii build anywhere (a custom PS3 guest compiles on Linux only). Other hosts exit `2`. `env`, `status`, and `export-guest` still work. Building the CLI locally on macOS can still master Interactive DVD. Published release binaries are Linux and Windows only.
 
 CI runs `go test ./...`, `go vet ./...`, `ps2 build --out hello.elf`, and `n64 build --out hello.z64` on Ubuntu and Windows.
 

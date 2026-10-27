@@ -27,8 +27,9 @@ Each tree keeps its upstream license. This CLI spawns compilers, packers, and em
 | make_self_npdrm, sfo, pkg (PSL1GHT tools/geohot, tools/sfo_pkg) | GPLv3 / MIT | ported into `internal/platforms/ps3` (self.go, pkg.go) | Sign EBOOT.BIN, write PARAM.SFO and the .pkg |
 | RPCS3 | GPLv2 | user `RPCS3_EXE` | Spawned by `ps3 run`; PS3 system software never fetched |
 | libogc (libraries, start-up code) and newlib | zlib-style (parts BSD-style); BSD-style | `guest/gamecube/prebuilt/gdir.dol` (compiled in) | Linked into the GameCube guest only; notices written beside each `.iso` |
-| devkitPPC (PowerPC GCC), elf2dol | GPLv3 / GPLv2 | user `DEVKITPRO` / `DEVKITPPC` | Spawned only to compile a GameCube guest with `--overlay` |
-| Dolphin | GPLv2+ | user `DOLPHIN_EXE` | Spawned by `gamecube run`; no IPL dump needed or fetched |
+| devkitPPC (PowerPC GCC), elf2dol | GPLv3 / GPLv2 | user `DEVKITPRO` / `DEVKITPPC` | Spawned only to compile a GameCube or Wii guest with `--overlay` |
+| Dolphin | GPLv2+ | user `DOLPHIN_EXE` | Spawned by `gamecube run` and `wii run`; no IPL dump or Wii system files needed or fetched |
+| libogc for the Wii (libraries, start-up code, Bluetooth stack), wiiuse, libfat and newlib | zlib-style; GPLv3 with a linking exception (wiiuse); BSD (libfat); BSD-style | `guest/wii/prebuilt/boot.dol` (compiled in) | Linked into the Wii guest only; notices written beside each `.zip` and in the app folder |
 
 Do not copy these trees into `blazium/` or link them into the editor.
 
