@@ -17,7 +17,7 @@ import (
 	"strings"
 )
 
-//go:embed gdir apploader
+//go:embed gdir apploader libogc
 var gdirFiles embed.FS
 
 // GDIRShared are the GameCube GDIR guest files kept byte-identical to
@@ -133,12 +133,12 @@ func PrebuiltVersion() string {
 	return strings.TrimSpace(string(raw))
 }
 
-// SourcesHash identifies the guest's sources (gdir/runtime and apploader,
-// line endings aside): the first 16 hex digits of a SHA-256 over each
+// SourcesHash identifies the guest's sources (gdir/runtime, apploader and
+// the libogc patch the prebuilt links, line endings aside): the first 16 hex digits of a SHA-256 over each
 // file's path and bytes.
 func SourcesHash() (string, error) {
 	var names []string
-	for _, root := range []string{"gdir/runtime", "apploader"} {
+	for _, root := range []string{"gdir/runtime", "apploader", "libogc"} {
 		err := fs.WalkDir(gdirFiles, root, func(path string, d fs.DirEntry, err error) error {
 			if err == nil && !d.IsDir() {
 				names = append(names, path)

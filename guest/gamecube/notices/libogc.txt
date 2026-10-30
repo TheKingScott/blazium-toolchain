@@ -1,5 +1,9 @@
 libogc (the GameCube libraries and start-up code the guest links; https://github.com/devkitPro/libogc)
 
+  The bundled guest links libogc v3.2.1 altered by blazium-toolchain's
+  guest/gamecube/libogc/wii-mode.patch (the hardware addresses of a Wii in
+  Wii mode, for Nintendont); this is not the original libogc.
+
   libogc copyright (C) 2004 - 2025
     Michael Wiedenbauer (shagkur)
     Dave Murphy (WinterMute)
