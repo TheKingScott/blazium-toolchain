@@ -116,6 +116,9 @@ func (t *Tool) discover() map[string]string {
 
 // libogc is where the libogc headers and cube libraries are.
 func libogc(env map[string]string) string {
+	if v := os.Getenv("LIBOGC"); v != "" {
+		return v // e.g. a libogc built with guest/gamecube/libogc/wii-mode.patch
+	}
 	if env["DEVKITPRO"] != "" {
 		return filepath.Join(env["DEVKITPRO"], "libogc")
 	}

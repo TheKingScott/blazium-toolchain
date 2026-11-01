@@ -263,7 +263,9 @@ Saves go to `BLAZIUM.SAV` in the game's `USRDIR`. Install the `.pkg` on a PS3 th
 
 Saves go to the file `BLAZIUM` on the Memory Card in slot A (one block). Pads 1 to 4 are GameCube controllers: A cross, B circle, X square, Y triangle, L/R L1/R1 (and the analogue triggers), Z select, Start start; the control stick steers and, pushed well over, also works the d-pad in menus (Dolphin puts the arrow keys on it). Play the `.iso` in Dolphin, or on a console with Swiss or another disc loader. `gamecube run` starts `DOLPHIN_EXE` on it.
 
-Only a guest with code of your own (`--overlay`, or `GDIR_EXTRA_FLAGS`) is compiled, with devkitPPC and libogc (devkitPro's `gamecube-dev`; set `DEVKITPRO`). After changing `guest/gamecube`, rebuild the bundled guest with `scripts/gamecube-guest-prebuilt.sh` (`go test ./guest/gamecube` checks that it matches the sources).
+On a Wii the `.iso` runs under Nintendont. The guest reads the disc through the drive's registers in a form Nintendont redirects to its own disc emulation, and the bundled guest's libogc (v3.2.1 with `guest/gamecube/libogc/wii-mode.patch`) finds the Wii by its bus clock and drives the controller ports, the Memory Card slots and the audio interface at their Wii addresses. So under Nintendont the game takes GameCube controllers in the Wii's GameCube ports (not Nintendont's Wii Remote, Classic Controller or USB pad emulation) and saves to a real Memory Card in slot A (not Nintendont's emulated card). A Wii U (vWii) or Wii mini has neither, so it is not supported there.
+
+Only a guest with code of your own (`--overlay`, or `GDIR_EXTRA_FLAGS`) is compiled, with devkitPPC and libogc (devkitPro's `gamecube-dev`; set `DEVKITPRO`); devkitPro's libogc runs on a GameCube and in Dolphin, but not on a Wii under Nintendont (point `LIBOGC` at a libogc built with the Wii-mode patch for that). After changing `guest/gamecube`, rebuild the bundled guest with `scripts/gamecube-guest-prebuilt.sh`, which builds the patched libogc (from `LIBOGC_SRC`, a libogc checkout, or a clone of its `v3.2.1` tag) with catnip (`go test ./guest/gamecube` checks that the prebuilt matches the sources).
 
 ## Wii
 

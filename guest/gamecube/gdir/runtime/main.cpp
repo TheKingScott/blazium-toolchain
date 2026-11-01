@@ -30,9 +30,26 @@ static uint32_t ru32(const unsigned char *p)
 	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
+/* The DOL's first 0x100 bytes (0x80003100 to 0x80003200) are left empty,
+ * crt0 starting after them: on a Wii, IOS keeps its own values in that
+ * part of low memory, and under Nintendont the word at 0x800031a0 is not
+ * the game's (Nintendont moves what a Nintendo game has there aside, which
+ * only helps code that runs through it, not a function starting there,
+ * as libgcc's __init did). The section sorts with crt0's (.crt0.*), and
+ * this file links before libogc's; "R" keeps --gc-sections off it. */
+__asm__(".section .crt0.blazium_lowmem,\"axR\",@progbits\n\t.space 0x100\n\t.previous");
+
+/* The time base runs at a quarter of the bus clock: 162 MHz on a GameCube,
+ * 243 MHz on a Wii (Nintendont runs GameCube games in the Wii's mode). The
+ * loader leaves the bus clock at 0x800000f8; libogc assumes the GameCube's. */
 static uint64_t us_now(void)
 {
-	return ticks_to_microsecs(gettime());
+	unsigned bus = *(volatile unsigned *)0x800000f8;
+	if (bus < 100000000u || bus > 400000000u) {
+		bus = 162000000u;
+	}
+	const uint64_t t = gettime(), q = bus / 4;
+	return t / q * 1000000ull + t % q * 1000000ull / q;
 }
 
 /* A whole file from the disc's DATA folder. */

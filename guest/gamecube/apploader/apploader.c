@@ -12,9 +12,12 @@
 typedef unsigned int u32;
 typedef void (*report_fn)(const char *, ...);
 
-/* scratch for the headers, above where the apploader lives */
-#define HDR ((volatile unsigned char *)0x81300000)
-#define DOL ((volatile unsigned char *)0x81300800)
+/* scratch for the headers, in the apploader's own megabyte (0x81200000 to
+ * 0x81300000): Nintendont, which plays the disc on a Wii, runs its loader
+ * (multidol, the one calling these functions) at 0x81300000, and a header
+ * read there wrote over it (a black screen) */
+#define HDR ((volatile unsigned char *)0x81280000)
+#define DOL ((volatile unsigned char *)0x81280800)
 
 static report_fn s_report = 0;
 static u32 s_state = 0;

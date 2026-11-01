@@ -1,0 +1,138 @@
+diff --git a/gc/tuxedo/mm.h b/gc/tuxedo/mm.h
+index a5a3e5e..74a0117 100644
+--- a/gc/tuxedo/mm.h
++++ b/gc/tuxedo/mm.h
+@@ -23,7 +23,11 @@
+ #define MM_P_MEM2   0x10000000
+ #define MM_MEM2_SZ  0x04000000
+ #else
+-#define MM_P_IO_PPC 0x0c000000
++/* A GameCube program can find itself on a Wii in Wii mode (Nintendont runs
++ * GameCube games so): there DI, SI, EXI and AI answer at 0x0d006000, not at
++ * 0x0c006000. The loader leaves the bus clock at 0x800000f8: 243 MHz on a
++ * Wii, 162 MHz on a GameCube (and in Dolphin). */
++#define MM_P_IO_PPC (*(volatile unsigned int *)0x800000f8 == 243000000u ? 0x0d000000u : 0x0c000000u)
+ #endif
+ 
+ #define MM_V_CACHED   0x80000000
+diff --git a/libogc/audio.c b/libogc/audio.c
+index 2e95074..c41369d 100644
+--- a/libogc/audio.c
++++ b/libogc/audio.c
+@@ -67,7 +67,8 @@ distribution.
+ #define AI_DMAFR			0x40
+ 
+ #if defined(HW_DOL)
+-	static vu32* const _aiReg = (u32*)0xCC006C00;
++	#include <tuxedo/mm.h>
++	#define _aiReg HWREG_AI
+ #elif defined(HW_RVL)
+ 	static vu32* const _aiReg = (u32*)0xCD006C00;
+ #else
+diff --git a/libogc/card.c b/libogc/card.c
+index 7608f1d..32a18e2 100644
+--- a/libogc/card.c
++++ b/libogc/card.c
+@@ -124,9 +124,11 @@ typedef struct _card_block {
+ 	cardcallback card_unlock_cb;
+ } card_block;
+ 
+-#if defined(HW_RVL)
++#if defined(HW_RVL) || defined(HW_DOL)
+ 
+-static u32 _cardunlockdata[0x160] ATTRIBUTE_ALIGN(32) =
++/* the Wii's: also on a GameCube program the Wii runs in its mode
++ * (Nintendont), where the DSP's accelerator reaches MEM2, not ARAM */
++static u32 _cardunlockdata_rvl[0x160] ATTRIBUTE_ALIGN(32) =
+ {
+ 	0x00000000,0x00000000,0x00000000,0x00000000,
+ 	0x00000000,0x00000000,0x00000021,0x02ff0021,
+@@ -152,9 +154,10 @@ static u32 _cardunlockdata[0x160] ATTRIBUTE_ALIGN(32) =
+ 	0x00000000,0x00000000,0x00000000,0x00000000
+ };
+ 
+-#elif defined(HW_DOL)
++#endif
++#if defined(HW_DOL)
+ 
+-static u32 _cardunlockdata[0x160] ATTRIBUTE_ALIGN(32) =
++static u32 _cardunlockdata_dol[0x160] ATTRIBUTE_ALIGN(32) =
+ {
+ 	0x00000000,0x00000000,0x00000000,0x00000000,
+ 	0x00000000,0x00000000,0x00000021,0x02ff0021,
+@@ -181,6 +184,17 @@ static u32 _cardunlockdata[0x160] ATTRIBUTE_ALIGN(32) =
+ };
+ #endif
+ 
++#if defined(HW_RVL)
++#define _cardunlockdata _cardunlockdata_rvl
++#define CARD_UNLOCK_MEM_BASE 0x10000000 // MEM2
++#else
++#include <tuxedo/mm.h>
++/* a Wii (Nintendont) by its bus clock, as MM_P_IO_PPC */
++#define CARD_ON_WII (*(volatile unsigned int *)0x800000f8 == 243000000u)
++#define _cardunlockdata (CARD_ON_WII ? _cardunlockdata_rvl : _cardunlockdata_dol)
++#define CARD_UNLOCK_MEM_BASE (CARD_ON_WII ? 0x10000000 : 0) // MEM2, or ARAM
++#endif
++
+ static u32 card_sector_size[] = 
+ {
+ 	0x0002000,
+@@ -2391,11 +2405,7 @@ static s32 __dounlock(s32 chn,u32 *key)
+ 	cipher1[1] = e;
+ 	workarea[0] = (u32)cipher1;
+ 	workarea[1] = 8;
+-#if defined(HW_RVL)
+-	workarea[2] = 0x10000000; // use MEM2 base
+-#else
+-	workarea[2] = 0; // use ARAM base
+-#endif
++	workarea[2] = CARD_UNLOCK_MEM_BASE;
+ 	workarea[3] = (u32)cipher2;
+ 	DCFlushRange(cipher1,8);
+ 	DCInvalidateRange(cipher2,4);
+diff --git a/libogc/dvd.c b/libogc/dvd.c
+index 7a92d6c..f6e77ab 100644
+--- a/libogc/dvd.c
++++ b/libogc/dvd.c
+@@ -345,7 +345,8 @@ static vu32* const _piReg = (u32*)0xCC003000;
+ #if defined(HW_RVL)
+ 	static vu32* const _diReg = (u32*)0xCD006000;
+ #elif defined(HW_DOL)
+-	static vu32* const _diReg = (u32*)0xCC006000;
++	#include <tuxedo/mm.h>
++	#define _diReg HWREG_DI
+ #endif
+ 
+ static const u8 __dvd_unlockcmd$221[12] = {0xff,0x01,'M','A','T','S','H','I','T','A',0x02,0x00};
+diff --git a/libogc/si.c b/libogc/si.c
+index 48c557d..601af4d 100644
+--- a/libogc/si.c
++++ b/libogc/si.c
+@@ -109,7 +109,8 @@ static SICallback typeCallback[4][4] = {{NULL,NULL,NULL,NULL},
+ static syswd_t si_alarm[4];
+ 
+ #if defined(HW_DOL)
+-	static vu32* const _siReg = (u32*)0xCC006400;
++	#include <tuxedo/mm.h>
++	#define _siReg HWREG_SI
+ #elif defined(HW_RVL)
+ 	static vu32* const _siReg = (u32*)0xCD006400;
+ #else
+diff --git a/libogc/sys_report.c b/libogc/sys_report.c
+index 2b17590..4a85245 100644
+--- a/libogc/sys_report.c
++++ b/libogc/sys_report.c
+@@ -63,7 +63,11 @@ static ssize_t __uart_stdio_write(struct _reent *r, void *fd, const char *ptr, s
+ 	// on retail consoles, there is no UART and the address shared with rtc so... no.
+ 	// Dolphin reports as devkit, so it keeps working there
+ #ifdef __gamecube__
+-	if (((*(vu32 *)0xCC006024) & 0xFF) == 0xFF)
++	/* on a Wii (Nintendont), the Wii's rule: only a devkit has the UART */
++	if (*(vu32 *)0x800000f8 == 243000000u) {
++		if (((*(vu32 *)0xCD006024) & 0xFF) != 0x01)
++			return len;
++	} else if (((*(vu32 *)0xCC006024) & 0xFF) == 0xFF)
+ 		return len;
+ #elif defined(__wii__)
+ 	if (((*(vu32 *)0xCD006024) & 0xFF) != 0x01)

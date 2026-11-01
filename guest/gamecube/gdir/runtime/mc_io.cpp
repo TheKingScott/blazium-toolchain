@@ -11,6 +11,7 @@
 #include <malloc.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 #define MC_SLOTS 4
 #define MC_BYTES 512
@@ -24,6 +25,12 @@ static u32 s_sector = 8192;
 
 static int mount(void)
 {
+	/* libogc counts a card as there only 300 ms after it first sees it
+	 * (CARD_ERROR_BUSY until then), and the game starts sooner than that
+	 * after the boot: wait that out (a second at most) */
+	for (int i = 0; i < 100 && CARD_ProbeEx(CARD_SLOTA, NULL, NULL) == CARD_ERROR_BUSY; i++) {
+		usleep(10000);
+	}
 	s32 r = CARD_Mount(CARD_SLOTA, s_work, NULL);
 	if (r < 0 && r != CARD_ERROR_BROKEN) {
 		return 0;

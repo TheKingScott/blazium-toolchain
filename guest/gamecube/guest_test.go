@@ -75,3 +75,53 @@ func TestPrebuiltCurrent(t *testing.T) {
 		t.Fatalf("apploader size %d, image %d", n, len(app))
 	}
 }
+
+// Under Nintendont (a Wii) the disc is emulated: Nintendont points code that
+// reaches the drive as "lis rX,0xCC00" then "addi rY,rX,0x6000" at its own
+// disc interface. The prebuilt guest must read the disc that way (libogc's
+// DVD driver resets the real drive, and hangs there).
+func TestPrebuiltDiscNintendont(t *testing.T) {
+	dol, err := PrebuiltDOL()
+	if err != nil {
+		t.Fatal(err)
+	}
+	be := binary.BigEndian
+	found := false
+	for s := 0; s < 7 && !found; s++ { // the text sections
+		off, size := be.Uint32(dol[s*4:]), be.Uint32(dol[0x90+s*4:])
+		code := dol[off : off+size]
+		for i := 0; i+8 <= len(code); i += 4 {
+			op := be.Uint32(code[i:])
+			if op&0xFC1FFFFF != 0x3C00CC00 {
+				continue
+			}
+			rx := op >> 21 & 31
+			next := be.Uint32(code[i+4:])
+			if next&0xFC00FFFF == 0x38006000 && next>>16&31 == rx {
+				found = true
+				break
+			}
+		}
+	}
+	if !found {
+		t.Error("gdir.dol has no disc read Nintendont can redirect (lis 0xCC00; addi 0x6000)")
+	}
+}
+
+// Under Nintendont the word at 0x800031a0 is not the game's (IOS keeps
+// values in that part of low memory), so the DOL leaves 0x80003100 to
+// 0x80003200 empty and starts after it.
+func TestPrebuiltLowMemoryGap(t *testing.T) {
+	dol, err := PrebuiltDOL()
+	if err != nil {
+		t.Fatal(err)
+	}
+	be := binary.BigEndian
+	off, addr := be.Uint32(dol[0:]), be.Uint32(dol[0x48:])
+	if addr != 0x80003100 || !bytes.Equal(dol[off:off+0x100], make([]byte, 0x100)) {
+		t.Errorf("text 0 at %#x does not start with 0x100 empty bytes", addr)
+	}
+	if entry := be.Uint32(dol[0xe0:]); entry < 0x80003200 {
+		t.Errorf("entry point %#x is in the gap", entry)
+	}
+}
