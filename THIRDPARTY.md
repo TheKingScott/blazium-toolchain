@@ -30,6 +30,10 @@ Each tree keeps its upstream license. This CLI spawns compilers, packers, and em
 | devkitPPC (PowerPC GCC), elf2dol | GPLv3 / GPLv2 | user `DEVKITPRO` / `DEVKITPPC` | Spawned only to compile a GameCube or Wii guest with `--overlay` |
 | Dolphin | GPLv2+ | user `DOLPHIN_EXE` | Spawned by `gamecube run` and `wii run`; no IPL dump or Wii system files needed or fetched |
 | libogc for the Wii (libraries, start-up code, Bluetooth stack), wiiuse, libfat and newlib | zlib-style; GPLv3 with a linking exception (wiiuse); BSD (libfat); BSD-style | `guest/wii/prebuilt/boot.dol` (compiled in) | Linked into the Wii guest only; notices written beside each `.zip` and in the app folder |
+| PSPSDK (libraries, start-up code, libgu) and newlib | BSD; BSD-style | `guest/psp/prebuilt/gdir.prx` (compiled in) | Linked into the PSP guest only; notices written beside each `.zip` and in the game folder |
+| pspdev (Allegrex GCC, PSPSDK tools) | GPLv3 / BSD | user `PSPDEV` | Spawned only to compile a PSP guest with `--overlay` |
+| mksfo, pack-pbp (PSPSDK tools) | BSD | ported into `internal/platforms/psp` (pbp.go) | Write PARAM.SFO and EBOOT.PBP |
+| PPSSPP | GPLv2+ | user `PPSSPP_EXE` | Spawned by `psp run`; no PSP firmware needed or fetched |
 
 Do not copy these trees into `blazium/` or link them into the editor.
 

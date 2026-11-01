@@ -1,6 +1,6 @@
 # blazium-toolchain
 
-A CLI that fetches console compilers into a cache and builds PS1, PS2, PS3, GameCube, Wii, N64, and Interactive DVD products. GPL-3.0-or-later; the MIT Blazium editor only spawns the binary. `ps4` is reserved and exits `2`.
+A CLI that fetches console compilers into a cache and builds PS1, PS2, PS3, PSP, GameCube, Wii, N64, and Interactive DVD products. GPL-3.0-or-later; the MIT Blazium editor only spawns the binary. `ps4` is reserved and exits `2`.
 
 ## Blazium Engine
 
@@ -25,7 +25,7 @@ A CLI that fetches console compilers into a cache and builds PS1, PS2, PS3, Game
 | [CLI](https://github.com/blazium-games/blazium-cli) | Install editors, projects, remote control, Steam and itch.io deploy. Not the Games uploader. | Linux and Windows, x86_64 and x86_32. Catalog: [cli.json](https://cdn.blazium.app/cli/cli.json) |
 | [Hub](https://github.com/blazium-games/blazium-hub) | Desktop companion; installers bundle the CLI. Engine builds track `blazium_4.8`. | Linux and Windows, x86_64 and x86_32. |
 | [Crash reporter](https://github.com/blazium-games/blazium_crash_reporter) | Sidecar UI for engine and Hub crash reports. Engine builds track `blazium_4.8`. | Linux and Windows, x86_64 and x86_32. Catalog: [crash_reporter.json](https://cdn.blazium.app/crash_reporter/crash_reporter.json) |
-| [Toolchain](https://github.com/blazium-games/blazium-toolchain) | PS1, PS2, PS3, GameCube, Wii, N64, and Interactive DVD. `ps4` is reserved and does not ship. | Linux and Windows, x86_64 and x86_32. Catalog: [toolchain.json](https://cdn.blazium.app/toolchain/toolchain.json) |
+| [Toolchain](https://github.com/blazium-games/blazium-toolchain) | PS1, PS2, PS3, PSP, GameCube, Wii, N64, and Interactive DVD. `ps4` is reserved and does not ship. | Linux and Windows, x86_64 and x86_32. Catalog: [toolchain.json](https://cdn.blazium.app/toolchain/toolchain.json) |
 | [Skills](https://github.com/blazium-games/blazium-skills) | Agent skill packs for Claude, Cursor, Codex, and Grok. Own semver, separate from the 0.8.x API baseline. | Catalog: [skills.json](https://cdn.blazium.app/skills/skills.json) |
 | [Subagents](https://github.com/blazium-games/blazium-subagents) | Studio roster that loads those skills. Own semver. | Catalog: [subagents.json](https://cdn.blazium.app/subagents/subagents.json) |
 | [Blazium Games](https://blazium.games) | Separate store. Upload with chauffeur, not with these tools. | Site [blazium.games](https://blazium.games), docs [docs.blazium.games](https://docs.blazium.games). |
@@ -286,9 +286,28 @@ Each player is a Wii Remote (on its own held sideways, or with a Nunchuk or a Cl
 
 Only a guest with code of your own (`--overlay`, or `GDIR_EXTRA_FLAGS`) is compiled, with devkitPPC, libogc and libfat (devkitPro's `wii-dev`; set `DEVKITPRO`). After changing `guest/wii`, rebuild the bundled guest with `scripts/wii-guest-prebuilt.sh` (`go test ./guest/wii` checks that it matches the sources).
 
+## PSP
+
+`psp build --sample gdir` needs no PSP SDK, on Windows, Linux or macOS. The GDIR guest comes compiled with the CLI (`guest/psp/prebuilt/gdir.prx`, a user-mode PRX built with pspdev and PSPSDK), and the CLI writes `PARAM.SFO` and `EBOOT.PBP` itself, as PSPSDK's `mksfo` and `pack-pbp` do. It takes a PS2 GDIR export (`--pack-dir`, else the folder `--out` is in); the cooked files go into the game's `DATA/` folder as they are. The GE draws the PS2 packs at 480x272: the CPU transforms and clips the triangles (as the PS2's EE does), the GE textures them straight from the PS2's indexed textures and CLUTs, with fog and a 16-bit depth buffer; the 3D fills the 16:9 screen and the HUD keeps the PS2's 640x448 layout at 4:3 in the middle, its text drawn in whole screen pixels. It writes:
+
+- `--out GAME.zip`: the game zipped as `PSP/GAME/NAME/` (unzip it onto the Memory Stick's root), with the same folder `PSP/GAME/NAME/` and `GAME.THIRD-PARTY-NOTICES.txt` beside it.
+- `--out DIR`: `DIR/PSP/GAME/NAME/` and `DIR/NAME.zip`.
+
+The game folder holds `EBOOT.PBP` (`PARAM.SFO`, `ICON0.PNG` and the PRX), `THIRD-PARTY-NOTICES.txt` and `DATA/`. The CLI writes the folder's name into the PRX too, so the game finds its data however it was started.
+
+| Flag | Effect |
+|------|--------|
+| `--title NAME` | The name on the XMB; default `--out`'s name |
+| `--title-id GAMEFOLDER` | The game's folder, `PSP/GAME/GAMEFOLDER` (upper-case letters, digits, `-`, `_`); default from `--out`'s name |
+| `--icon ICON0.PNG` | The XMB icon, scaled and cropped to 144x80; default the export's `ICON0.PNG`, else a plain one |
+
+The PSP's buttons are the DualShock 2's (L and R are L1 and R1, the analog nub the left stick, which also works the menus pushed well over). Saves go to `BLAZIUM.SAV` in the game folder; a build over the folder keeps it, and the `.zip` never holds one. HOME > Exit Game ends the game. `PARAM.SFO` asks for the PSP-2000's larger memory (MEMSIZE). Run it on a PSP with custom firmware, or in PPSSPP; `psp run` starts `PPSSPP_EXE` on the `EBOOT.PBP`.
+
+Only a guest with code of your own (`--overlay`, or `GDIR_EXTRA_FLAGS`) is compiled, with pspdev (set `PSPDEV`). After changing `guest/psp`, rebuild the bundled guest with `scripts/psp-guest-prebuilt.sh` (`go test ./guest/psp` checks that it matches the sources).
+
 ## Hosts
 
-PS1/PS2/N64 setup, build, run, iso, and rom are Windows and Linux. PS3, GameCube and Wii build anywhere (a custom PS3 guest compiles on Linux only). Other hosts exit `2`. `env`, `status`, and `export-guest` still work. Building the CLI locally on macOS can still master Interactive DVD. Published release binaries are Linux and Windows only.
+PS1/PS2/N64 setup, build, run, iso, and rom are Windows and Linux. PS3, PSP, GameCube and Wii build anywhere (a custom PS3 guest compiles on Linux only). Other hosts exit `2`. `env`, `status`, and `export-guest` still work. Building the CLI locally on macOS can still master Interactive DVD. Published release binaries are Linux and Windows only.
 
 CI runs `go test ./...`, `go vet ./...`, `ps2 build --out hello.elf`, and `n64 build --out hello.z64` on Ubuntu and Windows.
 

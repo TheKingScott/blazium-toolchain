@@ -57,10 +57,14 @@
 //	blazium-toolchain [--prefix DIR] wii build --sample gdir --out GAME.zip|DIR [--pack-dir EXPORT]
 //	  [--title NAME] [--title-id APPFOLDER] [--icon ICON.PNG] [--overlay DIR]
 //	blazium-toolchain [--prefix DIR] wii run [--timeout 120s] apps/NAME|boot.dol|SD_ROOT
+//	blazium-toolchain [--prefix DIR] psp setup [--profile prebuilt|compile]
+//	blazium-toolchain [--prefix DIR] psp build --sample gdir --out GAME.zip|DIR [--pack-dir EXPORT]
+//	  [--title NAME] [--title-id GAMEFOLDER] [--icon ICON0.PNG] [--overlay DIR]
+//	blazium-toolchain [--prefix DIR] psp run [--timeout 120s] PSP/GAME/NAME|EBOOT.PBP
 //
-// ps1, ps2, ps3, gamecube, wii, n64, and interdvd are implemented. Guests are bundled. N64 writes
+// ps1, ps2, ps3, gamecube, wii, psp, n64, and interdvd are implemented. Guests are bundled. N64 writes
 // a big-endian .z64. Cache is <prefix>/<plat>/{inst,src,guest,work}. Settings
 // come from blazium-toolchain.yml. Setup/build/run/iso/rom need Windows or
-// Linux (exit 2 elsewhere); ps3, gamecube and wii build on any host with their bundled guests. ps4
+// Linux (exit 2 elsewhere); ps3, gamecube, wii and psp build on any host with their bundled guests. ps4
 // is reserved (exit 2).
 package main
