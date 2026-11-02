@@ -30,6 +30,7 @@ import (
 	pspplat "github.com/blazium-games/blazium-toolchain/internal/platforms/psp"
 	"github.com/blazium-games/blazium-toolchain/internal/platforms/steam"
 	wiiplat "github.com/blazium-games/blazium-toolchain/internal/platforms/wii"
+	wiiuplat "github.com/blazium-games/blazium-toolchain/internal/platforms/wiiu"
 	"github.com/blazium-games/blazium-toolchain/internal/report"
 	"github.com/blazium-games/blazium-toolchain/internal/settings"
 )
@@ -60,6 +61,7 @@ func init() {
 	platforms.Register(wiiplat.New())
 	platforms.Register(pspplat.New())
 	platforms.Register(switchplat.New())
+	platforms.Register(wiiuplat.New())
 	platforms.Register(interdvd.New())
 	platforms.Register(steam.New())
 	future.Register()
@@ -152,7 +154,7 @@ func cmdList(jsonOut bool, w io.Writer) int {
 	for _, info := range list {
 		note := ""
 		switch info.ID {
-		case "ps1", "ps2", "n64", "nds", "dsi", "ps3", "gamecube", "wii", "psp", "switch":
+		case "ps1", "ps2", "n64", "nds", "dsi", "ps3", "gamecube", "wii", "psp", "switch", "wiiu":
 			if ps2.HostSupported() {
 				note = "  Windows/Linux; guest bundled in this CLI"
 			} else {
@@ -308,9 +310,9 @@ func runBuild(ctx context.Context, p platforms.Platform, args []string, base pla
 	display := fs.String("display", settings.Current().N64.Display, "N64 framebuffer: 320 or 640")
 	rumble := fs.Bool("rumble", settings.Current().N64.Rumble, "N64 Rumble Pak (P8 optional)")
 	rdram := fs.String("rdram", settings.Current().N64.Rdram, "N64 RDRAM: 8 or 4")
-	title := fs.String("title", "", "ps3/gamecube/wii/psp/switch: the game's name on the XMB, the disc, the Homebrew Channel or the Homebrew Menu (default: --out's name)")
-	titleID := fs.String("title-id", "", "ps3: title ID, four letters and five digits (default BLAZ00001); gamecube: game ID, six letters or digits (default GBZEBZ); wii: the app folder name; psp: the PSP/GAME folder name; switch: the switch/ folder name, lower case (default from --out)")
-	icon := fs.String("icon", "", "ps3: ICON0.PNG (320x176) for the XMB; gamecube: the banner picture (96x32 PNG); wii: icon.png (128x48); psp: ICON0.PNG (144x80); switch: the Homebrew Menu icon (256x256)")
+	title := fs.String("title", "", "ps3/gamecube/wii/psp/switch/wiiu: the game's name on the XMB, the disc, the Homebrew Channel or the Homebrew Menu or the Wii U Menu (default: --out's name)")
+	titleID := fs.String("title-id", "", "ps3: title ID, four letters and five digits (default BLAZ00001); gamecube: game ID, six letters or digits (default GBZEBZ); wii: the app folder name; psp: the PSP/GAME folder name; switch: the switch/ folder name, lower case; wiiu: the wiiu/apps folder name, lower case (default from --out)")
+	icon := fs.String("icon", "", "ps3: ICON0.PNG (320x176) for the XMB; gamecube: the banner picture (96x32 PNG); wii: icon.png (128x48); psp: ICON0.PNG (144x80); switch: the Homebrew Menu icon (256x256); wiiu: the icon (128x128) and boot pictures")
 	if err := fs.Parse(args); err != nil {
 		return report.Usage(err.Error())
 	}
@@ -661,6 +663,7 @@ Platforms:
   wii       supported (Nintendo Wii homebrew; any host, no SDK; guest bundled; product Homebrew Channel app + .zip)
   psp       supported (PlayStation Portable homebrew; any host, no SDK; guest bundled; product PSP/GAME/NAME/EBOOT.PBP + .zip)
   switch    supported (Nintendo Switch homebrew; any host, no SDK; guest bundled; product switch/NAME/NAME.nro + .zip)
+  wiiu      supported (Nintendo Wii U homebrew; any host, no SDK; guest bundled; product wiiu/apps/NAME/NAME.wuhb + .zip)
   ps4       planned
 
 PS1/PS2/N64 host tools: Windows and Linux only. setup/build/run/iso/rom exit 2 on other OSes.
@@ -748,6 +751,13 @@ Switch commands:
   status
   build --sample gdir --out GAME.zip|DIR [--pack-dir EXPORT] [--title NAME] [--title-id APPFOLDER] [--icon ICON.PNG] [--overlay DIR]
   run [--timeout 120s] switch/NAME|NAME.nro
+
+Wii U commands:
+  setup [--profile prebuilt|compile]   (compile: devkitPPC, wut and wut-tools for --overlay)
+  env
+  status
+  build --sample gdir --out GAME.zip|DIR [--pack-dir EXPORT] [--title NAME] [--title-id APPFOLDER] [--icon ICON.PNG] [--overlay DIR]
+  run [--timeout 120s] wiiu/apps/NAME|NAME.wuhb
 
 Cache: <prefix>/<plat>/ (inst, src, guest, work). Portable copy: <exeDir>/<plat>/.
 License: GPL-3.0-or-later (this repo may contain GCC, PSn00bSDK, mkpsxiso, pcsx-redux, ps2dev, libdragon, Ares).

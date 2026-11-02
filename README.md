@@ -1,6 +1,6 @@
 # blazium-toolchain
 
-A CLI that fetches console compilers into a cache and builds PS1, PS2, PS3, PSP, GameCube, Wii, Switch, N64, and Interactive DVD products. GPL-3.0-or-later; the MIT Blazium editor only spawns the binary. `ps4` is reserved and exits `2`.
+A CLI that fetches console compilers into a cache and builds PS1, PS2, PS3, PSP, GameCube, Wii, Wii U, Switch, N64, and Interactive DVD products. GPL-3.0-or-later; the MIT Blazium editor only spawns the binary. `ps4` is reserved and exits `2`.
 
 ## Blazium Engine
 
@@ -25,7 +25,7 @@ A CLI that fetches console compilers into a cache and builds PS1, PS2, PS3, PSP,
 | [CLI](https://github.com/blazium-games/blazium-cli) | Install editors, projects, remote control, Steam and itch.io deploy. Not the Games uploader. | Linux and Windows, x86_64 and x86_32. Catalog: [cli.json](https://cdn.blazium.app/cli/cli.json) |
 | [Hub](https://github.com/blazium-games/blazium-hub) | Desktop companion; installers bundle the CLI. Engine builds track `blazium_4.8`. | Linux and Windows, x86_64 and x86_32. |
 | [Crash reporter](https://github.com/blazium-games/blazium_crash_reporter) | Sidecar UI for engine and Hub crash reports. Engine builds track `blazium_4.8`. | Linux and Windows, x86_64 and x86_32. Catalog: [crash_reporter.json](https://cdn.blazium.app/crash_reporter/crash_reporter.json) |
-| [Toolchain](https://github.com/blazium-games/blazium-toolchain) | PS1, PS2, PS3, PSP, GameCube, Wii, Switch, N64, and Interactive DVD. `ps4` is reserved and does not ship. | Linux and Windows, x86_64 and x86_32. Catalog: [toolchain.json](https://cdn.blazium.app/toolchain/toolchain.json) |
+| [Toolchain](https://github.com/blazium-games/blazium-toolchain) | PS1, PS2, PS3, PSP, GameCube, Wii, Wii U, Switch, N64, and Interactive DVD. `ps4` is reserved and does not ship. | Linux and Windows, x86_64 and x86_32. Catalog: [toolchain.json](https://cdn.blazium.app/toolchain/toolchain.json) |
 | [Skills](https://github.com/blazium-games/blazium-skills) | Agent skill packs for Claude, Cursor, Codex, and Grok. Own semver, separate from the 0.8.x API baseline. | Catalog: [skills.json](https://cdn.blazium.app/skills/skills.json) |
 | [Subagents](https://github.com/blazium-games/blazium-subagents) | Studio roster that loads those skills. Own semver. | Catalog: [subagents.json](https://cdn.blazium.app/subagents/subagents.json) |
 | [Blazium Games](https://blazium.games) | Separate store. Upload with chauffeur, not with these tools. | Site [blazium.games](https://blazium.games), docs [docs.blazium.games](https://docs.blazium.games). |
@@ -324,9 +324,28 @@ Player 1 is the console in handheld mode or the controller set as player 1; play
 
 Only a guest with code of your own (`--overlay`, or `GDIR_EXTRA_FLAGS`) is compiled, with devkitA64, libnx, deko3d and switch-tools (devkitPro's `switch-dev`; set `DEVKITPRO`). After changing `guest/switch`, rebuild the bundled guest with `scripts/switch-guest-prebuilt.sh` (`go test ./guest/switch` checks that it matches the sources); after editing the shaders, run it with `--shaders` (it needs devkitPro's `uam`).
 
+## Wii U
+
+`wiiu build --sample gdir` needs no Wii U SDK, on Windows, Linux or macOS. The GDIR guest comes compiled with the CLI (`guest/wiiu/prebuilt/gdir.rpx`, an RPX built with devkitPPC and wut), and the CLI writes the `.wuhb` (Wii U Homebrew Bundle) itself, byte for byte as wut-tools' `wuhbtool` does. It takes a PS2 GDIR export (`--pack-dir`, else the folder `--out` is in); the cooked files go into the bundle's `content/DATA/` as they are. GX2 draws the PS2 packs at the TV's resolution (1080p, 720p or 480p, as the console is set) and copies the frame to the GamePad: the CPU transforms and clips the triangles (as the PS2's EE does), GX2 textures them from the PS2's textures expanded to RGBA, with fog and a depth buffer; the 3D fills the 16:9 screen and the HUD keeps the PS2's 640x448 layout at 4:3 in the middle. Sound is one AX voice fed with the PS2 mixer's output. It writes:
+
+- `--out GAME.zip`: the game zipped as `wiiu/apps/NAME/` (unzip it onto the SD card's root), with the same folder `wiiu/apps/NAME/` and `GAME.THIRD-PARTY-NOTICES.txt` beside it.
+- `--out DIR`: `DIR/wiiu/apps/NAME/` and `DIR/NAME.zip`.
+
+The app folder holds `NAME.wuhb` and `THIRD-PARTY-NOTICES.txt`. The bundle holds `code/root.rpx`, `meta/` (`meta.ini` with the name, the 128x128 icon and the TV's and the GamePad's boot pictures) and `content/` (`DATA/` and `APPDIR.TXT`, the app folder's name, so the game keeps its save beside the `.wuhb` however it was started).
+
+| Flag | Effect |
+|------|--------|
+| `--title NAME` | The name in the Wii U Menu and the Homebrew Launcher; default `--out`'s name |
+| `--title-id APPFOLDER` | The app's folder, `wiiu/apps/APPFOLDER` (lower-case letters, digits, `-`, `_`); default from `--out`'s name |
+| `--icon ICON.PNG` | The picture for the icon (scaled and cropped to 128x128) and the boot screens (whole, centred on dark blue); square, 512x512 shows best; default the export's `ICON.PNG`, else a plain one |
+
+Player 1 is the GamePad and the controller in slot 1; players 2 to 4 are the Wii U Pro Controllers or Wii Remotes in slots 2 to 4 (a Remote held sideways, or with a Nunchuk or a Classic Controller). Cross is A (sideways Remote 2), circle B (1), square Y (Nunchuk C, sideways Remote A), triangle X, L1 L or ZL, R1 R or ZR (Nunchuk Z, sideways Remote B), start +, select -; the left sticks steer and, pushed well over, work the menus. The GamePad and the Remotes rumble. HOME opens the HOME Menu, which closes the game. Saves go to `BLAZIUM.SAV` in the app folder on the SD card; a build over the folder keeps it, and the `.zip` never holds one. Run it on a Wii U with the Aroma environment (from the Wii U Menu or the Homebrew Launcher), or in Cemu; `wiiu run` starts `CEMU_EXE -g` on the `.wuhb` (put the app folder in Cemu's `sdcard/wiiu/apps/` for the save to land there).
+
+Only a guest with code of your own (`--overlay`, or `GDIR_EXTRA_FLAGS`) is compiled, with devkitPPC, wut and wut-tools (devkitPro's `wiiu-dev`; set `DEVKITPRO`). After changing `guest/wiiu`, rebuild the bundled guest with `scripts/wiiu-guest-prebuilt.sh` (`go test ./guest/wiiu` checks that it matches the sources). The shaders are kept compiled in `gx2_shaders.h`; after editing `gx2_shaders.vsh` or `.psh`, rebuild it with decaf-emu's `latte-assembler` as that file's comment says.
+
 ## Hosts
 
-PS1/PS2/N64 setup, build, run, iso, and rom are Windows and Linux. PS3, PSP, GameCube, Wii and Switch build anywhere (a custom PS3 guest compiles on Linux only). Other hosts exit `2`. `env`, `status`, and `export-guest` still work. Building the CLI locally on macOS can still master Interactive DVD. Published release binaries are Linux and Windows only.
+PS1/PS2/N64 setup, build, run, iso, and rom are Windows and Linux. PS3, PSP, GameCube, Wii, Wii U and Switch build anywhere (a custom PS3 guest compiles on Linux only). Other hosts exit `2`. `env`, `status`, and `export-guest` still work. Building the CLI locally on macOS can still master Interactive DVD. Published release binaries are Linux and Windows only.
 
 CI runs `go test ./...`, `go vet ./...`, `ps2 build --out hello.elf`, and `n64 build --out hello.z64` on Ubuntu and Windows.
 

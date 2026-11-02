@@ -38,6 +38,11 @@ Each tree keeps its upstream license. This CLI spawns compilers, packers, and em
 | devkitA64 (AArch64 GCC), switch-tools (elf2nro), uam | GPLv3 / ISC / zlib and MIT (its Mesa parts) | user `DEVKITPRO` | Spawned only to compile a Switch guest with `--overlay`, or its shaders |
 | elf2nro, nacptool, build_romfs (switch-tools) | ISC | ported into `internal/platforms/nswitch` (nro.go) | Write the .nro's assets, NACP and RomFS |
 | A Switch emulator (Ryujinx / Ryubing) | MIT | user `SWITCH_EMU` | Spawned by `switch run`; no Switch keys, firmware or games needed or fetched |
+| wut (libraries, start-up code, libwhb) and newlib | zlib; BSD-style | `guest/wiiu/prebuilt/gdir.rpx` (compiled in) | Linked into the Wii U guest only; notices written beside each `.zip` and in the app folder |
+| devkitPPC (PowerPC GCC), wut-tools (elf2rpl) | GPLv3 / GPLv2 | user `DEVKITPRO` | Spawned only to compile a Wii U guest with `--overlay` |
+| wuhbtool (wut-tools) | GPLv2 | its layout reimplemented in `internal/platforms/wiiu` (wuhb.go) | Write the .wuhb |
+| decaf-emu latte-assembler | GPLv3 | not shipped | Used once to compile the guest's shaders into `gx2_shaders.h` |
+| Cemu | MPL-2.0 | user `CEMU_EXE` | Spawned by `wiiu run`; no Wii U system files, keys or games needed or fetched |
 
 Do not copy these trees into `blazium/` or link them into the editor.
 
