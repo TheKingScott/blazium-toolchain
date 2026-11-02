@@ -34,6 +34,10 @@ Each tree keeps its upstream license. This CLI spawns compilers, packers, and em
 | pspdev (Allegrex GCC, PSPSDK tools) | GPLv3 / BSD | user `PSPDEV` | Spawned only to compile a PSP guest with `--overlay` |
 | mksfo, pack-pbp (PSPSDK tools) | BSD | ported into `internal/platforms/psp` (pbp.go) | Write PARAM.SFO and EBOOT.PBP |
 | PPSSPP | GPLv2+ | user `PPSSPP_EXE` | Spawned by `psp run`; no PSP firmware needed or fetched |
+| libnx (libraries, start-up code), deko3d and newlib | ISC; zlib; BSD-style | `guest/switch/prebuilt/gdir.nro` (compiled in) | Linked into the Switch guest only; notices written beside each `.zip` and in the app folder |
+| devkitA64 (AArch64 GCC), switch-tools (elf2nro), uam | GPLv3 / ISC / zlib and MIT (its Mesa parts) | user `DEVKITPRO` | Spawned only to compile a Switch guest with `--overlay`, or its shaders |
+| elf2nro, nacptool, build_romfs (switch-tools) | ISC | ported into `internal/platforms/nswitch` (nro.go) | Write the .nro's assets, NACP and RomFS |
+| A Switch emulator (Ryujinx / Ryubing) | MIT | user `SWITCH_EMU` | Spawned by `switch run`; no Switch keys, firmware or games needed or fetched |
 
 Do not copy these trees into `blazium/` or link them into the editor.
 

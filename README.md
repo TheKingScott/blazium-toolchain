@@ -1,6 +1,6 @@
 # blazium-toolchain
 
-A CLI that fetches console compilers into a cache and builds PS1, PS2, PS3, PSP, GameCube, Wii, N64, and Interactive DVD products. GPL-3.0-or-later; the MIT Blazium editor only spawns the binary. `ps4` is reserved and exits `2`.
+A CLI that fetches console compilers into a cache and builds PS1, PS2, PS3, PSP, GameCube, Wii, Switch, N64, and Interactive DVD products. GPL-3.0-or-later; the MIT Blazium editor only spawns the binary. `ps4` is reserved and exits `2`.
 
 ## Blazium Engine
 
@@ -25,7 +25,7 @@ A CLI that fetches console compilers into a cache and builds PS1, PS2, PS3, PSP,
 | [CLI](https://github.com/blazium-games/blazium-cli) | Install editors, projects, remote control, Steam and itch.io deploy. Not the Games uploader. | Linux and Windows, x86_64 and x86_32. Catalog: [cli.json](https://cdn.blazium.app/cli/cli.json) |
 | [Hub](https://github.com/blazium-games/blazium-hub) | Desktop companion; installers bundle the CLI. Engine builds track `blazium_4.8`. | Linux and Windows, x86_64 and x86_32. |
 | [Crash reporter](https://github.com/blazium-games/blazium_crash_reporter) | Sidecar UI for engine and Hub crash reports. Engine builds track `blazium_4.8`. | Linux and Windows, x86_64 and x86_32. Catalog: [crash_reporter.json](https://cdn.blazium.app/crash_reporter/crash_reporter.json) |
-| [Toolchain](https://github.com/blazium-games/blazium-toolchain) | PS1, PS2, PS3, PSP, GameCube, Wii, N64, and Interactive DVD. `ps4` is reserved and does not ship. | Linux and Windows, x86_64 and x86_32. Catalog: [toolchain.json](https://cdn.blazium.app/toolchain/toolchain.json) |
+| [Toolchain](https://github.com/blazium-games/blazium-toolchain) | PS1, PS2, PS3, PSP, GameCube, Wii, Switch, N64, and Interactive DVD. `ps4` is reserved and does not ship. | Linux and Windows, x86_64 and x86_32. Catalog: [toolchain.json](https://cdn.blazium.app/toolchain/toolchain.json) |
 | [Skills](https://github.com/blazium-games/blazium-skills) | Agent skill packs for Claude, Cursor, Codex, and Grok. Own semver, separate from the 0.8.x API baseline. | Catalog: [skills.json](https://cdn.blazium.app/skills/skills.json) |
 | [Subagents](https://github.com/blazium-games/blazium-subagents) | Studio roster that loads those skills. Own semver. | Catalog: [subagents.json](https://cdn.blazium.app/subagents/subagents.json) |
 | [Blazium Games](https://blazium.games) | Separate store. Upload with chauffeur, not with these tools. | Site [blazium.games](https://blazium.games), docs [docs.blazium.games](https://docs.blazium.games). |
@@ -305,9 +305,28 @@ The PSP's buttons are the DualShock 2's (L and R are L1 and R1, the analog nub t
 
 Only a guest with code of your own (`--overlay`, or `GDIR_EXTRA_FLAGS`) is compiled, with pspdev (set `PSPDEV`). After changing `guest/psp`, rebuild the bundled guest with `scripts/psp-guest-prebuilt.sh` (`go test ./guest/psp` checks that it matches the sources).
 
+## Switch
+
+`switch build --sample gdir` needs no Switch SDK, on Windows, Linux or macOS. The GDIR guest comes compiled with the CLI (`guest/switch/prebuilt/gdir.nro`, an NRO built with devkitA64, libnx and deko3d), and the CLI writes the `.nro`'s assets itself, byte for byte as switch-tools' `elf2nro`, `nacptool` and `build_romfs` do. It takes a PS2 GDIR export (`--pack-dir`, else the folder `--out` is in); the cooked files go into the `.nro`'s RomFS (`DATA/`) as they are. deko3d draws the PS2 packs at 1280x720 in handheld mode and 1920x1080 docked: the CPU transforms and clips the triangles (as the PS2's EE does), the GPU textures them from the PS2's textures expanded to RGBA, with fog and a depth buffer (one shader pair, `dk_vsh.glsl` / `dk_fsh.glsl`, kept compiled in `dk_shaders.h`); the 3D fills the 16:9 screen and the HUD keeps the PS2's 640x448 layout at 4:3 in the middle. Sound is audout at 48 kHz, fed by the PS2 mixer on a thread of its own. It writes:
+
+- `--out GAME.zip`: the game zipped as `switch/NAME/` (unzip it onto the SD card's root), with the same folder `switch/NAME/` and `GAME.THIRD-PARTY-NOTICES.txt` beside it.
+- `--out DIR`: `DIR/switch/NAME/` and `DIR/NAME.zip`.
+
+The app folder holds `NAME.nro` and `THIRD-PARTY-NOTICES.txt`. The `.nro` holds the program, its icon (a 256x256 JPEG), the NACP (the name the Homebrew Menu shows) and a RomFS with `DATA/` and `APPDIR.TXT` (the app folder's name, so the game keeps its save beside the `.nro` however it was started).
+
+| Flag | Effect |
+|------|--------|
+| `--title NAME` | The name in the Homebrew Menu; default `--out`'s name |
+| `--title-id APPFOLDER` | The app's folder, `switch/APPFOLDER` (lower-case letters, digits, `-`, `_`); default from `--out`'s name |
+| `--icon ICON.PNG` | The Homebrew Menu's icon, scaled and cropped to 256x256 (PNG or JPEG); default the export's `ICON.PNG`, else a plain one |
+
+Player 1 is the console in handheld mode or the controller set as player 1; players 2 to 4 are the controllers set as players 2 to 4 (Pro Controllers or pairs of Joy-Con). Cross is A, circle B, square Y, triangle X, L1 L or ZL, R1 R or ZR, start +, select -; the left stick steers and, pushed well over, works the menus. Player 1's controller rumbles. HOME opens the HOME Menu, which closes the game. Saves go to `BLAZIUM.SAV` in the app folder on the SD card; a build over the folder keeps it, and the `.zip` never holds one. Run it from the Homebrew Menu on a Switch that runs homebrew, or in Ryujinx (Ryubing), which runs it as it is (Ryubing 1.3.3 tested); `switch run` starts `SWITCH_EMU` on the `.nro` (the bare file for Ryujinx, `-g FILE` for yuzu's descendants). Eden 0.2.1 closes on any deko3d program, devkitPro's own samples too, so it cannot run the game. The guest logs what it does with `svcOutputDebugString` (Ryujinx's log shows it) and to `switch/blazium_log.txt` on the SD card, the first place to look if the game does not start.
+
+Only a guest with code of your own (`--overlay`, or `GDIR_EXTRA_FLAGS`) is compiled, with devkitA64, libnx, deko3d and switch-tools (devkitPro's `switch-dev`; set `DEVKITPRO`). After changing `guest/switch`, rebuild the bundled guest with `scripts/switch-guest-prebuilt.sh` (`go test ./guest/switch` checks that it matches the sources); after editing the shaders, run it with `--shaders` (it needs devkitPro's `uam`).
+
 ## Hosts
 
-PS1/PS2/N64 setup, build, run, iso, and rom are Windows and Linux. PS3, PSP, GameCube and Wii build anywhere (a custom PS3 guest compiles on Linux only). Other hosts exit `2`. `env`, `status`, and `export-guest` still work. Building the CLI locally on macOS can still master Interactive DVD. Published release binaries are Linux and Windows only.
+PS1/PS2/N64 setup, build, run, iso, and rom are Windows and Linux. PS3, PSP, GameCube, Wii and Switch build anywhere (a custom PS3 guest compiles on Linux only). Other hosts exit `2`. `env`, `status`, and `export-guest` still work. Building the CLI locally on macOS can still master Interactive DVD. Published release binaries are Linux and Windows only.
 
 CI runs `go test ./...`, `go vet ./...`, `ps2 build --out hello.elf`, and `n64 build --out hello.z64` on Ubuntu and Windows.
 
